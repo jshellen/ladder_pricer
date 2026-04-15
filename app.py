@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import List, Tuple
 
 import numpy as np
@@ -232,6 +232,26 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
     )
 
 
+def nearest_index(arr: np.ndarray, x: float) -> int:
+    return int(np.argmin(np.abs(arr - x)))
+
+
+def policy_arrays(
+    cpp_tier: lp.PriceTier,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    q_grid = np.array(cpp_tier.policy.q_grid, dtype=float)
+    y_grid = np.array(cpp_tier.policy.y_grid, dtype=float)
+    nu_grid = np.array(cpp_tier.policy.nu_grid, dtype=float)
+    bid = np.array(cpp_tier.policy.bid, dtype=float)   # [nq, ny, nnu, nz]
+    ask = np.array(cpp_tier.policy.ask, dtype=float)   # [nq, ny, nnu, nz]
+    return q_grid, y_grid, nu_grid, bid, ask
+
+
+def sigma_state_grid_from_solution(solution: lp.HJBSolution) -> np.ndarray:
+    nu_grid = np.array(solution.nu_grid, dtype=float)
+    return np.exp(nu_grid)
+
+
 def make_parameter_table(spec: TierSpec, cpp_tier: lp.PriceTier) -> pd.DataFrame:
     rows = []
     for z in spec.sizes:
@@ -248,38 +268,29 @@ def make_parameter_table(spec: TierSpec, cpp_tier: lp.PriceTier) -> pd.DataFrame
     return pd.DataFrame(rows)
 
 
-def policy_arrays(cpp_tier: lp.PriceTier) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    q_grid = np.array(cpp_tier.policy.q_grid, dtype=float)
-    y_grid = np.array(cpp_tier.policy.y_grid, dtype=float)
-    bid = np.array(cpp_tier.policy.bid, dtype=float)
-    ask = np.array(cpp_tier.policy.ask, dtype=float)
-    return q_grid, y_grid, bid, ask
-
-
-def nearest_index(arr: np.ndarray, x: float) -> int:
-    return int(np.argmin(np.abs(arr - x)))
-
-
-def make_h_slice_figure(solution: lp.HJBSolution, y_selected: float) -> go.Figure:
+def make_h_slice_figure(solution: lp.HJBSolution, y_selected: float, sigma_state_selected: float) -> go.Figure:
     q_grid = np.array(solution.q_grid, dtype=float)
     y_grid = np.array(solution.y_grid, dtype=float)
-    h = np.array(solution.h, dtype=float)
+    nu_grid = np.array(solution.nu_grid, dtype=float)
+    sigma_state_grid = np.exp(nu_grid)
+    h = np.array(solution.h, dtype=float)  # [nq, ny, nnu]
 
     iy = nearest_index(y_grid, y_selected)
+    inu = nearest_index(sigma_state_grid, sigma_state_selected)
 
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
             x=q_grid,
-            y=h[:, iy],
+            y=h[:, iy, inu],
             mode="lines+markers",
-            name=f"h(q, y={y_grid[iy]:g})",
+            name=f"h(q, y={y_grid[iy]:g}, σ={sigma_state_grid[inu]:g})",
         )
     )
     fig.update_layout(
-        title=f"Value function slice at y = {y_grid[iy]:g}",
+        title=f"Value function slice at y = {y_grid[iy]:g}, σ = {sigma_state_grid[inu]:g}",
         xaxis_title="Inventory q",
-        yaxis_title="h(q,y)",
+        yaxis_title="h(q,y,ν)",
         height=420,
     )
     return fig
@@ -310,9 +321,17 @@ def make_flow_curve_figure(cpp_tier: lp.PriceTier, spec: TierSpec) -> go.Figure:
     return fig
 
 
-def make_quote_inventory_figure(cpp_tier: lp.PriceTier, spec: TierSpec, y_selected: float) -> go.Figure:
-    q_grid, y_grid, bid, ask = policy_arrays(cpp_tier)
+def make_quote_inventory_figure(
+    cpp_tier: lp.PriceTier,
+    spec: TierSpec,
+    y_selected: float,
+    sigma_state_selected: float,
+) -> go.Figure:
+    q_grid, y_grid, nu_grid, bid, ask = policy_arrays(cpp_tier)
+    sigma_state_grid = np.exp(nu_grid)
+
     iy = nearest_index(y_grid, y_selected)
+    inu = nearest_index(sigma_state_grid, sigma_state_selected)
 
     fig = go.Figure()
     for j, z in enumerate(spec.sizes):
@@ -320,7 +339,7 @@ def make_quote_inventory_figure(cpp_tier: lp.PriceTier, spec: TierSpec, y_select
         fig.add_trace(
             go.Scatter(
                 x=q_grid,
-                y=-bid[:, iy, j],
+                y=-bid[:, iy, inu, j],
                 mode="lines",
                 name=f"{zf:g} bid",
             )
@@ -328,7 +347,7 @@ def make_quote_inventory_figure(cpp_tier: lp.PriceTier, spec: TierSpec, y_select
         fig.add_trace(
             go.Scatter(
                 x=q_grid,
-                y=ask[:, iy, j],
+                y=ask[:, iy, inu, j],
                 mode="lines",
                 line=dict(dash="dash"),
                 name=f"{zf:g} ask",
@@ -337,21 +356,73 @@ def make_quote_inventory_figure(cpp_tier: lp.PriceTier, spec: TierSpec, y_select
 
     fig.add_hline(y=0.0)
     fig.update_layout(
-        title=f"Quotes vs inventory at y = {y_grid[iy]:g} — {spec.name}",
+        title=f"Quotes vs inventory at y = {y_grid[iy]:g}, σ = {sigma_state_grid[inu]:g} — {spec.name}",
         xaxis_title="Inventory q",
         yaxis_title="Quote around mid",
-        yaxis=dict(range=[-10, +10]),
+        yaxis=dict(range=[-10, 10]),
         height=520,
     )
     return fig
 
 
-def make_ask_policy_heatmap(cpp_tier: lp.PriceTier, spec: TierSpec, z_selected: float) -> go.Figure:
-    q_grid, y_grid, _, ask = policy_arrays(cpp_tier)
-    z_arr = np.array(spec.sizes, dtype=float)
-    iz = nearest_index(z_arr, z_selected)
+def make_quote_volatility_figure(
+    cpp_tier: lp.PriceTier,
+    spec: TierSpec,
+    q_selected: float,
+    y_selected: float,
+) -> go.Figure:
+    q_grid, y_grid, nu_grid, bid, ask = policy_arrays(cpp_tier)
+    sigma_state_grid = np.exp(nu_grid)
 
-    values = ask[:, :, iz]
+    iq = nearest_index(q_grid, q_selected)
+    iy = nearest_index(y_grid, y_selected)
+
+    fig = go.Figure()
+    for j, z in enumerate(spec.sizes):
+        zf = float(z)
+        fig.add_trace(
+            go.Scatter(
+                x=sigma_state_grid,
+                y=-bid[iq, iy, :, j],
+                mode="lines",
+                name=f"{zf:g} bid",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=sigma_state_grid,
+                y=ask[iq, iy, :, j],
+                mode="lines",
+                line=dict(dash="dash"),
+                name=f"{zf:g} ask",
+            )
+        )
+
+    fig.add_hline(y=0.0)
+    fig.update_layout(
+        title=f"Quotes vs volatility at q = {q_grid[iq]:g}, y = {y_grid[iy]:g} — {spec.name}",
+        xaxis_title="Volatility state σ = exp(ν)",
+        yaxis_title="Quote around mid",
+        yaxis=dict(range=[-10, 10]),
+        height=520,
+    )
+    return fig
+
+
+def make_ask_policy_heatmap(
+    cpp_tier: lp.PriceTier,
+    spec: TierSpec,
+    z_selected: float,
+    sigma_state_selected: float,
+) -> go.Figure:
+    q_grid, y_grid, nu_grid, _, ask = policy_arrays(cpp_tier)
+    sigma_state_grid = np.exp(nu_grid)
+    z_arr = np.array(spec.sizes, dtype=float)
+
+    iz = nearest_index(z_arr, z_selected)
+    inu = nearest_index(sigma_state_grid, sigma_state_selected)
+
+    values = ask[:, :, inu, iz]
 
     fig = go.Figure(
         data=go.Heatmap(
@@ -362,7 +433,7 @@ def make_ask_policy_heatmap(cpp_tier: lp.PriceTier, spec: TierSpec, z_selected: 
         )
     )
     fig.update_layout(
-        title=f"Ask policy heatmap for z = {z_arr[iz]:g} — {spec.name}",
+        title=f"Ask policy heatmap for z = {z_arr[iz]:g}, σ = {sigma_state_grid[inu]:g} — {spec.name}",
         xaxis_title="Drift state y",
         yaxis_title="Inventory q",
         height=520,
@@ -370,10 +441,17 @@ def make_ask_policy_heatmap(cpp_tier: lp.PriceTier, spec: TierSpec, z_selected: 
     return fig
 
 
-def make_ladder_figure(cpp_tier: lp.PriceTier, spec: TierSpec, q: float, y: float) -> go.Figure:
+def make_ladder_figure(
+    cpp_tier: lp.PriceTier,
+    spec: TierSpec,
+    q: float,
+    y: float,
+    sigma_state: float,
+) -> go.Figure:
+    nu = float(np.log(sigma_state))
     sizes = [float(z) for z in spec.sizes]
-    bid_vals = [-cpp_tier.quote(float(q), float(y), z, "bid") for z in sizes]
-    ask_vals = [cpp_tier.quote(float(q), float(y), z, "ask") for z in sizes]
+    bid_vals = [-cpp_tier.quote(float(q), float(y), nu, z, "bid") for z in sizes]
+    ask_vals = [cpp_tier.quote(float(q), float(y), nu, z, "ask") for z in sizes]
 
     fig = go.Figure()
     fig.add_trace(
@@ -381,7 +459,7 @@ def make_ladder_figure(cpp_tier: lp.PriceTier, spec: TierSpec, q: float, y: floa
             x=sizes,
             y=bid_vals,
             mode="lines+markers",
-            name=f"Bid q={q:g}, y={y:g}",
+            name=f"Bid q={q:g}, y={y:g}, σ={sigma_state:g}",
         )
     )
     fig.add_trace(
@@ -390,13 +468,13 @@ def make_ladder_figure(cpp_tier: lp.PriceTier, spec: TierSpec, q: float, y: floa
             y=ask_vals,
             mode="lines+markers",
             line=dict(dash="dash"),
-            name=f"Ask q={q:g}, y={y:g}",
+            name=f"Ask q={q:g}, y={y:g}, σ={sigma_state:g}",
         )
     )
 
     fig.add_hline(y=0.0)
     fig.update_layout(
-        title=f"Ladders — {spec.name} at q = {q:g}, y = {y:g}",
+        title=f"Ladders — {spec.name} at q = {q:g}, y = {y:g}, σ = {sigma_state:g}",
         xaxis_title="Trade size z",
         yaxis_title="Quote around mid",
         height=420,
@@ -404,16 +482,25 @@ def make_ladder_figure(cpp_tier: lp.PriceTier, spec: TierSpec, q: float, y: floa
     return fig
 
 
-def make_qy_ladder_table(cpp_tier: lp.PriceTier, spec: TierSpec, q: float, y: float) -> pd.DataFrame:
+def make_state_ladder_table(
+    cpp_tier: lp.PriceTier,
+    spec: TierSpec,
+    q: float,
+    y: float,
+    sigma_state: float,
+) -> pd.DataFrame:
+    nu = float(np.log(sigma_state))
     rows = []
     for z in spec.sizes:
         zf = float(z)
-        bid_delta = cpp_tier.quote(float(q), float(y), zf, "bid")
-        ask_delta = cpp_tier.quote(float(q), float(y), zf, "ask")
+        bid_delta = cpp_tier.quote(float(q), float(y), nu, zf, "bid")
+        ask_delta = cpp_tier.quote(float(q), float(y), nu, zf, "ask")
         rows.append(
             {
                 "q": float(q),
                 "y": float(y),
+                "sigma_state": float(sigma_state),
+                "nu": nu,
                 "z": zf,
                 "bid_quote_plot_value": -bid_delta,
                 "ask_quote_plot_value": ask_delta,
@@ -464,16 +551,20 @@ def make_convergence_figure(solution: lp.HJBSolution) -> go.Figure:
 def build_signature(
     q_grid: np.ndarray,
     y_grid: np.ndarray,
+    nu_grid: np.ndarray,
     dt: float,
     n_iter: int,
     kappa_y: float,
+    kappa_nu: float,
+    nu_bar: float,
+    eta_nu: float,
     early_stop: bool,
     tol_h: float,
     tol_rhs: float,
     min_iter: int,
     consecutive_passes_required: int,
     risk_aversion: float,
-    sigma: float,
+    sigma_ref: float,
     tau0: float,
     cubic_coeff: float,
     quartic_coeff: float,
@@ -482,16 +573,20 @@ def build_signature(
     return (
         tuple(float(x) for x in q_grid),
         tuple(float(x) for x in y_grid),
+        tuple(float(x) for x in nu_grid),
         float(dt),
         int(n_iter),
         float(kappa_y),
+        float(kappa_nu),
+        float(nu_bar),
+        float(eta_nu),
         bool(early_stop),
         float(tol_h),
         float(tol_rhs),
         int(min_iter),
         int(consecutive_passes_required),
         float(risk_aversion),
-        float(sigma),
+        float(sigma_ref),
         float(tau0),
         float(cubic_coeff),
         float(quartic_coeff),
@@ -520,11 +615,12 @@ def build_signature(
 # App
 # ============================================================
 
-st.set_page_config(page_title="HJB ladder with drift state", layout="wide")
-st.title("HJB ladder playground with drift state")
+st.set_page_config(page_title="HJB ladder with drift and volatility state", layout="wide")
+st.title("HJB ladder playground with drift and volatility state")
 st.markdown(
     "This version uses the `ladder_pricer` C++ package via pybind11. "
-    "The state includes both inventory **q** and drift pressure **y**."
+    "The state now includes inventory **q**, drift pressure **y**, and log-volatility **ν** "
+    "(shown in the UI as **σ = exp(ν)**)."
 )
 
 with st.sidebar:
@@ -536,19 +632,44 @@ with st.sidebar:
     st.header("Drift-state grid")
     y_range = st.slider(
         "Drift state range",
-        min_value=-1.0,
-        max_value=1.0,
-        value=(-5.00, 5.00),
+        min_value=-10.0,
+        max_value=10.0,
+        value=(-5.0, 5.0),
         step=0.1,
     )
     n_y_points = st.slider(
         "Number of drift points",
-        min_value=9,
-        max_value=81,
+        min_value=5,
+        max_value=41,
         value=11,
-        step=4,
+        step=2,
     )
     kappa_y = st.number_input("kappa_y (drift decay speed)", value=2.0, step=0.1, format="%.4f")
+
+    st.header("Volatility-state grid")
+    sigma_state_range = st.slider(
+        "Volatility state range σ = exp(ν)",
+        min_value=0.10,
+        max_value=3.00,
+        value=(0.50, 1.50),
+        step=0.05,
+    )
+    n_sigma_points = st.slider(
+        "Number of volatility points",
+        min_value=5,
+        max_value=31,
+        value=9,
+        step=2,
+    )
+    sigma_bar_state = st.number_input(
+        "Long-run volatility state σ̄ = exp(ν̄)",
+        value=1.00,
+        min_value=0.05,
+        step=0.05,
+        format="%.4f",
+    )
+    kappa_nu = st.number_input("kappa_nu (log-vol mean reversion)", value=1.0, step=0.1, format="%.4f")
+    eta_nu = st.number_input("eta_nu (log-vol vol-of-vol)", value=0.2, step=0.05, format="%.4f")
 
     st.header("HJB iteration")
     dt = st.number_input("dt", value=0.001, step=0.001, format="%.4f")
@@ -567,7 +688,12 @@ with st.sidebar:
     )
 
     st.header("Inventory penalty")
-    sigma = st.number_input("sigma", value=0.25, step=0.01, format="%.4f")
+    sigma_ref = st.number_input(
+        "sigma_ref (base penalty scale)",
+        value=0.25,
+        step=0.01,
+        format="%.4f",
+    )
     risk_aversion = st.number_input("risk_aversion", value=2.0, step=0.1, format="%.4f")
     tau0 = st.number_input("tau0", value=2.0, step=0.1, format="%.4f")
     cubic_coeff = st.number_input("cubic coeff", value=0.1, step=0.01, format="%.4f")
@@ -591,15 +717,35 @@ y_min, y_max = float(y_range[0]), float(y_range[1])
 if y_max <= y_min:
     errors.append("Drift state range must have upper bound greater than lower bound.")
 
+sigma_state_min, sigma_state_max = float(sigma_state_range[0]), float(sigma_state_range[1])
+if sigma_state_max <= sigma_state_min:
+    errors.append("Volatility state range must have upper bound greater than lower bound.")
+if sigma_state_min <= 0.0:
+    errors.append("Volatility state must be strictly positive.")
+if sigma_bar_state <= 0.0:
+    errors.append("Long-run volatility state must be strictly positive.")
+if kappa_y < 0.0:
+    errors.append("kappa_y must be nonnegative.")
+if kappa_nu < 0.0:
+    errors.append("kappa_nu must be nonnegative.")
+if eta_nu < 0.0:
+    errors.append("eta_nu must be nonnegative.")
+
 q_grid = np.arange(float(q_min), float(q_max) + float(q_step), float(q_step), dtype=float)
 y_grid = np.round(np.linspace(y_min, y_max, int(n_y_points), dtype=float), 10)
+sigma_state_grid = np.round(
+    np.linspace(sigma_state_min, sigma_state_max, int(n_sigma_points), dtype=float),
+    10,
+)
+nu_grid = np.log(sigma_state_grid)
+nu_bar = float(np.log(sigma_bar_state))
 
 if len(q_grid) < 2:
     errors.append("q_grid must contain at least two points.")
 if len(y_grid) < 2:
     errors.append("y_grid must contain at least two points.")
-if kappa_y < 0.0:
-    errors.append("kappa_y must be nonnegative.")
+if len(nu_grid) < 2:
+    errors.append("nu_grid must contain at least two points.")
 
 if errors:
     for e in errors:
@@ -609,16 +755,20 @@ if errors:
 signature = build_signature(
     q_grid=q_grid,
     y_grid=y_grid,
+    nu_grid=nu_grid,
     dt=float(dt),
     n_iter=int(n_iter),
     kappa_y=float(kappa_y),
+    kappa_nu=float(kappa_nu),
+    nu_bar=float(nu_bar),
+    eta_nu=float(eta_nu),
     early_stop=bool(early_stop),
     tol_h=float(tol_h),
     tol_rhs=float(tol_rhs),
     min_iter=int(min_iter),
     consecutive_passes_required=int(consecutive_passes_required),
     risk_aversion=float(risk_aversion),
-    sigma=float(sigma),
+    sigma_ref=float(sigma_ref),
     tau0=float(tau0),
     cubic_coeff=float(cubic_coeff),
     quartic_coeff=float(quartic_coeff),
@@ -628,8 +778,10 @@ signature = build_signature(
 with st.sidebar:
     compute_clicked = st.button("Compute / refresh", type="primary", use_container_width=True)
 
-state_count = len(q_grid) * len(y_grid)
-st.caption(f"State grid size: {len(q_grid)} q-points × {len(y_grid)} y-points = {state_count} states")
+state_count = len(q_grid) * len(y_grid) * len(nu_grid)
+st.caption(
+    f"State grid size: {len(q_grid)} q-points × {len(y_grid)} y-points × {len(nu_grid)} ν-points = {state_count} states"
+)
 
 need_compute = compute_clicked or "solution" not in st.session_state
 
@@ -638,7 +790,7 @@ if need_compute:
 
     penalty = lp.PolynomialInventoryPenalty(
         risk_aversion=float(risk_aversion),
-        sigma=float(sigma),
+        sigma_ref=float(sigma_ref),
         tau0=float(tau0),
         cubic_coeff=float(cubic_coeff),
         quartic_coeff=float(quartic_coeff),
@@ -647,16 +799,20 @@ if need_compute:
     config = lp.SolverConfig()
     config.q_grid = [float(q) for q in q_grid]
     config.y_grid = [float(y) for y in y_grid]
+    config.nu_grid = [float(nu) for nu in nu_grid]
     config.dt = float(dt)
     config.n_iter = int(n_iter)
     config.kappa_y = float(kappa_y)
+    config.kappa_nu = float(kappa_nu)
+    config.nu_bar = float(nu_bar)
+    config.eta_nu = float(eta_nu)
     config.early_stop = bool(early_stop)
     config.tol_h = float(tol_h)
     config.tol_rhs = float(tol_rhs)
     config.min_iter = int(min_iter)
     config.consecutive_passes_required = int(consecutive_passes_required)
 
-    with st.spinner("Solving HJB in C++ and building drift-aware policies..."):
+    with st.spinner("Solving HJB in C++ and building drift/vol-aware policies..."):
         solver = lp.HJBLadderSolver(config=config, penalty=penalty, tiers=cpp_tiers)
         solution: lp.HJBSolution = solver.solve()
 
@@ -686,27 +842,42 @@ else:
         f"final max |rhs| = {solution.final_max_rhs:.2e}."
     )
 
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("q points", len(solution.q_grid))
 c2.metric("y points", len(solution.y_grid))
-c3.metric("tiers", len(solution.tiers))
-c4.metric("iterations used", solution.iterations_used)
+c3.metric("ν points", len(solution.nu_grid))
+c4.metric("tiers", len(solution.tiers))
+c5.metric("iterations used", solution.iterations_used)
 
-c5, c6, c7 = st.columns(3)
-c5.metric("converged", "yes" if solution.converged else "no")
-c6.metric("final max |Δh|", f"{solution.final_max_h_change:.2e}")
-c7.metric("final max |rhs|", f"{solution.final_max_rhs:.2e}")
+c6, c7, c8 = st.columns(3)
+c6.metric("converged", "yes" if solution.converged else "no")
+c7.metric("final max |Δh|", f"{solution.final_max_h_change:.2e}")
+c8.metric("final max |rhs|", f"{solution.final_max_rhs:.2e}")
 
 available_y = [float(y) for y in solution.y_grid]
 available_q = [float(q) for q in solution.q_grid]
+available_sigma_state = [float(s) for s in sigma_state_grid_from_solution(solution)]
 
-global_y_for_h = st.select_slider(
-    "Drift level for value-function slice",
-    options=available_y,
-    value=0.0 if 0.0 in available_y else available_y[len(available_y) // 2],
-    key="global_y_slice",
+c_top1, c_top2 = st.columns(2)
+with c_top1:
+    global_y_for_h = st.select_slider(
+        "Drift level for value-function slice",
+        options=available_y,
+        value=0.0 if 0.0 in available_y else available_y[len(available_y) // 2],
+        key="global_y_slice",
+    )
+with c_top2:
+    global_sigma_for_h = st.select_slider(
+        "Volatility level for value-function slice",
+        options=available_sigma_state,
+        value=1.0 if 1.0 in available_sigma_state else available_sigma_state[len(available_sigma_state) // 2],
+        key="global_sigma_slice",
+    )
+
+st.plotly_chart(
+    make_h_slice_figure(solution, float(global_y_for_h), float(global_sigma_for_h)),
+    use_container_width=True,
 )
-st.plotly_chart(make_h_slice_figure(solution, float(global_y_for_h)), use_container_width=True)
 st.plotly_chart(make_convergence_figure(solution), use_container_width=True)
 
 tab_names = [spec.name for spec in solved_tier_specs]
@@ -724,69 +895,150 @@ for tab, spec, cpp_tier in zip(tabs, solved_tier_specs, solution.tiers):
             use_container_width=True,
         )
 
-        y_for_inventory = st.select_slider(
-            f"Drift level for quotes vs inventory — {spec.name}",
-            options=available_y,
-            value=0.0 if 0.0 in available_y else available_y[len(available_y) // 2],
-            key=f"y_for_inventory_{spec.name}",
-        )
+        c_q1, c_q2 = st.columns(2)
+        with c_q1:
+            y_for_inventory = st.select_slider(
+                f"Drift level for quotes vs inventory — {spec.name}",
+                options=available_y,
+                value=0.0 if 0.0 in available_y else available_y[len(available_y) // 2],
+                key=f"y_for_inventory_{spec.name}",
+            )
+        with c_q2:
+            sigma_for_inventory = st.select_slider(
+                f"Volatility level for quotes vs inventory — {spec.name}",
+                options=available_sigma_state,
+                value=1.0 if 1.0 in available_sigma_state else available_sigma_state[len(available_sigma_state) // 2],
+                key=f"sigma_for_inventory_{spec.name}",
+            )
+
         st.plotly_chart(
-            make_quote_inventory_figure(cpp_tier, spec, float(y_for_inventory)),
+            make_quote_inventory_figure(
+                cpp_tier,
+                spec,
+                float(y_for_inventory),
+                float(sigma_for_inventory),
+            ),
             use_container_width=True,
         )
 
-        z_for_heatmap = st.selectbox(
-            f"Size for ask policy heatmap — {spec.name}",
-            options=[float(z) for z in spec.sizes],
-            index=0,
-            key=f"z_heat_{spec.name}",
-        )
+        c_v1, c_v2 = st.columns(2)
+        with c_v1:
+            q_for_vol = st.selectbox(
+                f"Inventory level for quotes vs volatility — {spec.name}",
+                options=available_q,
+                index=available_q.index(0.0) if 0.0 in available_q else len(available_q) // 2,
+                key=f"q_for_vol_{spec.name}",
+            )
+        with c_v2:
+            y_for_vol = st.select_slider(
+                f"Drift level for quotes vs volatility — {spec.name}",
+                options=available_y,
+                value=0.0 if 0.0 in available_y else available_y[len(available_y) // 2],
+                key=f"y_for_vol_{spec.name}",
+            )
+
         st.plotly_chart(
-            make_ask_policy_heatmap(cpp_tier, spec, float(z_for_heatmap)),
+            make_quote_volatility_figure(
+                cpp_tier,
+                spec,
+                float(q_for_vol),
+                float(y_for_vol),
+            ),
             use_container_width=True,
         )
 
-        c_ladder_1, c_ladder_2 = st.columns(2)
-        with c_ladder_1:
+        c_h1, c_h2 = st.columns(2)
+        with c_h1:
+            z_for_heatmap = st.selectbox(
+                f"Size for ask policy heatmap — {spec.name}",
+                options=[float(z) for z in spec.sizes],
+                index=0,
+                key=f"z_heat_{spec.name}",
+            )
+        with c_h2:
+            sigma_for_heatmap = st.select_slider(
+                f"Volatility level for ask policy heatmap — {spec.name}",
+                options=available_sigma_state,
+                value=1.0 if 1.0 in available_sigma_state else available_sigma_state[len(available_sigma_state) // 2],
+                key=f"sigma_heat_{spec.name}",
+            )
+
+        st.plotly_chart(
+            make_ask_policy_heatmap(
+                cpp_tier,
+                spec,
+                float(z_for_heatmap),
+                float(sigma_for_heatmap),
+            ),
+            use_container_width=True,
+        )
+
+        c_l1, c_l2, c_l3 = st.columns(3)
+        with c_l1:
             q_for_ladder = st.selectbox(
                 f"Inventory level for ladder — {spec.name}",
                 options=available_q,
                 index=available_q.index(0.0) if 0.0 in available_q else len(available_q) // 2,
                 key=f"q_ladder_{spec.name}",
             )
-        with c_ladder_2:
+        with c_l2:
             y_for_ladder = st.select_slider(
                 f"Drift level for ladder — {spec.name}",
                 options=available_y,
                 value=0.0 if 0.0 in available_y else available_y[len(available_y) // 2],
                 key=f"y_ladder_{spec.name}",
             )
+        with c_l3:
+            sigma_for_ladder = st.select_slider(
+                f"Volatility level for ladder — {spec.name}",
+                options=available_sigma_state,
+                value=1.0 if 1.0 in available_sigma_state else available_sigma_state[len(available_sigma_state) // 2],
+                key=f"sigma_ladder_{spec.name}",
+            )
 
         st.plotly_chart(
-            make_ladder_figure(cpp_tier, spec, float(q_for_ladder), float(y_for_ladder)),
+            make_ladder_figure(
+                cpp_tier,
+                spec,
+                float(q_for_ladder),
+                float(y_for_ladder),
+                float(sigma_for_ladder),
+            ),
             use_container_width=True,
         )
 
         st.dataframe(
-            make_qy_ladder_table(cpp_tier, spec, float(q_for_ladder), float(y_for_ladder)),
+            make_state_ladder_table(
+                cpp_tier,
+                spec,
+                float(q_for_ladder),
+                float(y_for_ladder),
+                float(sigma_for_ladder),
+            ),
             use_container_width=True,
         )
 
 with st.expander("What this app is solving"):
     st.markdown(
         r"""
-The state is now **two-dimensional**: inventory $q$ and drift pressure $y$.
+The state is now **three-dimensional**: inventory $q$, drift pressure $y$, and log-volatility $\nu$.
 
 Spot evolves as
 
 $$
-dS_t = y_t\,dt + \sigma\,dW_t,
+dS_t = y_t\,dt + e^{\nu_t} dW_t,
 $$
 
-and the drift state decays between fills:
+with drift-state decay
 
 $$
-dy_t = -\kappa_y y_t\,dt.
+dy_t = -\kappa_y y_t\,dt,
+$$
+
+and OU log-volatility
+
+$$
+d\nu_t = \kappa_\nu(\bar{\nu}-\nu_t)\,dt + \eta_\nu\,dB_t.
 $$
 
 A fill of size $z$ shifts the drift state by $\alpha(z)$:
@@ -796,7 +1048,7 @@ A fill of size $z$ shifts the drift state by $\alpha(z)$:
 Using the ansatz
 
 $$
-V(x,s,q,y)=x+qs+h(q,y),
+V(x,s,q,y,\nu)=x+qs+h(q,y,\nu),
 $$
 
 the stationary HJB is
@@ -805,8 +1057,10 @@ $$
 0
 =
 q\,y
--\phi(q)
--\kappa_y y\,\partial_y h(q,y)
+-\exp(2\nu)\phi(q)
+-\kappa_y y\,\partial_y h
++\kappa_\nu(\bar{\nu}-\nu)\partial_\nu h
++\frac12\eta_\nu^2 \partial_{\nu\nu} h
 $$
 
 $$
@@ -815,7 +1069,7 @@ $$
 \sum_z \sup_{\delta^b}
 \lambda(\delta^b,z)
 \Big[
-z\delta^b + h(q+z, y-\alpha(z)) - h(q,y)
+z\delta^b + h(q+z,y-\alpha(z),\nu)-h(q,y,\nu)
 \Big]
 $$
 
@@ -825,17 +1079,21 @@ $$
 \sum_z \sup_{\delta^a}
 \lambda(\delta^a,z)
 \Big[
-z\delta^a + h(q-z, y+\alpha(z)) - h(q,y)
+z\delta^a + h(q-z,y+\alpha(z),\nu)-h(q,y,\nu)
 \Big].
 $$
 
-The ladder is still built sequentially in size order for each fixed $(q,y)$ using bounded golden-section search, with the same ladder constraints:
-1. larger sizes cannot be more aggressive than smaller sizes
-2. for $q>0$: ask gaps shrink, bid gaps increase
-3. for $q<0$: ask gaps increase, bid gaps decrease
+The UI shows volatility as
+
+$$
+\sigma_{\text{state}} = e^\nu,
+$$
+
+so the volatility selectors are easier to interpret than raw log-vol values.
         """
     )
 
 st.caption(
-    "Use the Compute / refresh button to run the solver. Drift selectors are sliders so you can sweep policy behavior more easily."
+    "Use the Compute / refresh button to run the solver. "
+    "You can now inspect policy slices over inventory, drift, and volatility."
 )

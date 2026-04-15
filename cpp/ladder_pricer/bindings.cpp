@@ -8,7 +8,7 @@ namespace py = pybind11;
 using namespace hjb;
 
 PYBIND11_MODULE(ladder_pricer, m) {
-    m.doc() = "C++ HJB ladder solver with decaying drift state and pybind11 bindings";
+    m.doc() = "C++ HJB ladder solver with drift state and log-vol state";
 
     py::class_<FlowCurve, std::shared_ptr<FlowCurve>>(m, "FlowCurve");
     py::class_<DriftJumpModel, std::shared_ptr<DriftJumpModel>>(m, "DriftJumpModel");
@@ -43,12 +43,12 @@ PYBIND11_MODULE(ladder_pricer, m) {
     py::class_<PolynomialInventoryPenalty, InventoryPenalty, std::shared_ptr<PolynomialInventoryPenalty>>(m, "PolynomialInventoryPenalty")
         .def(py::init<double, double, double, double, double>(),
              py::arg("risk_aversion"),
-             py::arg("sigma"),
+             py::arg("sigma_ref"),
              py::arg("tau0"),
              py::arg("cubic_coeff") = 0.1,
              py::arg("quartic_coeff") = 0.0015)
         .def_readwrite("risk_aversion", &PolynomialInventoryPenalty::risk_aversion)
-        .def_readwrite("sigma", &PolynomialInventoryPenalty::sigma)
+        .def_readwrite("sigma_ref", &PolynomialInventoryPenalty::sigma_ref)
         .def_readwrite("tau0", &PolynomialInventoryPenalty::tau0)
         .def_readwrite("cubic_coeff", &PolynomialInventoryPenalty::cubic_coeff)
         .def_readwrite("quartic_coeff", &PolynomialInventoryPenalty::quartic_coeff)
@@ -58,6 +58,7 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def(py::init<>())
         .def_readwrite("q_grid", &QuotePolicy::q_grid)
         .def_readwrite("y_grid", &QuotePolicy::y_grid)
+        .def_readwrite("nu_grid", &QuotePolicy::nu_grid)
         .def_readwrite("sizes", &QuotePolicy::sizes)
         .def_readwrite("bid", &QuotePolicy::bid)
         .def_readwrite("ask", &QuotePolicy::ask)
@@ -94,19 +95,24 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def("quote", &PriceTier::quote)
         .def("build_policy",
              [](PriceTier& self,
-                const std::function<double(double, double)>& h_fn,
+                const std::function<double(double, double, double)>& h_fn,
                 const std::vector<double>& q_grid,
-                const std::vector<double>& y_grid) {
-                 return self.build_policy(h_fn, q_grid, y_grid);
+                const std::vector<double>& y_grid,
+                const std::vector<double>& nu_grid) {
+                 return self.build_policy(h_fn, q_grid, y_grid, nu_grid);
              });
 
     py::class_<SolverConfig>(m, "SolverConfig")
         .def(py::init<>())
         .def_readwrite("q_grid", &SolverConfig::q_grid)
         .def_readwrite("y_grid", &SolverConfig::y_grid)
+        .def_readwrite("nu_grid", &SolverConfig::nu_grid)
         .def_readwrite("dt", &SolverConfig::dt)
         .def_readwrite("n_iter", &SolverConfig::n_iter)
         .def_readwrite("kappa_y", &SolverConfig::kappa_y)
+        .def_readwrite("kappa_nu", &SolverConfig::kappa_nu)
+        .def_readwrite("nu_bar", &SolverConfig::nu_bar)
+        .def_readwrite("eta_nu", &SolverConfig::eta_nu)
         .def_readwrite("early_stop", &SolverConfig::early_stop)
         .def_readwrite("tol_h", &SolverConfig::tol_h)
         .def_readwrite("tol_rhs", &SolverConfig::tol_rhs)
@@ -119,6 +125,7 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("h", &HJBSolution::h)
         .def_readwrite("q_grid", &HJBSolution::q_grid)
         .def_readwrite("y_grid", &HJBSolution::y_grid)
+        .def_readwrite("nu_grid", &HJBSolution::nu_grid)
         .def_readwrite("tiers", &HJBSolution::tiers)
         .def_readwrite("converged", &HJBSolution::converged)
         .def_readwrite("iterations_used", &HJBSolution::iterations_used)
