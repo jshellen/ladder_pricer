@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List
+from dataclasses import dataclass, asdict
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -90,7 +90,7 @@ def default_tier_values(i: int) -> dict:
             "jump_base": 0.000,
             "jump_coeff": 0.020,
             "delta_min": -0.5,
-            "delta_max": 4.0,
+            "delta_max": 100.0,
         },
         {
             "name": "aggressive_clients",
@@ -103,7 +103,7 @@ def default_tier_values(i: int) -> dict:
             "jump_base": 0.000,
             "jump_coeff": 0.025,
             "delta_min": -0.5,
-            "delta_max": 4.0,
+            "delta_max": 100.0,
         },
         {
             "name": "sticky_clients",
@@ -116,7 +116,7 @@ def default_tier_values(i: int) -> dict:
             "jump_base": 0.000,
             "jump_coeff": 0.015,
             "delta_min": -0.5,
-            "delta_max": 4.0,
+            "delta_max": 100.0,
         },
     ]
     return presets[min(i, len(presets) - 1)]
@@ -340,6 +340,7 @@ def make_quote_inventory_figure(cpp_tier: lp.PriceTier, spec: TierSpec, y_select
         title=f"Quotes vs inventory at y = {y_grid[iy]:g} — {spec.name}",
         xaxis_title="Inventory q",
         yaxis_title="Quote around mid",
+        yaxis=dict(range=[-10, +10]),
         height=520,
     )
     return fig
@@ -460,6 +461,61 @@ def make_convergence_figure(solution: lp.HJBSolution) -> go.Figure:
     return fig
 
 
+def build_signature(
+    q_grid: np.ndarray,
+    y_grid: np.ndarray,
+    dt: float,
+    n_iter: int,
+    kappa_y: float,
+    early_stop: bool,
+    tol_h: float,
+    tol_rhs: float,
+    min_iter: int,
+    consecutive_passes_required: int,
+    risk_aversion: float,
+    sigma: float,
+    tau0: float,
+    cubic_coeff: float,
+    quartic_coeff: float,
+    tier_specs: List[TierSpec],
+) -> Tuple:
+    return (
+        tuple(float(x) for x in q_grid),
+        tuple(float(x) for x in y_grid),
+        float(dt),
+        int(n_iter),
+        float(kappa_y),
+        bool(early_stop),
+        float(tol_h),
+        float(tol_rhs),
+        int(min_iter),
+        int(consecutive_passes_required),
+        float(risk_aversion),
+        float(sigma),
+        float(tau0),
+        float(cubic_coeff),
+        float(quartic_coeff),
+        tuple(
+            (
+                spec.name,
+                tuple(float(z) for z in spec.sizes),
+                spec.flow_A0,
+                spec.flow_theta,
+                spec.flow_k,
+                spec.flow_m0,
+                spec.flow_m_alpha,
+                spec.jump_base,
+                spec.jump_coeff,
+                spec.delta_min,
+                spec.delta_max,
+                spec.golden_tol,
+                spec.golden_max_iter,
+            )
+            for spec in tier_specs
+        ),
+    )
+
+
 # ============================================================
 # App
 # ============================================================
@@ -468,7 +524,7 @@ st.set_page_config(page_title="HJB ladder with drift state", layout="wide")
 st.title("HJB ladder playground with drift state")
 st.markdown(
     "This version uses the `ladder_pricer` C++ package via pybind11. "
-    "The state now includes both inventory **q** and drift pressure **y**."
+    "The state includes both inventory **q** and drift pressure **y**."
 )
 
 with st.sidebar:
@@ -482,14 +538,14 @@ with st.sidebar:
         "Drift state range",
         min_value=-1.0,
         max_value=1.0,
-        value=(-0.50, 0.50),
-        step=0.01,
+        value=(-5.00, 5.00),
+        step=0.1,
     )
     n_y_points = st.slider(
         "Number of drift points",
         min_value=9,
         max_value=81,
-        value=41,
+        value=11,
         step=4,
     )
     kappa_y = st.number_input("kappa_y (drift decay speed)", value=2.0, step=0.1, format="%.4f")
@@ -550,34 +606,70 @@ if errors:
         st.error(e)
     st.stop()
 
-cpp_tiers = [spec.build_cpp_tier() for spec in tier_specs]
-
-penalty = lp.PolynomialInventoryPenalty(
+signature = build_signature(
+    q_grid=q_grid,
+    y_grid=y_grid,
+    dt=float(dt),
+    n_iter=int(n_iter),
+    kappa_y=float(kappa_y),
+    early_stop=bool(early_stop),
+    tol_h=float(tol_h),
+    tol_rhs=float(tol_rhs),
+    min_iter=int(min_iter),
+    consecutive_passes_required=int(consecutive_passes_required),
     risk_aversion=float(risk_aversion),
     sigma=float(sigma),
     tau0=float(tau0),
     cubic_coeff=float(cubic_coeff),
     quartic_coeff=float(quartic_coeff),
+    tier_specs=tier_specs,
 )
 
-config = lp.SolverConfig()
-config.q_grid = [float(q) for q in q_grid]
-config.y_grid = [float(y) for y in y_grid]
-config.dt = float(dt)
-config.n_iter = int(n_iter)
-config.kappa_y = float(kappa_y)
-config.early_stop = bool(early_stop)
-config.tol_h = float(tol_h)
-config.tol_rhs = float(tol_rhs)
-config.min_iter = int(min_iter)
-config.consecutive_passes_required = int(consecutive_passes_required)
+with st.sidebar:
+    compute_clicked = st.button("Compute / refresh", type="primary", use_container_width=True)
 
 state_count = len(q_grid) * len(y_grid)
 st.caption(f"State grid size: {len(q_grid)} q-points × {len(y_grid)} y-points = {state_count} states")
 
-with st.spinner("Solving HJB in C++ and building drift-aware policies..."):
-    solver = lp.HJBLadderSolver(config=config, penalty=penalty, tiers=cpp_tiers)
-    solution: lp.HJBSolution = solver.solve()
+need_compute = compute_clicked or "solution" not in st.session_state
+
+if need_compute:
+    cpp_tiers = [spec.build_cpp_tier() for spec in tier_specs]
+
+    penalty = lp.PolynomialInventoryPenalty(
+        risk_aversion=float(risk_aversion),
+        sigma=float(sigma),
+        tau0=float(tau0),
+        cubic_coeff=float(cubic_coeff),
+        quartic_coeff=float(quartic_coeff),
+    )
+
+    config = lp.SolverConfig()
+    config.q_grid = [float(q) for q in q_grid]
+    config.y_grid = [float(y) for y in y_grid]
+    config.dt = float(dt)
+    config.n_iter = int(n_iter)
+    config.kappa_y = float(kappa_y)
+    config.early_stop = bool(early_stop)
+    config.tol_h = float(tol_h)
+    config.tol_rhs = float(tol_rhs)
+    config.min_iter = int(min_iter)
+    config.consecutive_passes_required = int(consecutive_passes_required)
+
+    with st.spinner("Solving HJB in C++ and building drift-aware policies..."):
+        solver = lp.HJBLadderSolver(config=config, penalty=penalty, tiers=cpp_tiers)
+        solution: lp.HJBSolution = solver.solve()
+
+    st.session_state["solution"] = solution
+    st.session_state["tier_specs"] = tier_specs
+    st.session_state["signature"] = signature
+
+solution: lp.HJBSolution = st.session_state["solution"]
+solved_tier_specs: List[TierSpec] = st.session_state["tier_specs"]
+solved_signature = st.session_state["signature"]
+
+if signature != solved_signature:
+    st.info("Parameters have changed. Click **Compute / refresh** to update the displayed solution.")
 
 st.success("Solver run complete.")
 
@@ -595,8 +687,8 @@ else:
     )
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("q points", len(config.q_grid))
-c2.metric("y points", len(config.y_grid))
+c1.metric("q points", len(solution.q_grid))
+c2.metric("y points", len(solution.y_grid))
 c3.metric("tiers", len(solution.tiers))
 c4.metric("iterations used", solution.iterations_used)
 
@@ -608,19 +700,19 @@ c7.metric("final max |rhs|", f"{solution.final_max_rhs:.2e}")
 available_y = [float(y) for y in solution.y_grid]
 available_q = [float(q) for q in solution.q_grid]
 
-global_y_for_h = st.selectbox(
+global_y_for_h = st.select_slider(
     "Drift level for value-function slice",
     options=available_y,
-    index=available_y.index(0.0) if 0.0 in available_y else len(available_y) // 2,
+    value=0.0 if 0.0 in available_y else available_y[len(available_y) // 2],
     key="global_y_slice",
 )
 st.plotly_chart(make_h_slice_figure(solution, float(global_y_for_h)), use_container_width=True)
 st.plotly_chart(make_convergence_figure(solution), use_container_width=True)
 
-tab_names = [spec.name for spec in tier_specs]
+tab_names = [spec.name for spec in solved_tier_specs]
 tabs = st.tabs(tab_names)
 
-for tab, spec, cpp_tier in zip(tabs, tier_specs, solution.tiers):
+for tab, spec, cpp_tier in zip(tabs, solved_tier_specs, solution.tiers):
     with tab:
         st.subheader(f"Tier: {spec.name}")
 
@@ -632,10 +724,10 @@ for tab, spec, cpp_tier in zip(tabs, tier_specs, solution.tiers):
             use_container_width=True,
         )
 
-        y_for_inventory = st.selectbox(
+        y_for_inventory = st.select_slider(
             f"Drift level for quotes vs inventory — {spec.name}",
             options=available_y,
-            index=available_y.index(0.0) if 0.0 in available_y else len(available_y) // 2,
+            value=0.0 if 0.0 in available_y else available_y[len(available_y) // 2],
             key=f"y_for_inventory_{spec.name}",
         )
         st.plotly_chart(
@@ -663,10 +755,10 @@ for tab, spec, cpp_tier in zip(tabs, tier_specs, solution.tiers):
                 key=f"q_ladder_{spec.name}",
             )
         with c_ladder_2:
-            y_for_ladder = st.selectbox(
+            y_for_ladder = st.select_slider(
                 f"Drift level for ladder — {spec.name}",
                 options=available_y,
-                index=available_y.index(0.0) if 0.0 in available_y else len(available_y) // 2,
+                value=0.0 if 0.0 in available_y else available_y[len(available_y) // 2],
                 key=f"y_ladder_{spec.name}",
             )
 
@@ -745,5 +837,5 @@ The ladder is still built sequentially in size order for each fixed $(q,y)$ usin
     )
 
 st.caption(
-    "This version uses a wider drift range and a controllable number of drift grid points."
+    "Use the Compute / refresh button to run the solver. Drift selectors are sliders so you can sweep policy behavior more easily."
 )
