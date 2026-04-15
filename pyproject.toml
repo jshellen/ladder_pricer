@@ -1,0 +1,14 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "ladder_pricer"
+version = "0.1.0"
+description = "C++ HJB ladder solver with pybind11 bindings"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+cmake.build-type = "Release"
