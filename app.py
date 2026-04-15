@@ -30,8 +30,8 @@ class TierSpec:
     flow_k: float
     flow_m0: float
     flow_m_alpha: float
-    markout_base: float
-    markout_coeff: float
+    jump_base: float
+    jump_coeff: float
     delta_min: float
     delta_max: float
     golden_tol: float = 1e-4
@@ -45,15 +45,15 @@ class TierSpec:
             m0=float(self.flow_m0),
             m_alpha=float(self.flow_m_alpha),
         )
-        markout = lp.SqrtMarkoutModel(
-            base=float(self.markout_base),
-            coeff=float(self.markout_coeff),
+        jump = lp.SqrtDriftJumpModel(
+            base=float(self.jump_base),
+            coeff=float(self.jump_coeff),
         )
         return lp.PriceTier(
             name=self.name,
             sizes=[float(z) for z in self.sizes],
             flow_curve=flow,
-            markout_model=markout,
+            jump_model=jump,
             delta_min=float(self.delta_min),
             delta_max=float(self.delta_max),
             golden_tol=float(self.golden_tol),
@@ -87,8 +87,8 @@ def default_tier_values(i: int) -> dict:
             "flow_k": 2.00,
             "flow_m0": 0.15,
             "flow_m_alpha": 0.075,
-            "markout_base": 0.005,
-            "markout_coeff": 0.003,
+            "jump_base": 0.000,
+            "jump_coeff": 0.020,
             "delta_min": -0.5,
             "delta_max": 4.0,
         },
@@ -100,8 +100,8 @@ def default_tier_values(i: int) -> dict:
             "flow_k": 2.40,
             "flow_m0": 0.05,
             "flow_m_alpha": 0.070,
-            "markout_base": 0.007,
-            "markout_coeff": 0.004,
+            "jump_base": 0.000,
+            "jump_coeff": 0.025,
             "delta_min": -0.5,
             "delta_max": 4.0,
         },
@@ -113,8 +113,8 @@ def default_tier_values(i: int) -> dict:
             "flow_k": 1.60,
             "flow_m0": 0.28,
             "flow_m_alpha": 0.090,
-            "markout_base": 0.003,
-            "markout_coeff": 0.002,
+            "jump_base": 0.000,
+            "jump_coeff": 0.015,
             "delta_min": -0.5,
             "delta_max": 4.0,
         },
@@ -170,21 +170,21 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
             key=f"flow_m_alpha_{i}",
         )
 
-        st.markdown("**Markout parameters**")
+        st.markdown("**Drift-jump parameters**")
         c5, c6 = st.columns(2)
-        markout_base = c5.number_input(
-            f"Markout base {i + 1}",
-            value=float(defaults["markout_base"]),
+        jump_base = c5.number_input(
+            f"Jump base {i + 1}",
+            value=float(defaults["jump_base"]),
             step=0.001,
             format="%.5f",
-            key=f"markout_base_{i}",
+            key=f"jump_base_{i}",
         )
-        markout_coeff = c6.number_input(
-            f"Markout coeff {i + 1}",
-            value=float(defaults["markout_coeff"]),
+        jump_coeff = c6.number_input(
+            f"Jump coeff {i + 1}",
+            value=float(defaults["jump_coeff"]),
             step=0.001,
             format="%.5f",
-            key=f"markout_coeff_{i}",
+            key=f"jump_coeff_{i}",
         )
 
         st.markdown("**Tier quote settings**")
@@ -225,14 +225,14 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
         flow_k=float(flow_k),
         flow_m0=float(flow_m0),
         flow_m_alpha=float(flow_m_alpha),
-        markout_base=float(markout_base),
-        markout_coeff=float(markout_coeff),
+        jump_base=float(jump_base),
+        jump_coeff=float(jump_coeff),
         delta_min=float(tier_delta_min),
         delta_max=float(tier_delta_max),
     )
 
 
-def make_flow_parameter_table(spec: TierSpec, cpp_tier: lp.PriceTier) -> pd.DataFrame:
+def make_parameter_table(spec: TierSpec, cpp_tier: lp.PriceTier) -> pd.DataFrame:
     rows = []
     for z in spec.sizes:
         zf = float(z)
@@ -242,83 +242,45 @@ def make_flow_parameter_table(spec: TierSpec, cpp_tier: lp.PriceTier) -> pd.Data
                 "A(z)": spec.flow_A0 * zf ** (-spec.flow_theta),
                 "m(z)": spec.flow_m0 + spec.flow_m_alpha * zf,
                 "k": spec.flow_k,
-                "mu(z)": cpp_tier.expected_markout(zf),
+                "jump_alpha(z)": cpp_tier.jump_size(zf),
             }
         )
     return pd.DataFrame(rows)
 
 
-def policy_arrays(cpp_tier: lp.PriceTier) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def policy_arrays(cpp_tier: lp.PriceTier) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     q_grid = np.array(cpp_tier.policy.q_grid, dtype=float)
+    y_grid = np.array(cpp_tier.policy.y_grid, dtype=float)
     bid = np.array(cpp_tier.policy.bid, dtype=float)
     ask = np.array(cpp_tier.policy.ask, dtype=float)
-    return q_grid, bid, ask
+    return q_grid, y_grid, bid, ask
 
 
-def make_quote_inventory_figure(cpp_tier: lp.PriceTier, spec: TierSpec) -> go.Figure:
-    q_grid, bid, ask = policy_arrays(cpp_tier)
+def nearest_index(arr: np.ndarray, x: float) -> int:
+    return int(np.argmin(np.abs(arr - x)))
+
+
+def make_h_slice_figure(solution: lp.HJBSolution, y_selected: float) -> go.Figure:
+    q_grid = np.array(solution.q_grid, dtype=float)
+    y_grid = np.array(solution.y_grid, dtype=float)
+    h = np.array(solution.h, dtype=float)
+
+    iy = nearest_index(y_grid, y_selected)
 
     fig = go.Figure()
-    for j, z in enumerate(spec.sizes):
-        zf = float(z)
-        fig.add_trace(
-            go.Scatter(
-                x=q_grid,
-                y=-bid[:, j],
-                mode="lines",
-                name=f"{zf:g} bid",
-            )
+    fig.add_trace(
+        go.Scatter(
+            x=q_grid,
+            y=h[:, iy],
+            mode="lines+markers",
+            name=f"h(q, y={y_grid[iy]:g})",
         )
-        fig.add_trace(
-            go.Scatter(
-                x=q_grid,
-                y=ask[:, j],
-                mode="lines",
-                line=dict(dash="dash"),
-                name=f"{zf:g} ask",
-            )
-        )
-
-    fig.add_hline(y=0.0)
+    )
     fig.update_layout(
-        title=f"Quotes vs inventory — {spec.name}",
+        title=f"Value function slice at y = {y_grid[iy]:g}",
         xaxis_title="Inventory q",
-        yaxis_title="Quote around mid (mid = 0)",
-        height=520,
-    )
-    return fig
-
-
-def make_ladder_figure(cpp_tier: lp.PriceTier, spec: TierSpec, q: float) -> go.Figure:
-    sizes = [float(z) for z in spec.sizes]
-    bid_vals = [-cpp_tier.quote(float(q), z, "bid") for z in sizes]
-    ask_vals = [cpp_tier.quote(float(q), z, "ask") for z in sizes]
-
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=sizes,
-            y=bid_vals,
-            mode="lines+markers",
-            name=f"Bid q={q:g}",
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=sizes,
-            y=ask_vals,
-            mode="lines+markers",
-            line=dict(dash="dash"),
-            name=f"Ask q={q:g}",
-        )
-    )
-
-    fig.add_hline(y=0.0)
-    fig.update_layout(
-        title=f"Ladders — {spec.name} at q = {q:g}",
-        xaxis_title="Trade size z",
-        yaxis_title="Quote around mid",
-        height=520,
+        yaxis_title="h(q,y)",
+        height=420,
     )
     return fig
 
@@ -343,47 +305,123 @@ def make_flow_curve_figure(cpp_tier: lp.PriceTier, spec: TierSpec) -> go.Figure:
         title=f"Flow curves λ(δ, z) — {spec.name}",
         xaxis_title="delta",
         yaxis_title="arrival rate",
+        height=420,
+    )
+    return fig
+
+
+def make_quote_inventory_figure(cpp_tier: lp.PriceTier, spec: TierSpec, y_selected: float) -> go.Figure:
+    q_grid, y_grid, bid, ask = policy_arrays(cpp_tier)
+    iy = nearest_index(y_grid, y_selected)
+
+    fig = go.Figure()
+    for j, z in enumerate(spec.sizes):
+        zf = float(z)
+        fig.add_trace(
+            go.Scatter(
+                x=q_grid,
+                y=-bid[:, iy, j],
+                mode="lines",
+                name=f"{zf:g} bid",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=q_grid,
+                y=ask[:, iy, j],
+                mode="lines",
+                line=dict(dash="dash"),
+                name=f"{zf:g} ask",
+            )
+        )
+
+    fig.add_hline(y=0.0)
+    fig.update_layout(
+        title=f"Quotes vs inventory at y = {y_grid[iy]:g} — {spec.name}",
+        xaxis_title="Inventory q",
+        yaxis_title="Quote around mid",
         height=520,
     )
     return fig
 
 
-def make_q_ladder_table(cpp_tier: lp.PriceTier, spec: TierSpec, q: float) -> pd.DataFrame:
+def make_ask_policy_heatmap(cpp_tier: lp.PriceTier, spec: TierSpec, z_selected: float) -> go.Figure:
+    q_grid, y_grid, _, ask = policy_arrays(cpp_tier)
+    z_arr = np.array(spec.sizes, dtype=float)
+    iz = nearest_index(z_arr, z_selected)
+
+    values = ask[:, :, iz]
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            x=y_grid,
+            y=q_grid,
+            z=values,
+            colorbar_title="ask quote",
+        )
+    )
+    fig.update_layout(
+        title=f"Ask policy heatmap for z = {z_arr[iz]:g} — {spec.name}",
+        xaxis_title="Drift state y",
+        yaxis_title="Inventory q",
+        height=520,
+    )
+    return fig
+
+
+def make_ladder_figure(cpp_tier: lp.PriceTier, spec: TierSpec, q: float, y: float) -> go.Figure:
+    sizes = [float(z) for z in spec.sizes]
+    bid_vals = [-cpp_tier.quote(float(q), float(y), z, "bid") for z in sizes]
+    ask_vals = [cpp_tier.quote(float(q), float(y), z, "ask") for z in sizes]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=sizes,
+            y=bid_vals,
+            mode="lines+markers",
+            name=f"Bid q={q:g}, y={y:g}",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=sizes,
+            y=ask_vals,
+            mode="lines+markers",
+            line=dict(dash="dash"),
+            name=f"Ask q={q:g}, y={y:g}",
+        )
+    )
+
+    fig.add_hline(y=0.0)
+    fig.update_layout(
+        title=f"Ladders — {spec.name} at q = {q:g}, y = {y:g}",
+        xaxis_title="Trade size z",
+        yaxis_title="Quote around mid",
+        height=420,
+    )
+    return fig
+
+
+def make_qy_ladder_table(cpp_tier: lp.PriceTier, spec: TierSpec, q: float, y: float) -> pd.DataFrame:
     rows = []
     for z in spec.sizes:
         zf = float(z)
-        bid_delta = cpp_tier.quote(float(q), zf, "bid")
-        ask_delta = cpp_tier.quote(float(q), zf, "ask")
+        bid_delta = cpp_tier.quote(float(q), float(y), zf, "bid")
+        ask_delta = cpp_tier.quote(float(q), float(y), zf, "ask")
         rows.append(
             {
                 "q": float(q),
+                "y": float(y),
                 "z": zf,
                 "bid_quote_plot_value": -bid_delta,
                 "ask_quote_plot_value": ask_delta,
                 "raw_bid_delta": bid_delta,
                 "raw_ask_delta": ask_delta,
+                "jump_alpha(z)": cpp_tier.jump_size(zf),
             }
         )
     return pd.DataFrame(rows)
-
-
-def make_h_figure(solution: lp.HJBSolution) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=list(solution.q_grid),
-            y=list(solution.h),
-            mode="lines+markers",
-            name="h(q)",
-        )
-    )
-    fig.update_layout(
-        title="Value function h(q)",
-        xaxis_title="Inventory q",
-        yaxis_title="h(q)",
-        height=480,
-    )
-    return fig
 
 
 def make_convergence_figure(solution: lp.HJBSolution) -> go.Figure:
@@ -426,21 +464,39 @@ def make_convergence_figure(solution: lp.HJBSolution) -> go.Figure:
 # App
 # ============================================================
 
-st.set_page_config(page_title="HJB ladder playground", layout="wide")
-st.title("HJB ladder playground")
+st.set_page_config(page_title="HJB ladder with drift state", layout="wide")
+st.title("HJB ladder playground with drift state")
 st.markdown(
     "This version uses the `ladder_pricer` C++ package via pybind11. "
-    "The app recomputes automatically whenever parameters change."
+    "The state now includes both inventory **q** and drift pressure **y**."
 )
 
 with st.sidebar:
-    st.header("Global parameters")
+    st.header("Inventory grid")
     q_min = st.number_input("q min", value=-20, step=1)
     q_max = st.number_input("q max", value=20, step=1)
     q_step = st.number_input("q step", value=1, step=1, min_value=1)
 
-    dt = st.number_input("dt", value=0.002, step=0.001, format="%.4f")
-    n_iter = st.number_input("n_iter", value=140, step=10, min_value=1)
+    st.header("Drift-state grid")
+    y_range = st.slider(
+        "Drift state range",
+        min_value=-1.0,
+        max_value=1.0,
+        value=(-0.50, 0.50),
+        step=0.01,
+    )
+    n_y_points = st.slider(
+        "Number of drift points",
+        min_value=9,
+        max_value=81,
+        value=41,
+        step=4,
+    )
+    kappa_y = st.number_input("kappa_y (drift decay speed)", value=2.0, step=0.1, format="%.4f")
+
+    st.header("HJB iteration")
+    dt = st.number_input("dt", value=0.001, step=0.001, format="%.4f")
+    n_iter = st.number_input("n_iter", value=200, step=10, min_value=1)
 
     st.header("Convergence / stopping")
     early_stop = st.checkbox("Enable early stopping", value=True)
@@ -475,10 +531,19 @@ for i in range(num_tiers):
 if q_max <= q_min:
     errors.append("q_max must be greater than q_min.")
 
+y_min, y_max = float(y_range[0]), float(y_range[1])
+if y_max <= y_min:
+    errors.append("Drift state range must have upper bound greater than lower bound.")
+
 q_grid = np.arange(float(q_min), float(q_max) + float(q_step), float(q_step), dtype=float)
+y_grid = np.round(np.linspace(y_min, y_max, int(n_y_points), dtype=float), 10)
 
 if len(q_grid) < 2:
     errors.append("q_grid must contain at least two points.")
+if len(y_grid) < 2:
+    errors.append("y_grid must contain at least two points.")
+if kappa_y < 0.0:
+    errors.append("kappa_y must be nonnegative.")
 
 if errors:
     for e in errors:
@@ -497,15 +562,20 @@ penalty = lp.PolynomialInventoryPenalty(
 
 config = lp.SolverConfig()
 config.q_grid = [float(q) for q in q_grid]
+config.y_grid = [float(y) for y in y_grid]
 config.dt = float(dt)
 config.n_iter = int(n_iter)
+config.kappa_y = float(kappa_y)
 config.early_stop = bool(early_stop)
 config.tol_h = float(tol_h)
 config.tol_rhs = float(tol_rhs)
 config.min_iter = int(min_iter)
 config.consecutive_passes_required = int(consecutive_passes_required)
 
-with st.spinner("Solving HJB in C++ and building saved policies..."):
+state_count = len(q_grid) * len(y_grid)
+st.caption(f"State grid size: {len(q_grid)} q-points × {len(y_grid)} y-points = {state_count} states")
+
+with st.spinner("Solving HJB in C++ and building drift-aware policies..."):
     solver = lp.HJBLadderSolver(config=config, penalty=penalty, tiers=cpp_tiers)
     solution: lp.HJBSolution = solver.solve()
 
@@ -526,98 +596,154 @@ else:
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("q points", len(config.q_grid))
-c2.metric("tiers", len(solution.tiers))
-c3.metric("iterations used", solution.iterations_used)
-c4.metric("converged", "yes" if solution.converged else "no")
+c2.metric("y points", len(config.y_grid))
+c3.metric("tiers", len(solution.tiers))
+c4.metric("iterations used", solution.iterations_used)
 
-c5, c6 = st.columns(2)
-c5.metric("final max |Δh|", f"{solution.final_max_h_change:.2e}")
-c6.metric("final max |rhs|", f"{solution.final_max_rhs:.2e}")
+c5, c6, c7 = st.columns(3)
+c5.metric("converged", "yes" if solution.converged else "no")
+c6.metric("final max |Δh|", f"{solution.final_max_h_change:.2e}")
+c7.metric("final max |rhs|", f"{solution.final_max_rhs:.2e}")
 
-st.plotly_chart(make_h_figure(solution), use_container_width=True)
+available_y = [float(y) for y in solution.y_grid]
+available_q = [float(q) for q in solution.q_grid]
+
+global_y_for_h = st.selectbox(
+    "Drift level for value-function slice",
+    options=available_y,
+    index=available_y.index(0.0) if 0.0 in available_y else len(available_y) // 2,
+    key="global_y_slice",
+)
+st.plotly_chart(make_h_slice_figure(solution, float(global_y_for_h)), use_container_width=True)
 st.plotly_chart(make_convergence_figure(solution), use_container_width=True)
 
 tab_names = [spec.name for spec in tier_specs]
 tabs = st.tabs(tab_names)
-
-available_q = [float(q) for q in solution.q_grid]
 
 for tab, spec, cpp_tier in zip(tabs, tier_specs, solution.tiers):
     with tab:
         st.subheader(f"Tier: {spec.name}")
 
         st.markdown("**Implied parameters at ladder sizes**")
-        st.dataframe(make_flow_parameter_table(spec, cpp_tier), use_container_width=True)
+        st.dataframe(make_parameter_table(spec, cpp_tier), use_container_width=True)
 
         st.plotly_chart(
             make_flow_curve_figure(cpp_tier, spec),
             use_container_width=True,
         )
 
+        y_for_inventory = st.selectbox(
+            f"Drift level for quotes vs inventory — {spec.name}",
+            options=available_y,
+            index=available_y.index(0.0) if 0.0 in available_y else len(available_y) // 2,
+            key=f"y_for_inventory_{spec.name}",
+        )
         st.plotly_chart(
-            make_quote_inventory_figure(cpp_tier, spec),
+            make_quote_inventory_figure(cpp_tier, spec, float(y_for_inventory)),
             use_container_width=True,
         )
 
-        default_q_single = 0.0 if 0.0 in available_q else available_q[len(available_q) // 2]
-
-        q_for_ladder = st.select_slider(
-            f"Inventory level for ladder — {spec.name}",
-            options=available_q,
-            value=default_q_single,
-            key=f"qslider_{spec.name}",
+        z_for_heatmap = st.selectbox(
+            f"Size for ask policy heatmap — {spec.name}",
+            options=[float(z) for z in spec.sizes],
+            index=0,
+            key=f"z_heat_{spec.name}",
         )
-
         st.plotly_chart(
-            make_ladder_figure(cpp_tier, spec, float(q_for_ladder)),
+            make_ask_policy_heatmap(cpp_tier, spec, float(z_for_heatmap)),
             use_container_width=True,
         )
 
-        q_for_table = st.selectbox(
-            f"q for ladder table — {spec.name}",
-            options=available_q,
-            index=available_q.index(0.0) if 0.0 in available_q else len(available_q) // 2,
-            key=f"qtable_{spec.name}",
+        c_ladder_1, c_ladder_2 = st.columns(2)
+        with c_ladder_1:
+            q_for_ladder = st.selectbox(
+                f"Inventory level for ladder — {spec.name}",
+                options=available_q,
+                index=available_q.index(0.0) if 0.0 in available_q else len(available_q) // 2,
+                key=f"q_ladder_{spec.name}",
+            )
+        with c_ladder_2:
+            y_for_ladder = st.selectbox(
+                f"Drift level for ladder — {spec.name}",
+                options=available_y,
+                index=available_y.index(0.0) if 0.0 in available_y else len(available_y) // 2,
+                key=f"y_ladder_{spec.name}",
+            )
+
+        st.plotly_chart(
+            make_ladder_figure(cpp_tier, spec, float(q_for_ladder), float(y_for_ladder)),
+            use_container_width=True,
         )
 
         st.dataframe(
-            make_q_ladder_table(cpp_tier, spec, float(q_for_table)),
+            make_qy_ladder_table(cpp_tier, spec, float(q_for_ladder), float(y_for_ladder)),
             use_container_width=True,
         )
 
 with st.expander("What this app is solving"):
     st.markdown(
         r"""
-For each inventory point $q$, the Bellman right-hand side is
+The state is now **two-dimensional**: inventory $q$ and drift pressure $y$.
+
+Spot evolves as
 
 $$
+dS_t = y_t\,dt + \sigma\,dW_t,
+$$
+
+and the drift state decays between fills:
+
+$$
+dy_t = -\kappa_y y_t\,dt.
+$$
+
+A fill of size $z$ shifts the drift state by $\alpha(z)$:
+- ask fill: $y \to y + \alpha(z)$
+- bid fill: $y \to y - \alpha(z)$
+
+Using the ansatz
+
+$$
+V(x,s,q,y)=x+qs+h(q,y),
+$$
+
+the stationary HJB is
+
+$$
+0
+=
+q\,y
 -\phi(q)
-+ \sum_{\text{tier}} \sum_z \Big[
-\lambda(\delta^b, z) \big(z(\delta^b - \mu(z)) + h(q+z)-h(q)\big)
+-\kappa_y y\,\partial_y h(q,y)
+$$
+
+$$
+\qquad
 +
-\lambda(\delta^a, z) \big(z(\delta^a - \mu(z)) + h(q-z)-h(q)\big)
+\sum_z \sup_{\delta^b}
+\lambda(\delta^b,z)
+\Big[
+z\delta^b + h(q+z, y-\alpha(z)) - h(q,y)
+\Big]
+$$
+
+$$
+\qquad
++
+\sum_z \sup_{\delta^a}
+\lambda(\delta^a,z)
+\Big[
+z\delta^a + h(q-z, y+\alpha(z)) - h(q,y)
 \Big].
 $$
 
-The C++ backend solves the ladder sequentially:
-- first near $q = 0$,
-- then for $q > 0$ moving outward,
-- then for $q < 0$ moving outward.
-
-For each side and inventory, the ladder is built rung-by-rung in size order using bounded golden-section search.
-
-Hard constraints:
-1. Larger sizes cannot be more aggressive than smaller sizes:
-   $$
-   \delta(q, z_{j+1}) \ge \delta(q, z_j).
-   $$
-2. Inventory-dependent gap rules:
-   - for $q > 0$: ask gaps shrink, bid gaps increase
-   - for $q < 0$: ask gaps increase, bid gaps decrease
+The ladder is still built sequentially in size order for each fixed $(q,y)$ using bounded golden-section search, with the same ladder constraints:
+1. larger sizes cannot be more aggressive than smaller sizes
+2. for $q>0$: ask gaps shrink, bid gaps increase
+3. for $q<0$: ask gaps increase, bid gaps decrease
         """
     )
 
 st.caption(
-    "This app recomputes on every widget change. If you want less frequent recomputation, "
-    "wrap the sidebar inputs in a form and solve only on submit."
+    "This version uses a wider drift range and a controllable number of drift grid points."
 )

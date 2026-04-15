@@ -8,10 +8,10 @@ namespace py = pybind11;
 using namespace hjb;
 
 PYBIND11_MODULE(ladder_pricer, m) {
-    m.doc() = "C++ HJB ladder solver with pybind11 bindings";
+    m.doc() = "C++ HJB ladder solver with decaying drift state and pybind11 bindings";
 
     py::class_<FlowCurve, std::shared_ptr<FlowCurve>>(m, "FlowCurve");
-    py::class_<MarkoutModel, std::shared_ptr<MarkoutModel>>(m, "MarkoutModel");
+    py::class_<DriftJumpModel, std::shared_ptr<DriftJumpModel>>(m, "DriftJumpModel");
     py::class_<InventoryPenalty, std::shared_ptr<InventoryPenalty>>(m, "InventoryPenalty");
 
     py::class_<LogisticFlowCurve, FlowCurve, std::shared_ptr<LogisticFlowCurve>>(m, "LogisticFlowCurve")
@@ -32,13 +32,13 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def("m", &LogisticFlowCurve::m)
         .def("arrival_rate", &LogisticFlowCurve::arrival_rate);
 
-    py::class_<SqrtMarkoutModel, MarkoutModel, std::shared_ptr<SqrtMarkoutModel>>(m, "SqrtMarkoutModel")
+    py::class_<SqrtDriftJumpModel, DriftJumpModel, std::shared_ptr<SqrtDriftJumpModel>>(m, "SqrtDriftJumpModel")
         .def(py::init<double, double>(),
-             py::arg("base") = 0.005,
-             py::arg("coeff") = 0.003)
-        .def_readwrite("base", &SqrtMarkoutModel::base)
-        .def_readwrite("coeff", &SqrtMarkoutModel::coeff)
-        .def("expected_markout", &SqrtMarkoutModel::expected_markout);
+             py::arg("base") = 0.0,
+             py::arg("coeff") = 0.01)
+        .def_readwrite("base", &SqrtDriftJumpModel::base)
+        .def_readwrite("coeff", &SqrtDriftJumpModel::coeff)
+        .def("jump_size", &SqrtDriftJumpModel::jump_size);
 
     py::class_<PolynomialInventoryPenalty, InventoryPenalty, std::shared_ptr<PolynomialInventoryPenalty>>(m, "PolynomialInventoryPenalty")
         .def(py::init<double, double, double, double, double>(),
@@ -57,6 +57,7 @@ PYBIND11_MODULE(ladder_pricer, m) {
     py::class_<QuotePolicy>(m, "QuotePolicy")
         .def(py::init<>())
         .def_readwrite("q_grid", &QuotePolicy::q_grid)
+        .def_readwrite("y_grid", &QuotePolicy::y_grid)
         .def_readwrite("sizes", &QuotePolicy::sizes)
         .def_readwrite("bid", &QuotePolicy::bid)
         .def_readwrite("ask", &QuotePolicy::ask)
@@ -68,7 +69,7 @@ PYBIND11_MODULE(ladder_pricer, m) {
                  std::string,
                  std::vector<double>,
                  std::shared_ptr<FlowCurve>,
-                 std::shared_ptr<MarkoutModel>,
+                 std::shared_ptr<DriftJumpModel>,
                  double,
                  double,
                  double,
@@ -76,7 +77,7 @@ PYBIND11_MODULE(ladder_pricer, m) {
              py::arg("name"),
              py::arg("sizes"),
              py::arg("flow_curve"),
-             py::arg("markout_model"),
+             py::arg("jump_model"),
              py::arg("delta_min") = -0.5,
              py::arg("delta_max") = 4.0,
              py::arg("golden_tol") = 1e-4,
@@ -89,20 +90,23 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("golden_max_iter", &PriceTier::golden_max_iter)
         .def_readwrite("policy", &PriceTier::policy)
         .def("arrival_rate", &PriceTier::arrival_rate)
-        .def("expected_markout", &PriceTier::expected_markout)
+        .def("jump_size", &PriceTier::jump_size)
         .def("quote", &PriceTier::quote)
         .def("build_policy",
              [](PriceTier& self,
-                const std::function<double(double)>& h_fn,
-                const std::vector<double>& q_grid) {
-                 return self.build_policy(h_fn, q_grid);
+                const std::function<double(double, double)>& h_fn,
+                const std::vector<double>& q_grid,
+                const std::vector<double>& y_grid) {
+                 return self.build_policy(h_fn, q_grid, y_grid);
              });
 
     py::class_<SolverConfig>(m, "SolverConfig")
         .def(py::init<>())
         .def_readwrite("q_grid", &SolverConfig::q_grid)
+        .def_readwrite("y_grid", &SolverConfig::y_grid)
         .def_readwrite("dt", &SolverConfig::dt)
         .def_readwrite("n_iter", &SolverConfig::n_iter)
+        .def_readwrite("kappa_y", &SolverConfig::kappa_y)
         .def_readwrite("early_stop", &SolverConfig::early_stop)
         .def_readwrite("tol_h", &SolverConfig::tol_h)
         .def_readwrite("tol_rhs", &SolverConfig::tol_rhs)
@@ -114,6 +118,7 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def(py::init<>())
         .def_readwrite("h", &HJBSolution::h)
         .def_readwrite("q_grid", &HJBSolution::q_grid)
+        .def_readwrite("y_grid", &HJBSolution::y_grid)
         .def_readwrite("tiers", &HJBSolution::tiers)
         .def_readwrite("converged", &HJBSolution::converged)
         .def_readwrite("iterations_used", &HJBSolution::iterations_used)

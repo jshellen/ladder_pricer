@@ -21,12 +21,122 @@ inline double clamp(double x, double lo, double hi) {
     return std::min(std::max(x, lo), hi);
 }
 
-inline double max_abs(const std::vector<double>& x) {
-    double m = 0.0;
-    for (double v : x) {
-        m = std::max(m, std::abs(v));
+inline std::pair<std::size_t, double> locate_segment_with_weight(
+    const std::vector<double>& grid,
+    double x
+) {
+    if (grid.empty()) {
+        throw std::invalid_argument("Grid cannot be empty.");
     }
-    return m;
+    if (grid.size() == 1) {
+        return {0, 0.0};
+    }
+
+    if (x <= grid.front()) {
+        const double x0 = grid[0];
+        const double x1 = grid[1];
+        const double t = (x - x0) / (x1 - x0);
+        return {0, t};
+    }
+
+    if (x >= grid.back()) {
+        const std::size_t i = grid.size() - 2;
+        const double x0 = grid[i];
+        const double x1 = grid[i + 1];
+        const double t = (x - x0) / (x1 - x0);
+        return {i, t};
+    }
+
+    auto it = std::upper_bound(grid.begin(), grid.end(), x);
+    const std::size_t i = static_cast<std::size_t>(it - grid.begin() - 1);
+    const double x0 = grid[i];
+    const double x1 = grid[i + 1];
+    const double t = (x - x0) / (x1 - x0);
+    return {i, t};
+}
+
+inline double interp_linear(
+    const std::vector<double>& grid,
+    const std::vector<double>& vals,
+    double x
+) {
+    if (grid.size() != vals.size()) {
+        throw std::invalid_argument("interp_linear: size mismatch.");
+    }
+    if (grid.empty()) {
+        throw std::invalid_argument("interp_linear: empty input.");
+    }
+    if (grid.size() == 1) {
+        return vals.front();
+    }
+
+    const auto [i, t] = locate_segment_with_weight(grid, x);
+    return vals[i] + t * (vals[i + 1] - vals[i]);
+}
+
+inline double interp_bilinear(
+    const std::vector<double>& x_grid,
+    const std::vector<double>& y_grid,
+    const std::vector<std::vector<double>>& vals,
+    double x,
+    double y
+) {
+    if (vals.size() != x_grid.size()) {
+        throw std::invalid_argument("interp_bilinear: x dimension mismatch.");
+    }
+    if (x_grid.empty() || y_grid.empty()) {
+        throw std::invalid_argument("interp_bilinear: empty grid.");
+    }
+
+    for (const auto& row : vals) {
+        if (row.size() != y_grid.size()) {
+            throw std::invalid_argument("interp_bilinear: y dimension mismatch.");
+        }
+    }
+
+    if (x_grid.size() == 1 && y_grid.size() == 1) {
+        return vals[0][0];
+    }
+
+    if (x_grid.size() == 1) {
+        return interp_linear(y_grid, vals[0], y);
+    }
+
+    if (y_grid.size() == 1) {
+        std::vector<double> col(x_grid.size(), 0.0);
+        for (std::size_t i = 0; i < x_grid.size(); ++i) {
+            col[i] = vals[i][0];
+        }
+        return interp_linear(x_grid, col, x);
+    }
+
+    const auto [ix, tx] = locate_segment_with_weight(x_grid, x);
+    const auto [iy, ty] = locate_segment_with_weight(y_grid, y);
+
+    const double v00 = vals[ix][iy];
+    const double v10 = vals[ix + 1][iy];
+    const double v01 = vals[ix][iy + 1];
+    const double v11 = vals[ix + 1][iy + 1];
+
+    const double vx0 = v00 + tx * (v10 - v00);
+    const double vx1 = v01 + tx * (v11 - v01);
+    return vx0 + ty * (vx1 - vx0);
+}
+
+inline double max_abs_vec(const std::vector<double>& x) {
+    double out = 0.0;
+    for (double v : x) {
+        out = std::max(out, std::abs(v));
+    }
+    return out;
+}
+
+inline double max_abs_mat(const std::vector<std::vector<double>>& x) {
+    double out = 0.0;
+    for (const auto& row : x) {
+        out = std::max(out, max_abs_vec(row));
+    }
+    return out;
 }
 
 inline std::vector<double> diff(const std::vector<double>& x) {
@@ -38,43 +148,6 @@ inline std::vector<double> diff(const std::vector<double>& x) {
     return out;
 }
 
-inline double interp_linear(
-    const std::vector<double>& grid,
-    const std::vector<double>& vals,
-    double x
-) {
-    if (grid.size() != vals.size()) {
-        throw std::invalid_argument("interp_linear: grid and vals size mismatch.");
-    }
-    if (grid.empty()) {
-        throw std::invalid_argument("interp_linear: empty input.");
-    }
-    if (grid.size() == 1) {
-        return vals.front();
-    }
-
-    if (x <= grid.front()) {
-        double x0 = grid[0], x1 = grid[1];
-        double y0 = vals[0], y1 = vals[1];
-        double t = (x - x0) / (x1 - x0);
-        return y0 + t * (y1 - y0);
-    }
-    if (x >= grid.back()) {
-        std::size_t n = grid.size();
-        double x0 = grid[n - 2], x1 = grid[n - 1];
-        double y0 = vals[n - 2], y1 = vals[n - 1];
-        double t = (x - x0) / (x1 - x0);
-        return y0 + t * (y1 - y0);
-    }
-
-    auto it = std::upper_bound(grid.begin(), grid.end(), x);
-    std::size_t idx = static_cast<std::size_t>(it - grid.begin() - 1);
-    double x0 = grid[idx], x1 = grid[idx + 1];
-    double y0 = vals[idx], y1 = vals[idx + 1];
-    double t = (x - x0) / (x1 - x0);
-    return y0 + t * (y1 - y0);
-}
-
 // ============================================================
 // Abstract model components
 // ============================================================
@@ -84,9 +157,9 @@ struct FlowCurve {
     virtual double arrival_rate(double delta, double z) const = 0;
 };
 
-struct MarkoutModel {
-    virtual ~MarkoutModel() = default;
-    virtual double expected_markout(double z) const = 0;
+struct DriftJumpModel {
+    virtual ~DriftJumpModel() = default;
+    virtual double jump_size(double z) const = 0;
 };
 
 struct InventoryPenalty {
@@ -134,8 +207,8 @@ struct LogisticFlowCurve final : public FlowCurve {
     }
 
     double arrival_rate(double delta, double z) const override {
-        double Az = A(z);
-        double mz = m(z);
+        const double Az = A(z);
+        const double mz = m(z);
 
         if (Az < 0.0) {
             throw std::invalid_argument("A(z) must be nonnegative.");
@@ -145,6 +218,7 @@ struct LogisticFlowCurve final : public FlowCurve {
         }
 
         const double x = k * (delta - mz);
+
         if (x >= 0.0) {
             const double ex = std::exp(-x);
             return Az * ex / (1.0 + ex);
@@ -154,14 +228,16 @@ struct LogisticFlowCurve final : public FlowCurve {
     }
 };
 
-struct SqrtMarkoutModel final : public MarkoutModel {
-    double base{0.005};
-    double coeff{0.003};
+struct SqrtDriftJumpModel final : public DriftJumpModel {
+    double base{0.0};
+    double coeff{0.01};
 
-    SqrtMarkoutModel() = default;
-    SqrtMarkoutModel(double base_, double coeff_) : base(base_), coeff(coeff_) {}
+    SqrtDriftJumpModel() = default;
 
-    double expected_markout(double z) const override {
+    SqrtDriftJumpModel(double base_, double coeff_)
+        : base(base_), coeff(coeff_) {}
+
+    double jump_size(double z) const override {
         return base + coeff * std::sqrt(z);
     }
 };
@@ -196,24 +272,29 @@ struct PolynomialInventoryPenalty final : public InventoryPenalty {
 };
 
 // ============================================================
-// Quote policy
+// Quote policy: indexed by q, y, size
 // ============================================================
 
 struct QuotePolicy {
     std::vector<double> q_grid;
+    std::vector<double> y_grid;
     std::vector<double> sizes;
-    std::vector<std::vector<double>> bid;  // shape: nq x nz
-    std::vector<std::vector<double>> ask;  // shape: nq x nz
+
+    // shapes: [nq][ny][nz]
+    std::vector<std::vector<std::vector<double>>> bid;
+    std::vector<std::vector<std::vector<double>>> ask;
 
     QuotePolicy() = default;
 
     QuotePolicy(
         std::vector<double> q_grid_,
+        std::vector<double> y_grid_,
         std::vector<double> sizes_,
-        std::vector<std::vector<double>> bid_,
-        std::vector<std::vector<double>> ask_
+        std::vector<std::vector<std::vector<double>>> bid_,
+        std::vector<std::vector<std::vector<double>>> ask_
     )
         : q_grid(std::move(q_grid_)),
+          y_grid(std::move(y_grid_)),
           sizes(std::move(sizes_)),
           bid(std::move(bid_)),
           ask(std::move(ask_)) {
@@ -222,43 +303,65 @@ struct QuotePolicy {
 
     void validate() const {
         const std::size_t nq = q_grid.size();
+        const std::size_t ny = y_grid.size();
         const std::size_t nz = sizes.size();
 
         if (bid.size() != nq || ask.size() != nq) {
-            throw std::invalid_argument("QuotePolicy: row count mismatch.");
+            throw std::invalid_argument("QuotePolicy: q dimension mismatch.");
         }
-        for (const auto& row : bid) {
-            if (row.size() != nz) {
-                throw std::invalid_argument("QuotePolicy: bid column count mismatch.");
+
+        for (const auto& slab : bid) {
+            if (slab.size() != ny) {
+                throw std::invalid_argument("QuotePolicy: bid y dimension mismatch.");
+            }
+            for (const auto& row : slab) {
+                if (row.size() != nz) {
+                    throw std::invalid_argument("QuotePolicy: bid size dimension mismatch.");
+                }
             }
         }
-        for (const auto& row : ask) {
-            if (row.size() != nz) {
-                throw std::invalid_argument("QuotePolicy: ask column count mismatch.");
+
+        for (const auto& slab : ask) {
+            if (slab.size() != ny) {
+                throw std::invalid_argument("QuotePolicy: ask y dimension mismatch.");
+            }
+            for (const auto& row : slab) {
+                if (row.size() != nz) {
+                    throw std::invalid_argument("QuotePolicy: ask size dimension mismatch.");
+                }
             }
         }
     }
 
-    double delta_at_index(std::size_t i, std::size_t j, const std::string& side) const {
-        if (side == "bid") return bid.at(i).at(j);
-        if (side == "ask") return ask.at(i).at(j);
+    double delta_at_index(
+        std::size_t iq,
+        std::size_t iy,
+        std::size_t iz,
+        const std::string& side
+    ) const {
+        if (side == "bid") return bid.at(iq).at(iy).at(iz);
+        if (side == "ask") return ask.at(iq).at(iy).at(iz);
         throw std::invalid_argument("Unknown side: " + side);
     }
 
-    double quote(double q, double z, const std::string& side) const {
-        const auto& mat = (side == "bid") ? bid : ask;
+    double quote(double q, double y, double z, const std::string& side) const {
+        const auto& cube = (side == "bid") ? bid : ask;
         if (side != "bid" && side != "ask") {
             throw std::invalid_argument("Unknown side: " + side);
         }
 
         std::vector<double> vals_by_z(sizes.size(), 0.0);
-        for (std::size_t j = 0; j < sizes.size(); ++j) {
-            std::vector<double> col(q_grid.size(), 0.0);
-            for (std::size_t i = 0; i < q_grid.size(); ++i) {
-                col[i] = mat[i][j];
+
+        for (std::size_t iz = 0; iz < sizes.size(); ++iz) {
+            std::vector<std::vector<double>> slice(q_grid.size(), std::vector<double>(y_grid.size(), 0.0));
+            for (std::size_t iq = 0; iq < q_grid.size(); ++iq) {
+                for (std::size_t iy = 0; iy < y_grid.size(); ++iy) {
+                    slice[iq][iy] = cube[iq][iy][iz];
+                }
             }
-            vals_by_z[j] = interp_linear(q_grid, col, q);
+            vals_by_z[iz] = interp_bilinear(q_grid, y_grid, slice, q, y);
         }
+
         return interp_linear(sizes, vals_by_z, z);
     }
 };
@@ -271,7 +374,7 @@ struct PriceTier {
     std::string name;
     std::vector<double> sizes;
     std::shared_ptr<FlowCurve> flow_curve;
-    std::shared_ptr<MarkoutModel> markout_model;
+    std::shared_ptr<DriftJumpModel> jump_model;
 
     double delta_min{-0.5};
     double delta_max{4.0};
@@ -286,7 +389,7 @@ struct PriceTier {
         std::string name_,
         std::vector<double> sizes_,
         std::shared_ptr<FlowCurve> flow_curve_,
-        std::shared_ptr<MarkoutModel> markout_model_,
+        std::shared_ptr<DriftJumpModel> jump_model_,
         double delta_min_ = -0.5,
         double delta_max_ = 4.0,
         double golden_tol_ = 1e-4,
@@ -295,7 +398,7 @@ struct PriceTier {
         : name(std::move(name_)),
           sizes(std::move(sizes_)),
           flow_curve(std::move(flow_curve_)),
-          markout_model(std::move(markout_model_)),
+          jump_model(std::move(jump_model_)),
           delta_min(delta_min_),
           delta_max(delta_max_),
           golden_tol(golden_tol_),
@@ -310,12 +413,13 @@ struct PriceTier {
         if (!flow_curve) {
             throw std::invalid_argument("PriceTier: flow_curve cannot be null.");
         }
-        if (!markout_model) {
-            throw std::invalid_argument("PriceTier: markout_model cannot be null.");
+        if (!jump_model) {
+            throw std::invalid_argument("PriceTier: jump_model cannot be null.");
         }
         if (delta_max <= delta_min) {
             throw std::invalid_argument("PriceTier: delta_max must be > delta_min.");
         }
+
         for (double z : sizes) {
             if (z <= 0.0) {
                 throw std::invalid_argument("PriceTier: sizes must be positive.");
@@ -334,26 +438,33 @@ struct PriceTier {
         throw std::invalid_argument("Unknown side: " + side);
     }
 
+    static double next_drift(double y, double jump, const std::string& side) {
+        if (side == "bid") return y - jump;
+        if (side == "ask") return y + jump;
+        throw std::invalid_argument("Unknown side: " + side);
+    }
+
     double arrival_rate(double delta, double z) const {
         return flow_curve->arrival_rate(delta, z);
     }
 
-    double expected_markout(double z) const {
-        return markout_model->expected_markout(z);
+    double jump_size(double z) const {
+        return jump_model->jump_size(z);
     }
 
     double single_size_objective(
         double delta,
-        const std::function<double(double)>& h_fn,
+        const std::function<double(double, double)>& h_fn,
         double q,
+        double y,
         double z,
         const std::string& side
     ) const {
         const double q_next = next_inventory(q, z, side);
-        const double dh = h_fn(q_next) - h_fn(q);
+        const double y_next = next_drift(y, jump_size(z), side);
+        const double dh = h_fn(q_next, y_next) - h_fn(q, y);
         const double lam = arrival_rate(delta, z);
-        const double mu = expected_markout(z);
-        return lam * (z * (delta - mu) + dh);
+        return lam * (z * delta + dh);
     }
 
     double golden_search_max(
@@ -420,7 +531,6 @@ struct PriceTier {
             prev_gaps = diff(*prev_delta);
         }
 
-        // Smallest rung
         if (rung_idx == 0) {
             if (!prev_gaps.empty() && is_expand_mode(q, side)) {
                 double required_total_gap = 0.0;
@@ -430,7 +540,6 @@ struct PriceTier {
             return {lower, upper};
         }
 
-        // Weak monotonicity in size: d_j >= d_{j-1}
         const double prev_curr = current_delta[rung_idx - 1];
         lower = std::max(lower, prev_curr);
 
@@ -441,13 +550,10 @@ struct PriceTier {
         const double prev_gap = prev_gaps[rung_idx - 1];
 
         if (is_shrink_mode(q, side)) {
-            // d_j - d_{j-1} <= prev_gap
             upper = std::min(upper, prev_curr + prev_gap);
         } else if (is_expand_mode(q, side)) {
-            // d_j - d_{j-1} >= prev_gap
             lower = std::max(lower, prev_curr + prev_gap);
 
-            // Reserve room for future mandatory gaps
             double remaining_future_gap = 0.0;
             for (std::size_t k = rung_idx; k + 1 < n; ++k) {
                 remaining_future_gap += prev_gaps[k];
@@ -459,8 +565,9 @@ struct PriceTier {
     }
 
     std::vector<double> solve_side_ladder(
-        const std::function<double(double)>& h_fn,
+        const std::function<double(double, double)>& h_fn,
         double q,
+        double y,
         const std::string& side,
         const std::vector<double>* prev_delta = nullptr
     ) const {
@@ -483,7 +590,7 @@ struct PriceTier {
 
             const double z = sizes[j];
             auto obj = [&](double d) {
-                return single_size_objective(d, h_fn, q, z, side);
+                return single_size_objective(d, h_fn, q, y, z, side);
             };
 
             delta[j] = golden_search_max(obj, lower, upper);
@@ -494,14 +601,20 @@ struct PriceTier {
     }
 
     QuotePolicy build_policy(
-        const std::function<double(double)>& h_fn,
-        const std::vector<double>& q_grid
+        const std::function<double(double, double)>& h_fn,
+        const std::vector<double>& q_grid,
+        const std::vector<double>& y_grid
     ) {
         const std::size_t nq = q_grid.size();
+        const std::size_t ny = y_grid.size();
         const std::size_t nz = sizes.size();
 
-        std::vector<std::vector<double>> bid(nq, std::vector<double>(nz, 0.0));
-        std::vector<std::vector<double>> ask(nq, std::vector<double>(nz, 0.0));
+        std::vector<std::vector<std::vector<double>>> bid(
+            nq, std::vector<std::vector<double>>(ny, std::vector<double>(nz, 0.0))
+        );
+        std::vector<std::vector<std::vector<double>>> ask(
+            nq, std::vector<std::vector<double>>(ny, std::vector<double>(nz, 0.0))
+        );
 
         std::size_t q0_idx = 0;
         double best_abs = std::numeric_limits<double>::infinity();
@@ -513,30 +626,32 @@ struct PriceTier {
             }
         }
 
-        const double q0 = q_grid[q0_idx];
-        ask[q0_idx] = solve_side_ladder(h_fn, q0, "ask", nullptr);
-        bid[q0_idx] = solve_side_ladder(h_fn, q0, "bid", nullptr);
+        for (std::size_t iy = 0; iy < ny; ++iy) {
+            const double y = y_grid[iy];
+            const double q0 = q_grid[q0_idx];
 
-        // q > 0 outward
-        for (std::size_t i = q0_idx + 1; i < nq; ++i) {
-            const double q = q_grid[i];
-            ask[i] = solve_side_ladder(h_fn, q, "ask", &ask[i - 1]);
-            bid[i] = solve_side_ladder(h_fn, q, "bid", &bid[i - 1]);
+            ask[q0_idx][iy] = solve_side_ladder(h_fn, q0, y, "ask", nullptr);
+            bid[q0_idx][iy] = solve_side_ladder(h_fn, q0, y, "bid", nullptr);
+
+            for (std::size_t iq = q0_idx + 1; iq < nq; ++iq) {
+                const double q = q_grid[iq];
+                ask[iq][iy] = solve_side_ladder(h_fn, q, y, "ask", &ask[iq - 1][iy]);
+                bid[iq][iy] = solve_side_ladder(h_fn, q, y, "bid", &bid[iq - 1][iy]);
+            }
+
+            for (std::size_t ii = q0_idx; ii-- > 0;) {
+                const double q = q_grid[ii];
+                ask[ii][iy] = solve_side_ladder(h_fn, q, y, "ask", &ask[ii + 1][iy]);
+                bid[ii][iy] = solve_side_ladder(h_fn, q, y, "bid", &bid[ii + 1][iy]);
+            }
         }
 
-        // q < 0 outward
-        for (std::size_t ii = q0_idx; ii-- > 0;) {
-            const double q = q_grid[ii];
-            ask[ii] = solve_side_ladder(h_fn, q, "ask", &ask[ii + 1]);
-            bid[ii] = solve_side_ladder(h_fn, q, "bid", &bid[ii + 1]);
-        }
-
-        policy = QuotePolicy(q_grid, sizes, bid, ask);
+        policy = QuotePolicy(q_grid, y_grid, sizes, bid, ask);
         return policy;
     }
 
-    double quote(double q, double z, const std::string& side) const {
-        return policy.quote(q, z, side);
+    double quote(double q, double y, double z, const std::string& side) const {
+        return policy.quote(q, y, z, side);
     }
 };
 
@@ -546,8 +661,11 @@ struct PriceTier {
 
 struct SolverConfig {
     std::vector<double> q_grid;
+    std::vector<double> y_grid;
+
     double dt{0.002};
     int n_iter{140};
+    double kappa_y{1.0};
 
     bool early_stop{true};
     double tol_h{1e-5};
@@ -559,11 +677,17 @@ struct SolverConfig {
         if (q_grid.empty()) {
             throw std::invalid_argument("SolverConfig: q_grid cannot be empty.");
         }
+        if (y_grid.empty()) {
+            throw std::invalid_argument("SolverConfig: y_grid cannot be empty.");
+        }
         if (dt <= 0.0) {
             throw std::invalid_argument("SolverConfig: dt must be positive.");
         }
         if (n_iter < 1) {
             throw std::invalid_argument("SolverConfig: n_iter must be at least 1.");
+        }
+        if (kappa_y < 0.0) {
+            throw std::invalid_argument("SolverConfig: kappa_y must be nonnegative.");
         }
         if (tol_h < 0.0 || tol_rhs < 0.0) {
             throw std::invalid_argument("SolverConfig: tolerances must be nonnegative.");
@@ -571,12 +695,23 @@ struct SolverConfig {
         if (min_iter < 0 || consecutive_passes_required < 1) {
             throw std::invalid_argument("SolverConfig: invalid stopping parameters.");
         }
+        for (std::size_t i = 1; i < q_grid.size(); ++i) {
+            if (q_grid[i] <= q_grid[i - 1]) {
+                throw std::invalid_argument("SolverConfig: q_grid must be strictly increasing.");
+            }
+        }
+        for (std::size_t i = 1; i < y_grid.size(); ++i) {
+            if (y_grid[i] <= y_grid[i - 1]) {
+                throw std::invalid_argument("SolverConfig: y_grid must be strictly increasing.");
+            }
+        }
     }
 };
 
 struct HJBSolution {
-    std::vector<double> h;
+    std::vector<std::vector<double>> h;  // [nq][ny]
     std::vector<double> q_grid;
+    std::vector<double> y_grid;
     std::vector<std::shared_ptr<PriceTier>> tiers;
 
     bool converged{false};
@@ -606,62 +741,127 @@ struct HJBLadderSolver {
         }
     }
 
-    std::function<double(double)> make_h_interp(const std::vector<double>& h_vec) const {
-        std::vector<double> grid = config.q_grid;
-        std::vector<double> vals = h_vec;
-        return [grid = std::move(grid), vals = std::move(vals)](double q) {
-            return interp_linear(grid, vals, q);
+    std::function<double(double, double)> make_h_interp(
+        const std::vector<std::vector<double>>& h_mat
+    ) const {
+        const auto qg = config.q_grid;
+        const auto yg = config.y_grid;
+        const auto hm = h_mat;
+        return [qg = std::move(qg), yg = std::move(yg), hm = std::move(hm)](double q, double y) {
+            return interp_bilinear(qg, yg, hm, q, y);
         };
     }
 
-    void update_policies(const std::vector<double>& h_vec) {
-        auto h_fn = make_h_interp(h_vec);
+    double y_drift_term(
+        const std::vector<std::vector<double>>& h_mat,
+        std::size_t iq,
+        std::size_t iy
+    ) const {
+        const double y = config.y_grid[iy];
+        const double b = -config.kappa_y * y;
+
+        if (std::abs(b) < 1e-14 || config.y_grid.size() == 1) {
+            return 0.0;
+        }
+
+        double dh_dy = 0.0;
+        const std::size_t ny = config.y_grid.size();
+
+        if (b > 0.0) {
+            if (iy == 0) {
+                const double dy = config.y_grid[1] - config.y_grid[0];
+                dh_dy = (h_mat[iq][1] - h_mat[iq][0]) / dy;
+            } else {
+                const double dy = config.y_grid[iy] - config.y_grid[iy - 1];
+                dh_dy = (h_mat[iq][iy] - h_mat[iq][iy - 1]) / dy;
+            }
+        } else {
+            if (iy + 1 >= ny) {
+                const double dy = config.y_grid[ny - 1] - config.y_grid[ny - 2];
+                dh_dy = (h_mat[iq][ny - 1] - h_mat[iq][ny - 2]) / dy;
+            } else {
+                const double dy = config.y_grid[iy + 1] - config.y_grid[iy];
+                dh_dy = (h_mat[iq][iy + 1] - h_mat[iq][iy]) / dy;
+            }
+        }
+
+        return b * dh_dy;
+    }
+
+    void update_policies(const std::vector<std::vector<double>>& h_mat) {
+        auto h_fn = make_h_interp(h_mat);
         for (auto& tier : tiers) {
-            tier->build_policy(h_fn, config.q_grid);
+            tier->build_policy(h_fn, config.q_grid, config.y_grid);
         }
     }
 
-    std::vector<double> bellman_rhs_from_policies(const std::vector<double>& h_vec) const {
-        auto h_fn = make_h_interp(h_vec);
-        std::vector<double> rhs(h_vec.size(), 0.0);
+    std::vector<std::vector<double>> bellman_rhs_from_policies(
+        const std::vector<std::vector<double>>& h_mat
+    ) const {
+        auto h_fn = make_h_interp(h_mat);
 
-        for (std::size_t i = 0; i < config.q_grid.size(); ++i) {
-            const double q = config.q_grid[i];
-            double val = -penalty->value(q);
+        const std::size_t nq = config.q_grid.size();
+        const std::size_t ny = config.y_grid.size();
+        std::vector<std::vector<double>> rhs(nq, std::vector<double>(ny, 0.0));
 
-            for (const auto& tier : tiers) {
-                for (std::size_t j = 0; j < tier->sizes.size(); ++j) {
-                    const double z = tier->sizes[j];
-                    const double mu = tier->expected_markout(z);
+        for (std::size_t iq = 0; iq < nq; ++iq) {
+            const double q = config.q_grid[iq];
 
-                    const double d_b = tier->policy.delta_at_index(i, j, "bid");
-                    const double qpb = h_fn(q + z) - h_fn(q);
-                    const double lam_b = tier->arrival_rate(d_b, z);
-                    val += lam_b * (z * (d_b - mu) + qpb);
+            for (std::size_t iy = 0; iy < ny; ++iy) {
+                const double y = config.y_grid[iy];
 
-                    const double d_a = tier->policy.delta_at_index(i, j, "ask");
-                    const double qpa = h_fn(q - z) - h_fn(q);
-                    const double lam_a = tier->arrival_rate(d_a, z);
-                    val += lam_a * (z * (d_a - mu) + qpa);
+                double val = q * y;
+                val += y_drift_term(h_mat, iq, iy);
+                val -= penalty->value(q);
+
+                for (const auto& tier : tiers) {
+                    for (std::size_t iz = 0; iz < tier->sizes.size(); ++iz) {
+                        const double z = tier->sizes[iz];
+                        const double jump = tier->jump_size(z);
+
+                        const double d_b = tier->policy.delta_at_index(iq, iy, iz, "bid");
+                        const double lam_b = tier->arrival_rate(d_b, z);
+                        const double cont_b = h_fn(q + z, y - jump) - h_fn(q, y);
+                        val += lam_b * (z * d_b + cont_b);
+
+                        const double d_a = tier->policy.delta_at_index(iq, iy, iz, "ask");
+                        const double lam_a = tier->arrival_rate(d_a, z);
+                        const double cont_a = h_fn(q - z, y + jump) - h_fn(q, y);
+                        val += lam_a * (z * d_a + cont_a);
+                    }
                 }
-            }
 
-            rhs[i] = val;
+                rhs[iq][iy] = val;
+            }
         }
 
         return rhs;
     }
 
     HJBSolution solve() {
-        std::vector<double> h(config.q_grid.size(), 0.0);
+        const std::size_t nq = config.q_grid.size();
+        const std::size_t ny = config.y_grid.size();
+
+        std::vector<std::vector<double>> h(nq, std::vector<double>(ny, 0.0));
 
         std::size_t q0_idx = 0;
-        double best_abs = std::numeric_limits<double>::infinity();
-        for (std::size_t i = 0; i < config.q_grid.size(); ++i) {
+        std::size_t y0_idx = 0;
+
+        double best_abs_q = std::numeric_limits<double>::infinity();
+        for (std::size_t i = 0; i < nq; ++i) {
             const double a = std::abs(config.q_grid[i]);
-            if (a < best_abs) {
-                best_abs = a;
+            if (a < best_abs_q) {
+                best_abs_q = a;
                 q0_idx = i;
+            }
+        }
+
+        double best_abs_y = std::numeric_limits<double>::infinity();
+        for (std::size_t j = 0; j < ny; ++j) {
+            const double a = std::abs(config.y_grid[j]);
+            if (a < best_abs_y) {
+                best_abs_y = a;
+                y0_idx = j;
             }
         }
 
@@ -675,27 +875,29 @@ struct HJBLadderSolver {
         std::vector<double> hist_rhs;
 
         for (int it = 1; it <= config.n_iter; ++it) {
-            const std::vector<double> h_old = h;
+            const auto h_old = h;
 
             update_policies(h_old);
-            const std::vector<double> rhs = bellman_rhs_from_policies(h_old);
+            const auto rhs = bellman_rhs_from_policies(h_old);
 
-            for (std::size_t i = 0; i < h.size(); ++i) {
-                h[i] = h_old[i] + config.dt * rhs[i];
+            std::vector<std::vector<double>> dh(nq, std::vector<double>(ny, 0.0));
+
+            for (std::size_t iq = 0; iq < nq; ++iq) {
+                for (std::size_t iy = 0; iy < ny; ++iy) {
+                    h[iq][iy] = h_old[iq][iy] + config.dt * rhs[iq][iy];
+                    dh[iq][iy] = h[iq][iy] - h_old[iq][iy];
+                }
             }
 
-            const double h0 = h[q0_idx];
-            for (double& v : h) {
-                v -= h0;
+            const double anchor = h[q0_idx][y0_idx];
+            for (std::size_t iq = 0; iq < nq; ++iq) {
+                for (std::size_t iy = 0; iy < ny; ++iy) {
+                    h[iq][iy] -= anchor;
+                }
             }
 
-            std::vector<double> dh(h.size(), 0.0);
-            for (std::size_t i = 0; i < h.size(); ++i) {
-                dh[i] = h[i] - h_old[i];
-            }
-
-            const double max_h_change = max_abs(dh);
-            const double max_rhs_now = max_abs(rhs);
+            const double max_h_change = max_abs_mat(dh);
+            const double max_rhs_now = max_abs_mat(rhs);
 
             hist_h.push_back(max_h_change);
             hist_rhs.push_back(max_rhs_now);
@@ -727,6 +929,7 @@ struct HJBLadderSolver {
         HJBSolution out;
         out.h = std::move(h);
         out.q_grid = config.q_grid;
+        out.y_grid = config.y_grid;
         out.tiers = tiers;
         out.converged = converged;
         out.iterations_used = iterations_used;
