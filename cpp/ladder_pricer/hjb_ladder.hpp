@@ -26,7 +26,9 @@ struct FlatCube3D {
         : data(nq_ * ny_ * nnu_, init), nq(nq_), ny(ny_), nnu(nnu_) {}
 
     void reset(std::size_t nq_, std::size_t ny_, std::size_t nnu_, double init = 0.0) {
-        nq = nq_; ny = ny_; nnu = nnu_;
+        nq = nq_;
+        ny = ny_;
+        nnu = nnu_;
         data.assign(nq_ * ny_ * nnu_, init);
     }
 
@@ -59,7 +61,10 @@ struct FlatCube4D {
     // Reallocates (zeroed) only when shape changes.
     void ensure_shape(std::size_t nq_, std::size_t ny_, std::size_t nnu_, std::size_t nz_) {
         if (nq_ == nq && ny_ == ny && nnu_ == nnu && nz_ == nz) return;
-        nq = nq_; ny = ny_; nnu = nnu_; nz = nz_;
+        nq = nq_;
+        ny = ny_;
+        nnu = nnu_;
+        nz = nz_;
         data.assign(nq_ * ny_ * nnu_ * nz_, 0.0);
     }
 
@@ -140,8 +145,8 @@ inline double interp_linear(
     double x
 ) {
     if (grid.size() != vals.size()) throw std::invalid_argument("interp_linear: size mismatch.");
-    if (grid.empty())               throw std::invalid_argument("interp_linear: empty input.");
-    if (grid.size() == 1)           return vals.front();
+    if (grid.empty()) throw std::invalid_argument("interp_linear: empty input.");
+    if (grid.size() == 1) return vals.front();
 
     const auto [i, t] = locate_segment_with_weight(grid, x);
     return vals[i] + t * (vals[i + 1] - vals[i]);
@@ -226,7 +231,10 @@ inline double max_abs_3d(const FlatCube3D& x) {
 
 // Writes differences of the n-element array x into out.
 inline void diff_inplace(const double* x, std::size_t n, std::vector<double>& out) {
-    if (n < 2) { out.clear(); return; }
+    if (n < 2) {
+        out.clear();
+        return;
+    }
     out.resize(n - 1);
     for (std::size_t i = 0; i + 1 < n; ++i) out[i] = x[i + 1] - x[i];
 }
@@ -246,7 +254,8 @@ struct HInterp3D {
         const std::vector<double>& y_grid_,
         const std::vector<double>& nu_grid_,
         const FlatCube3D& h_
-    ) : q_grid(q_grid_), y_grid(y_grid_), nu_grid(nu_grid_), h(h_) {
+    )
+        : q_grid(q_grid_), y_grid(y_grid_), nu_grid(nu_grid_), h(h_) {
         if (h.nq != q_grid.size())
             throw std::invalid_argument("HInterp3D: q dimension mismatch.");
         if (h.ny != y_grid.size())
@@ -332,11 +341,15 @@ struct GoldenSectionOptimizer {
             if (std::abs(b - a) < opts.tol) break;
 
             if (fc > fd) {
-                b = d; d = c; fd = fc;
+                b = d;
+                d = c;
+                fd = fc;
                 c = b - (b - a) / gr;
                 fc = f(c);
             } else {
-                a = c; c = d; fc = fd;
+                a = c;
+                c = d;
+                fc = fd;
                 d = a + (b - a) / gr;
                 fd = f(d);
             }
@@ -490,13 +503,21 @@ struct QuotePolicy {
         validate();
     }
 
-    void ensure_shape(
+    // Copy metadata once up front.
+    void set_axes(
         const std::vector<double>& q_grid_,
         const std::vector<double>& y_grid_,
         const std::vector<double>& nu_grid_,
         const std::vector<double>& sizes_
     ) {
-        q_grid = q_grid_; y_grid = y_grid_; nu_grid = nu_grid_; sizes = sizes_;
+        q_grid = q_grid_;
+        y_grid = y_grid_;
+        nu_grid = nu_grid_;
+        sizes = sizes_;
+    }
+
+    // Allocate storage once up front (or reallocate only if shape actually changed).
+    void ensure_storage_shape() {
         bid.ensure_shape(q_grid.size(), y_grid.size(), nu_grid.size(), sizes.size());
         ask.ensure_shape(q_grid.size(), y_grid.size(), nu_grid.size(), sizes.size());
     }
@@ -580,9 +601,9 @@ struct PriceTier {
     }
 
     void validate() const {
-        if (sizes.empty())   throw std::invalid_argument("PriceTier: sizes cannot be empty.");
-        if (!flow_curve)     throw std::invalid_argument("PriceTier: flow_curve cannot be null.");
-        if (!jump_model)     throw std::invalid_argument("PriceTier: jump_model cannot be null.");
+        if (sizes.empty()) throw std::invalid_argument("PriceTier: sizes cannot be empty.");
+        if (!flow_curve) throw std::invalid_argument("PriceTier: flow_curve cannot be null.");
+        if (!jump_model) throw std::invalid_argument("PriceTier: jump_model cannot be null.");
         if (delta_max <= delta_min)
             throw std::invalid_argument("PriceTier: delta_max must be > delta_min.");
         for (double z : sizes)
@@ -593,7 +614,7 @@ struct PriceTier {
     }
 
     double arrival_rate(double delta, double z) const { return flow_curve->arrival_rate(delta, z); }
-    double jump_size(double z)                  const { return jump_model->jump_size(z); }
+    double jump_size(double z) const { return jump_model->jump_size(z); }
 
     double quote(double q, double y, double nu, double z, Side side) const {
         return policy.quote(q, y, nu, z, side);
@@ -729,14 +750,18 @@ struct LadderPolicyBuilder {
         const std::size_t ny  = y_grid.size();
         const std::size_t nnu = nu_grid.size();
 
-        policy.ensure_shape(q_grid, y_grid, nu_grid, tier.sizes);
+        // Storage and metadata are assumed to have been initialised once up front.
+        // This routine only overwrites the existing bid/ask values.
 
         // Find the index closest to q = 0 as the unseeded starting point.
         std::size_t q0_idx = 0;
         double best_abs = std::numeric_limits<double>::infinity();
         for (std::size_t i = 0; i < nq; ++i) {
             const double a = std::abs(q_grid[i]);
-            if (a < best_abs) { best_abs = a; q0_idx = i; }
+            if (a < best_abs) {
+                best_abs = a;
+                q0_idx = i;
+            }
         }
 
         std::vector<double> prev_gaps_storage;
@@ -815,7 +840,7 @@ struct SolverConfig {
             throw std::invalid_argument("SolverConfig: n_iter must be at least 1.");
         if (kappa_y < 0.0 || kappa_nu < 0.0 || eta_nu < 0.0)
             throw std::invalid_argument(
-                "SolverConfig: mean reversion and vol-of-vol must be nonneg.");
+                "SolverConfig: mean reversion and vol-of-vol must be nonnegative.");
         if (tol_h < 0.0 || tol_rhs < 0.0)
             throw std::invalid_argument("SolverConfig: tolerances must be nonnegative.");
         if (min_iter < 0 || consecutive_passes_required < 1)
@@ -863,6 +888,17 @@ struct HJBLadderSolver {
           tiers(std::move(tiers_)) {
         config.validate();
         if (!penalty) throw std::invalid_argument("HJBLadderSolver: penalty cannot be null.");
+        initialize_policies();
+    }
+
+    void initialize_policies() {
+        for (auto& tier : tiers) {
+            if (!tier) throw std::invalid_argument("HJBLadderSolver: tier cannot be null.");
+            tier->validate();
+            tier->policy.set_axes(config.q_grid, config.y_grid, config.nu_grid, tier->sizes);
+            tier->policy.ensure_storage_shape();
+            tier->policy.validate();
+        }
     }
 
     HInterp3D make_h_interp(const FlatCube3D& h_mat) const {
@@ -965,7 +1001,10 @@ struct HJBLadderSolver {
             double best = std::numeric_limits<double>::infinity();
             for (std::size_t i = 0; i < g.size(); ++i) {
                 const double a = std::abs(g[i]);
-                if (a < best) { best = a; idx = i; }
+                if (a < best) {
+                    best = a;
+                    idx = i;
+                }
             }
             return idx;
         };
@@ -984,10 +1023,10 @@ struct HJBLadderSolver {
             exp_2nu[inu] = std::exp(2.0 * config.nu_grid[inu]);
 
         bool converged = false;
-        int  iterations_used = 0;
+        int iterations_used = 0;
         double final_max_h_change = std::numeric_limits<double>::infinity();
-        double final_max_rhs      = std::numeric_limits<double>::infinity();
-        int consecutive_passes    = 0;
+        double final_max_rhs = std::numeric_limits<double>::infinity();
+        int consecutive_passes = 0;
 
         std::vector<double> hist_h, hist_rhs;
         hist_h.reserve(static_cast<std::size_t>(config.n_iter));
@@ -1046,13 +1085,13 @@ struct HJBLadderSolver {
 
             // Normalise so h = 0 at the anchor point (removes the gauge degree of freedom).
             const double anchor = h_next.at(q0_idx, y0_idx, nu0_idx);
-            for (double& v : h_next.data) v -= anchor;  // single vectorisable pass
+            for (double& v : h_next.data) v -= anchor;
 
             hist_h.push_back(max_h_change);
             hist_rhs.push_back(max_rhs_now);
             final_max_h_change = max_h_change;
-            final_max_rhs      = max_rhs_now;
-            iterations_used    = it;
+            final_max_rhs = max_rhs_now;
+            iterations_used = it;
 
             const bool passes_now =
                 it >= config.min_iter &&

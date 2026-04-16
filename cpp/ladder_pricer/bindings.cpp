@@ -45,7 +45,8 @@ PYBIND11_MODULE(ladder_pricer, m) {
              },
              py::arg("iq"), py::arg("iy"), py::arg("inu"))
         .def("empty", &hjb::FlatCube3D::empty)
-        .def_property_readonly("shape",
+        .def_property_readonly(
+             "shape",
              [](const hjb::FlatCube3D& self) {
                  return py::make_tuple(self.nq, self.ny, self.nnu);
              })
@@ -94,7 +95,8 @@ PYBIND11_MODULE(ladder_pricer, m) {
              },
              py::arg("iq"), py::arg("iy"), py::arg("inu"), py::arg("iz"))
         .def("empty", &hjb::FlatCube4D::empty)
-        .def_property_readonly("shape",
+        .def_property_readonly(
+             "shape",
              [](const hjb::FlatCube4D& self) {
                  return py::make_tuple(self.nq, self.ny, self.nnu, self.nz);
              })
@@ -200,11 +202,12 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("sizes", &hjb::QuotePolicy::sizes)
         .def_readwrite("bid", &hjb::QuotePolicy::bid)
         .def_readwrite("ask", &hjb::QuotePolicy::ask)
-        .def("ensure_shape", &hjb::QuotePolicy::ensure_shape,
+        .def("set_axes", &hjb::QuotePolicy::set_axes,
              py::arg("q_grid"),
              py::arg("y_grid"),
              py::arg("nu_grid"),
              py::arg("sizes"))
+        .def("ensure_storage_shape", &hjb::QuotePolicy::ensure_storage_shape)
         .def("validate", &hjb::QuotePolicy::validate)
         .def("delta_at_index", &hjb::QuotePolicy::delta_at_index,
              py::arg("iq"),
@@ -317,7 +320,12 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("config", &hjb::HJBLadderSolver::config)
         .def_readwrite("penalty", &hjb::HJBLadderSolver::penalty)
         .def_readwrite("tiers", &hjb::HJBLadderSolver::tiers)
-        .def("update_policies", &hjb::HJBLadderSolver::update_policies,
+        .def("initialize_policies", &hjb::HJBLadderSolver::initialize_policies)
+        .def("update_policies",
+             [](hjb::HJBLadderSolver& self, const hjb::FlatCube3D& h_mat) {
+                 const auto h_fn = self.make_h_interp(h_mat);
+                 self.update_policies(h_fn);
+             },
              py::arg("h_mat"))
         .def("solve", &hjb::HJBLadderSolver::solve);
 
