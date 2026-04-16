@@ -1,6 +1,8 @@
+#include <memory>
+
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <pybind11/numpy.h>
 
 #include "hjb_ladder.hpp"
 
@@ -40,19 +42,23 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def("index", &hjb::FlatCube3D::index,
              py::arg("iq"), py::arg("iy"), py::arg("inu"))
         .def("at",
-             [](const hjb::FlatCube3D& self, std::size_t iq, std::size_t iy, std::size_t inu) {
+             [](const hjb::FlatCube3D& self,
+                std::size_t iq,
+                std::size_t iy,
+                std::size_t inu) {
                  return self.at(iq, iy, inu);
              },
              py::arg("iq"), py::arg("iy"), py::arg("inu"))
         .def("empty", &hjb::FlatCube3D::empty)
         .def_property_readonly(
-             "shape",
-             [](const hjb::FlatCube3D& self) {
-                 return py::make_tuple(self.nq, self.ny, self.nnu);
-             })
+            "shape",
+            [](const hjb::FlatCube3D& self) {
+                return py::make_tuple(self.nq, self.ny, self.nnu);
+            })
         .def("numpy",
              [](hjb::FlatCube3D& self) {
-                 py::object owner = py::cast(&self, py::return_value_policy::reference_internal);
+                 py::object owner =
+                     py::cast(&self, py::return_value_policy::reference_internal);
                  return py::array_t<double>(
                      {
                          static_cast<py::ssize_t>(self.nq),
@@ -90,19 +96,23 @@ PYBIND11_MODULE(ladder_pricer, m) {
              py::arg("iq"), py::arg("iy"), py::arg("inu"), py::arg("iz"))
         .def("at",
              [](const hjb::FlatCube4D& self,
-                std::size_t iq, std::size_t iy, std::size_t inu, std::size_t iz) {
+                std::size_t iq,
+                std::size_t iy,
+                std::size_t inu,
+                std::size_t iz) {
                  return self.at(iq, iy, inu, iz);
              },
              py::arg("iq"), py::arg("iy"), py::arg("inu"), py::arg("iz"))
         .def("empty", &hjb::FlatCube4D::empty)
         .def_property_readonly(
-             "shape",
-             [](const hjb::FlatCube4D& self) {
-                 return py::make_tuple(self.nq, self.ny, self.nnu, self.nz);
-             })
+            "shape",
+            [](const hjb::FlatCube4D& self) {
+                return py::make_tuple(self.nq, self.ny, self.nnu, self.nz);
+            })
         .def("numpy",
              [](hjb::FlatCube4D& self) {
-                 py::object owner = py::cast(&self, py::return_value_policy::reference_internal);
+                 py::object owner =
+                     py::cast(&self, py::return_value_policy::reference_internal);
                  return py::array_t<double>(
                      {
                          static_cast<py::ssize_t>(self.nq),
@@ -133,7 +143,8 @@ PYBIND11_MODULE(ladder_pricer, m) {
     // Concrete model components
     // ============================================================
 
-    py::class_<hjb::LogisticFlowCurve, hjb::FlowCurve, std::shared_ptr<hjb::LogisticFlowCurve>>(m, "LogisticFlowCurve")
+    py::class_<hjb::LogisticFlowCurve, hjb::FlowCurve, std::shared_ptr<hjb::LogisticFlowCurve>>(
+        m, "LogisticFlowCurve")
         .def(py::init<>())
         .def(py::init<double, double, double, double, double, double>(),
              py::arg("A0"),
@@ -153,7 +164,8 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def("arrival_rate", &hjb::LogisticFlowCurve::arrival_rate,
              py::arg("delta"), py::arg("z"));
 
-    py::class_<hjb::SqrtDriftJumpModel, hjb::DriftJumpModel, std::shared_ptr<hjb::SqrtDriftJumpModel>>(m, "SqrtDriftJumpModel")
+    py::class_<hjb::SqrtDriftJumpModel, hjb::DriftJumpModel, std::shared_ptr<hjb::SqrtDriftJumpModel>>(
+        m, "SqrtDriftJumpModel")
         .def(py::init<>())
         .def(py::init<double, double>(),
              py::arg("base"),
@@ -162,7 +174,10 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("coeff", &hjb::SqrtDriftJumpModel::coeff)
         .def("jump_size", &hjb::SqrtDriftJumpModel::jump_size, py::arg("z"));
 
-    py::class_<hjb::PolynomialInventoryPenalty, hjb::InventoryPenalty, std::shared_ptr<hjb::PolynomialInventoryPenalty>>(m, "PolynomialInventoryPenalty")
+    py::class_<hjb::PolynomialInventoryPenalty,
+               hjb::InventoryPenalty,
+               std::shared_ptr<hjb::PolynomialInventoryPenalty>>(
+        m, "PolynomialInventoryPenalty")
         .def(py::init<>())
         .def(py::init<double, double, double, double, double>(),
              py::arg("risk_aversion"),
@@ -284,7 +299,8 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("tol_h", &hjb::SolverConfig::tol_h)
         .def_readwrite("tol_rhs", &hjb::SolverConfig::tol_rhs)
         .def_readwrite("min_iter", &hjb::SolverConfig::min_iter)
-        .def_readwrite("consecutive_passes_required", &hjb::SolverConfig::consecutive_passes_required)
+        .def_readwrite("consecutive_passes_required",
+                       &hjb::SolverConfig::consecutive_passes_required)
         .def("validate", &hjb::SolverConfig::validate);
 
     // ============================================================
@@ -322,10 +338,8 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("tiers", &hjb::HJBLadderSolver::tiers)
         .def("initialize_policies", &hjb::HJBLadderSolver::initialize_policies)
         .def("update_policies",
-             [](hjb::HJBLadderSolver& self, const hjb::FlatCube3D& h_mat) {
-                 const auto h_fn = self.make_h_interp(h_mat);
-                 self.update_policies(h_fn);
-             },
+             py::overload_cast<const hjb::FlatCube3D&>(
+                 &hjb::HJBLadderSolver::update_policies),
              py::arg("h_mat"))
         .def("solve", &hjb::HJBLadderSolver::solve);
 
