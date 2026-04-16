@@ -150,6 +150,21 @@ inline std::vector<double> diff(const std::vector<double>& x) {
 }
 
 // ============================================================
+// No-copy interpolator
+// ============================================================
+
+struct HInterp3D {
+    const std::vector<double>& q_grid;
+    const std::vector<double>& y_grid;
+    const std::vector<double>& nu_grid;
+    const std::vector<std::vector<std::vector<double>>>& h;
+
+    double operator()(double q, double y, double nu) const {
+        return interp_trilinear(q_grid, y_grid, nu_grid, h, q, y, nu);
+    }
+};
+
+// ============================================================
 // Abstract model components
 // ============================================================
 
@@ -165,7 +180,7 @@ struct DriftJumpModel {
 
 struct InventoryPenalty {
     virtual ~InventoryPenalty() = default;
-    // This is the base inventory penalty ψ(q). The solver multiplies it by exp(2*nu).
+    // Base penalty ψ(q). Solver multiplies it by exp(2*nu).
     virtual double value(double q) const = 0;
 };
 
@@ -466,7 +481,7 @@ struct PriceTier {
 
     double single_size_objective(
         double delta,
-        const std::function<double(double, double, double)>& h_fn,
+        const HInterp3D& h_fn,
         double q,
         double y,
         double nu,
@@ -579,7 +594,7 @@ struct PriceTier {
     }
 
     std::vector<double> solve_side_ladder(
-        const std::function<double(double, double, double)>& h_fn,
+        const HInterp3D& h_fn,
         double q,
         double y,
         double nu,
@@ -616,7 +631,7 @@ struct PriceTier {
     }
 
     QuotePolicy build_policy(
-        const std::function<double(double, double, double)>& h_fn,
+        const HInterp3D& h_fn,
         const std::vector<double>& q_grid,
         const std::vector<double>& y_grid,
         const std::vector<double>& nu_grid
@@ -771,18 +786,10 @@ struct HJBLadderSolver {
         }
     }
 
-    std::function<double(double, double, double)> make_h_interp(
+    HInterp3D make_h_interp(
         const std::vector<std::vector<std::vector<double>>>& h_mat
     ) const {
-        const auto qg = config.q_grid;
-        const auto yg = config.y_grid;
-        const auto ng = config.nu_grid;
-        const auto hm = h_mat;
-
-        return [qg = std::move(qg), yg = std::move(yg), ng = std::move(ng), hm = std::move(hm)](
-                   double q, double y, double nu) {
-            return interp_trilinear(qg, yg, ng, hm, q, y, nu);
-        };
+        return HInterp3D{config.q_grid, config.y_grid, config.nu_grid, h_mat};
     }
 
     double y_drift_term(
@@ -887,7 +894,7 @@ struct HJBLadderSolver {
     }
 
     void update_policies(const std::vector<std::vector<std::vector<double>>>& h_mat) {
-        auto h_fn = make_h_interp(h_mat);
+        const auto h_fn = make_h_interp(h_mat);
         for (auto& tier : tiers) {
             tier->build_policy(h_fn, config.q_grid, config.y_grid, config.nu_grid);
         }
@@ -896,7 +903,7 @@ struct HJBLadderSolver {
     std::vector<std::vector<std::vector<double>>> bellman_rhs_from_policies(
         const std::vector<std::vector<std::vector<double>>>& h_mat
     ) const {
-        auto h_fn = make_h_interp(h_mat);
+        const auto h_fn = make_h_interp(h_mat);
 
         const std::size_t nq = config.q_grid.size();
         const std::size_t ny = config.y_grid.size();

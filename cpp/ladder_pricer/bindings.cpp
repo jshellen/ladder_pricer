@@ -1,4 +1,3 @@
-#include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -92,15 +91,7 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("policy", &PriceTier::policy)
         .def("arrival_rate", &PriceTier::arrival_rate)
         .def("jump_size", &PriceTier::jump_size)
-        .def("quote", &PriceTier::quote)
-        .def("build_policy",
-             [](PriceTier& self,
-                const std::function<double(double, double, double)>& h_fn,
-                const std::vector<double>& q_grid,
-                const std::vector<double>& y_grid,
-                const std::vector<double>& nu_grid) {
-                 return self.build_policy(h_fn, q_grid, y_grid, nu_grid);
-             });
+        .def("quote", &PriceTier::quote);
 
     py::class_<SolverConfig>(m, "SolverConfig")
         .def(py::init<>())
