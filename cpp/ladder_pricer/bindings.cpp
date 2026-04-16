@@ -249,25 +249,19 @@ PYBIND11_MODULE(ladder_pricer, m) {
                  std::shared_ptr<hjb::FlowCurve>,
                  std::shared_ptr<hjb::DriftJumpModel>,
                  double,
-                 double,
-                 double,
-                 int>(),
+                 double>(),
              py::arg("name"),
              py::arg("sizes"),
              py::arg("flow_curve"),
              py::arg("jump_model"),
              py::arg("delta_min") = -0.5,
-             py::arg("delta_max") = 4.0,
-             py::arg("golden_tol") = 1e-4,
-             py::arg("golden_max_iter") = 32)
+             py::arg("delta_max") = 4.0)
         .def_readwrite("name", &hjb::PriceTier::name)
         .def_readwrite("sizes", &hjb::PriceTier::sizes)
         .def_readwrite("flow_curve", &hjb::PriceTier::flow_curve)
         .def_readwrite("jump_model", &hjb::PriceTier::jump_model)
         .def_readwrite("delta_min", &hjb::PriceTier::delta_min)
         .def_readwrite("delta_max", &hjb::PriceTier::delta_max)
-        .def_readwrite("golden_tol", &hjb::PriceTier::golden_tol)
-        .def_readwrite("golden_max_iter", &hjb::PriceTier::golden_max_iter)
         .def_readwrite("policy", &hjb::PriceTier::policy)
         .def("validate", &hjb::PriceTier::validate)
         .def("arrival_rate", &hjb::PriceTier::arrival_rate,
@@ -295,6 +289,8 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("kappa_nu", &hjb::SolverConfig::kappa_nu)
         .def_readwrite("nu_bar", &hjb::SolverConfig::nu_bar)
         .def_readwrite("eta_nu", &hjb::SolverConfig::eta_nu)
+        .def_readwrite("golden_tol", &hjb::SolverConfig::golden_tol)
+        .def_readwrite("golden_max_iter", &hjb::SolverConfig::golden_max_iter)
         .def_readwrite("early_stop", &hjb::SolverConfig::early_stop)
         .def_readwrite("tol_h", &hjb::SolverConfig::tol_h)
         .def_readwrite("tol_rhs", &hjb::SolverConfig::tol_rhs)

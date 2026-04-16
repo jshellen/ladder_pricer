@@ -320,19 +320,34 @@ struct GoldenSectionResult {
 };
 
 struct GoldenSectionOptimizer {
+    GoldenSectionOptions opts{};
+
+    GoldenSectionOptimizer() = default;
+
+    explicit GoldenSectionOptimizer(const GoldenSectionOptions& opts_) : opts(opts_) {
+        validate_options(opts);
+    }
+
+    void set_options(const GoldenSectionOptions& opts_) {
+        validate_options(opts_);
+        opts = opts_;
+    }
+
+    static void validate_options(const GoldenSectionOptions& opts_) {
+        if (opts_.tol <= 0.0)
+            throw std::invalid_argument("GoldenSectionOptimizer: tol must be positive.");
+        if (opts_.max_iter < 1)
+            throw std::invalid_argument("GoldenSectionOptimizer: max_iter must be >= 1.");
+    }
+
     template <class ObjectiveFn>
-    static GoldenSectionResult maximize(
+    GoldenSectionResult maximize(
         const ObjectiveFn& f,
         double lower,
-        double upper,
-        const GoldenSectionOptions& opts = {}
-    ) {
+        double upper
+    ) const {
         if (upper < lower)
             throw std::invalid_argument("GoldenSectionOptimizer::maximize: invalid bounds.");
-        if (opts.tol <= 0.0)
-            throw std::invalid_argument("GoldenSectionOptimizer::maximize: tol must be positive.");
-        if (opts.max_iter < 1)
-            throw std::invalid_argument("GoldenSectionOptimizer::maximize: max_iter must be >= 1.");
 
         if (std::abs(upper - lower) < opts.tol) {
             const double x = 0.5 * (lower + upper);
@@ -374,14 +389,13 @@ struct GoldenSectionOptimizer {
     }
 
     template <class ObjectiveFn>
-    static GoldenSectionResult minimize(
+    GoldenSectionResult minimize(
         const ObjectiveFn& f,
         double lower,
-        double upper,
-        const GoldenSectionOptions& opts = {}
-    ) {
+        double upper
+    ) const {
         auto neg_f = [&](double x) { return -f(x); };
-        auto res = maximize(neg_f, lower, upper, opts);
+        auto res = maximize(neg_f, lower, upper);
         res.f_star = f(res.x_star);
         return res;
     }
@@ -582,8 +596,6 @@ struct PriceTier {
 
     double delta_min{-0.5};
     double delta_max{4.0};
-    double golden_tol{1e-4};
-    int golden_max_iter{32};
 
     QuotePolicy policy;
 
@@ -595,18 +607,14 @@ struct PriceTier {
         std::shared_ptr<FlowCurve> flow_curve_,
         std::shared_ptr<DriftJumpModel> jump_model_,
         double delta_min_ = -0.5,
-        double delta_max_ = 4.0,
-        double golden_tol_ = 1e-4,
-        int golden_max_iter_ = 32
+        double delta_max_ = 4.0
     )
         : name(std::move(name_)),
           sizes(std::move(sizes_)),
           flow_curve(std::move(flow_curve_)),
           jump_model(std::move(jump_model_)),
           delta_min(delta_min_),
-          delta_max(delta_max_),
-          golden_tol(golden_tol_),
-          golden_max_iter(golden_max_iter_) {
+          delta_max(delta_max_) {
         validate();
     }
 
@@ -639,6 +647,7 @@ struct LadderPolicyBuilder {
     const std::vector<double>& q_grid;
     const std::vector<double>& y_grid;
     const std::vector<double>& nu_grid;
+    const opt::GoldenSectionOptimizer& optimizer;
     std::size_t q0_idx{0};
 
     const FlatCube3D* h_mat{nullptr};
@@ -649,11 +658,13 @@ struct LadderPolicyBuilder {
     LadderPolicyBuilder(
         const std::vector<double>& q_grid_,
         const std::vector<double>& y_grid_,
-        const std::vector<double>& nu_grid_
+        const std::vector<double>& nu_grid_,
+        const opt::GoldenSectionOptimizer& optimizer_
     )
         : q_grid(q_grid_),
           y_grid(y_grid_),
-          nu_grid(nu_grid_) {
+          nu_grid(nu_grid_),
+          optimizer(optimizer_) {
         if (q_grid.empty())
             throw std::invalid_argument("LadderPolicyBuilder: q_grid cannot be empty.");
         if (q_grid.size() % 2 == 0)
@@ -762,8 +773,6 @@ struct LadderPolicyBuilder {
             prev_gaps_storage.clear();
         }
 
-        const opt::GoldenSectionOptions gs_opts{tier.golden_tol, tier.golden_max_iter};
-
         for (std::size_t j = 0; j < n; ++j) {
             auto [lower0, upper0] = rung_bounds(tier, j, delta, s.q, side, prev_gaps);
             double lower = std::max(tier.delta_min, lower0);
@@ -785,7 +794,7 @@ struct LadderPolicyBuilder {
                 return tier.arrival_rate(d, z) * (z * d + dh);
             };
 
-            const auto res = opt::GoldenSectionOptimizer::maximize(objective, lower, upper, gs_opts);
+            const auto res = optimizer.maximize(objective, lower, upper);
             delta[j] = clamp(res.x_star, lower, upper);
         }
     }
@@ -858,6 +867,9 @@ struct SolverConfig {
     double nu_bar{0.0};
     double eta_nu{0.2};
 
+    double golden_tol{1e-4};
+    int golden_max_iter{32};
+
     bool early_stop{true};
     double tol_h{1e-5};
     double tol_rhs{1e-4};
@@ -883,6 +895,10 @@ struct SolverConfig {
         if (kappa_y < 0.0 || kappa_nu < 0.0 || eta_nu < 0.0)
             throw std::invalid_argument(
                 "SolverConfig: mean reversion and vol-of-vol must be nonnegative.");
+        if (golden_tol <= 0.0)
+            throw std::invalid_argument("SolverConfig: golden_tol must be positive.");
+        if (golden_max_iter < 1)
+            throw std::invalid_argument("SolverConfig: golden_max_iter must be at least 1.");
         if (tol_h < 0.0 || tol_rhs < 0.0)
             throw std::invalid_argument("SolverConfig: tolerances must be nonnegative.");
         if (min_iter < 0 || consecutive_passes_required < 1)
@@ -934,6 +950,7 @@ struct HJBLadderSolver {
     SolverConfig config;
     std::shared_ptr<InventoryPenalty> penalty;
     std::vector<std::shared_ptr<PriceTier>> tiers;
+    opt::GoldenSectionOptimizer optimizer;
     LadderPolicyBuilder policy_builder;
 
     HJBLadderSolver(
@@ -944,10 +961,15 @@ struct HJBLadderSolver {
         : config(std::move(config_)),
           penalty(std::move(penalty_)),
           tiers(std::move(tiers_)),
-          policy_builder(config.q_grid, config.y_grid, config.nu_grid) {
+          optimizer(opt::GoldenSectionOptions{config.golden_tol, config.golden_max_iter}),
+          policy_builder(config.q_grid, config.y_grid, config.nu_grid, optimizer) {
         config.validate();
         if (!penalty) throw std::invalid_argument("HJBLadderSolver: penalty cannot be null.");
         initialize_policies();
+    }
+
+    void sync_optimizer_from_config() {
+        optimizer.set_options(opt::GoldenSectionOptions{config.golden_tol, config.golden_max_iter});
     }
 
     GridState make_state(std::size_t iq, std::size_t iy, std::size_t inu) const {
@@ -1029,6 +1051,7 @@ struct HJBLadderSolver {
     }
 
     void update_policies(const FlatCube3D& h_mat, const HInterp3D& h_fn) {
+        sync_optimizer_from_config();
         policy_builder.set_value_function(h_mat, h_fn);
         for (auto& tier : tiers) {
             policy_builder.build_policy_inplace(*tier, tier->policy);
@@ -1041,6 +1064,8 @@ struct HJBLadderSolver {
     }
 
     HJBSolution solve() {
+        sync_optimizer_from_config();
+
         const std::size_t nq  = config.q_grid.size();
         const std::size_t ny  = config.y_grid.size();
         const std::size_t nnu = config.nu_grid.size();
@@ -1090,6 +1115,9 @@ struct HJBLadderSolver {
                                    + nu_diffusion_term(h_curr, s)
                                    - exp_2nu[s.inu] * penalty_q[s.iq];
 
+                        // ----------------------------------------------------------------- //
+                        // Price tier optimization
+                        // ----------------------------------------------------------------- //
                         for (const auto& tier : tiers) {
                             const double* bid_row = tier->policy.bid.row_ptr(s.iq, s.iy, s.inu);
                             const double* ask_row = tier->policy.ask.row_ptr(s.iq, s.iy, s.inu);
@@ -1142,6 +1170,9 @@ struct HJBLadderSolver {
             }
         }
 
+        // ----------------------------------------------------------------- //
+        // Final policy update after convergence or max iterations
+        // ----------------------------------------------------------------- //
         update_policies(h_curr, h_fn);
 
         HJBSolution out;

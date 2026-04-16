@@ -34,8 +34,6 @@ class TierSpec:
     jump_coeff: float
     delta_min: float
     delta_max: float
-    golden_tol: float = 1e-4
-    golden_max_iter: int = 32
 
     def build_cpp_tier(self) -> lp.PriceTier:
         flow = lp.LogisticFlowCurve(
@@ -56,8 +54,6 @@ class TierSpec:
             jump_model=jump,
             delta_min=float(self.delta_min),
             delta_max=float(self.delta_max),
-            golden_tol=float(self.golden_tol),
-            golden_max_iter=int(self.golden_max_iter),
         )
 
 
@@ -710,6 +706,8 @@ def build_signature(
     kappa_nu: float,
     nu_bar: float,
     eta_nu: float,
+    golden_tol: float,
+    golden_max_iter: int,
     early_stop: bool,
     tol_h: float,
     tol_rhs: float,
@@ -732,6 +730,8 @@ def build_signature(
         float(kappa_nu),
         float(nu_bar),
         float(eta_nu),
+        float(golden_tol),
+        int(golden_max_iter),
         bool(early_stop),
         float(tol_h),
         float(tol_rhs),
@@ -755,8 +755,6 @@ def build_signature(
                 spec.jump_coeff,
                 spec.delta_min,
                 spec.delta_max,
-                spec.golden_tol,
-                spec.golden_max_iter,
             )
             for spec in tier_specs
         ),
@@ -833,6 +831,10 @@ with st.sidebar:
     dt = st.number_input("dt", value=0.001, step=0.001, format="%.4f")
     n_iter = st.number_input("n_iter", value=200, step=10, min_value=1)
 
+    st.header("Golden-section optimizer")
+    golden_tol = st.number_input("golden_tol", value=1e-4, min_value=1e-12, format="%.1e")
+    golden_max_iter = st.number_input("golden_max_iter", value=32, step=1, min_value=1)
+
     st.header("Convergence / stopping")
     early_stop = st.checkbox("Enable early stopping", value=True)
     tol_h = st.number_input("tol_h", value=1e-5, format="%.1e")
@@ -870,6 +872,10 @@ for i in range(num_tiers):
 
 if q_step <= 0:
     errors.append("q_step must be positive.")
+if golden_tol <= 0.0:
+    errors.append("golden_tol must be positive.")
+if golden_max_iter < 1:
+    errors.append("golden_max_iter must be at least 1.")
 
 y_min, y_max = float(y_range[0]), float(y_range[1])
 sigma_state_min, sigma_state_max = float(sigma_state_range[0]), float(sigma_state_range[1])
@@ -947,6 +953,8 @@ signature = build_signature(
     kappa_nu=float(kappa_nu),
     nu_bar=float(nu_bar),
     eta_nu=float(eta_nu),
+    golden_tol=float(golden_tol),
+    golden_max_iter=int(golden_max_iter),
     early_stop=bool(early_stop),
     tol_h=float(tol_h),
     tol_rhs=float(tol_rhs),
@@ -1001,6 +1009,8 @@ if need_compute:
     config.kappa_nu = float(kappa_nu)
     config.nu_bar = float(nu_bar)
     config.eta_nu = float(eta_nu)
+    config.golden_tol = float(golden_tol)
+    config.golden_max_iter = int(golden_max_iter)
     config.early_stop = bool(early_stop)
     config.tol_h = float(tol_h)
     config.tol_rhs = float(tol_rhs)
