@@ -230,15 +230,6 @@ inline double max_abs_3d(const FlatCube3D& x) {
     return max_abs_vec(x.data);
 }
 
-inline void diff_inplace(const double* x, std::size_t n, std::vector<double>& out) {
-    if (n < 2) {
-        out.clear();
-        return;
-    }
-    out.resize(n - 1);
-    for (std::size_t i = 0; i + 1 < n; ++i) out[i] = x[i + 1] - x[i];
-}
-
 // ============================================================
 // Grid state
 // ============================================================
@@ -747,8 +738,6 @@ struct LadderPolicyBuilder {
 
     const HInterp3D* value_fn{nullptr};
 
-    std::vector<double> prev_gaps_storage;
-
     LadderPolicyBuilder(
         const SolverConfig& config_,
         const opt::GoldenSectionOptimizer& optimizer_
@@ -795,17 +784,17 @@ struct LadderPolicyBuilder {
         const double* current_delta,
         double q,
         Side side,
-        const std::vector<double>* prev_gaps
+        const double* prev_delta = nullptr
     ) {
         const std::size_t n = tier.sizes.size();
+
         double lower = tier.delta_min;
         double upper = tier.delta_max;
 
         if (rung_idx == 0) {
-            if (prev_gaps != nullptr && is_expand_mode(q, side)) {
-                double total = 0.0;
-                for (double g : *prev_gaps) total += g;
-                upper = std::min(upper, tier.delta_max - total);
+            if (prev_delta != nullptr && is_expand_mode(q, side)) {
+                const double total_span = prev_delta[n - 1] - prev_delta[0];
+                upper = std::min(upper, tier.delta_max - total_span);
             }
             return {lower, upper};
         }
@@ -813,20 +802,18 @@ struct LadderPolicyBuilder {
         const double prev_curr = current_delta[rung_idx - 1];
         lower = std::max(lower, prev_curr);
 
-        if (prev_gaps == nullptr || prev_gaps->empty())
+        if (prev_delta == nullptr)
             return {lower, upper};
 
-        const double prev_gap = (*prev_gaps)[rung_idx - 1];
+        const double prev_gap = prev_delta[rung_idx] - prev_delta[rung_idx - 1];
 
         if (is_shrink_mode(q, side)) {
             upper = std::min(upper, prev_curr + prev_gap);
         } else if (is_expand_mode(q, side)) {
             lower = std::max(lower, prev_curr + prev_gap);
 
-            double remaining = 0.0;
-            for (std::size_t k = rung_idx; k + 1 < n; ++k)
-                remaining += (*prev_gaps)[k];
-            upper = std::min(upper, tier.delta_max - remaining);
+            const double remaining_span = prev_delta[n - 1] - prev_delta[rung_idx];
+            upper = std::min(upper, tier.delta_max - remaining_span);
         }
 
         return {lower, upper};
@@ -847,16 +834,8 @@ struct LadderPolicyBuilder {
         const std::size_t n = tier.sizes.size();
         const double h_here = value_fn->h.at(s.iq, s.iy, s.inu);
 
-        const std::vector<double>* prev_gaps = nullptr;
-        if (prev_delta != nullptr) {
-            diff_inplace(prev_delta, n, prev_gaps_storage);
-            prev_gaps = &prev_gaps_storage;
-        } else {
-            prev_gaps_storage.clear();
-        }
-
         for (std::size_t j = 0; j < n; ++j) {
-            auto [lower0, upper0] = rung_bounds(tier, j, delta, s.q, side, prev_gaps);
+            auto [lower0, upper0] = rung_bounds(tier, j, delta, s.q, side, prev_delta);
             double lower = std::max(tier.delta_min, lower0);
             double upper = std::min(tier.delta_max, upper0);
 
