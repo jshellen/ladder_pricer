@@ -95,6 +95,56 @@ struct FlatCube4D {
 };
 
 // ============================================================
+// Cached continuation interpolation structures
+// ============================================================
+
+struct BilinearLoc2D {
+    std::size_t iq{0};
+    std::size_t iy{0};
+    double tq{0.0};
+    double ty{0.0};
+};
+
+struct FlatBilinearLoc3D {
+    std::vector<BilinearLoc2D> data;
+    std::size_t nq{0}, ny{0}, nz{0};
+
+    FlatBilinearLoc3D() = default;
+
+    void ensure_shape(std::size_t nq_, std::size_t ny_, std::size_t nz_) {
+        if (nq_ == nq && ny_ == ny && nz_ == nz) return;
+        nq = nq_;
+        ny = ny_;
+        nz = nz_;
+        data.assign(nq_ * ny_ * nz_, {});
+    }
+
+    std::size_t index(std::size_t iq, std::size_t iy, std::size_t iz) const noexcept {
+        return (iq * ny + iy) * nz + iz;
+    }
+
+    BilinearLoc2D& at(std::size_t iq, std::size_t iy, std::size_t iz) noexcept {
+        return data[index(iq, iy, iz)];
+    }
+
+    const BilinearLoc2D& at(std::size_t iq, std::size_t iy, std::size_t iz) const noexcept {
+        return data[index(iq, iy, iz)];
+    }
+
+    bool empty() const noexcept { return data.empty(); }
+};
+
+struct ContinuationCache {
+    FlatBilinearLoc3D bid;
+    FlatBilinearLoc3D ask;
+
+    void ensure_shape(std::size_t nq, std::size_t ny, std::size_t nz) {
+        bid.ensure_shape(nq, ny, nz);
+        ask.ensure_shape(nq, ny, nz);
+    }
+};
+
+// ============================================================
 // Helpers
 // ============================================================
 
@@ -152,6 +202,40 @@ inline double interp_linear(
 
     const auto [i, t] = locate_segment_with_weight(grid, x);
     return vals[i] + t * (vals[i + 1] - vals[i]);
+}
+
+inline BilinearLoc2D locate_bilinear_qy(
+    const std::vector<double>& q_grid,
+    const std::vector<double>& y_grid,
+    double q,
+    double y
+) {
+    const auto [iq, tq] = locate_segment_with_weight(q_grid, q);
+    const auto [iy, ty] = locate_segment_with_weight(y_grid, y);
+    return {iq, iy, tq, ty};
+}
+
+inline double eval_bilinear_qy_at_nu_index(
+    const FlatCube3D& h,
+    std::size_t inu,
+    const BilinearLoc2D& loc
+) noexcept {
+    const std::size_t stride_q = h.ny * h.nnu;
+    const std::size_t stride_y = h.nnu;
+
+    const std::size_t base    = (loc.iq * h.ny + loc.iy) * h.nnu + inu;
+    const std::size_t base_q  = base + stride_q;
+    const std::size_t base_y  = base + stride_y;
+    const std::size_t base_qy = base_q + stride_y;
+
+    const double c00 = h.data[base];
+    const double c10 = h.data[base_q];
+    const double c01 = h.data[base_y];
+    const double c11 = h.data[base_qy];
+
+    const double cx0 = c00 + loc.tq * (c10 - c00);
+    const double cx1 = c01 + loc.tq * (c11 - c01);
+    return cx0 + loc.ty * (cx1 - cx0);
 }
 
 inline double interp_trilinear(
@@ -269,7 +353,6 @@ struct SolverConfig {
     int min_iter{5};
     int consecutive_passes_required{3};
 
-    // Derived grid metadata
     std::size_t nq{0};
     std::size_t ny{0};
     std::size_t nnu{0};
@@ -338,55 +421,6 @@ struct SolverConfig {
         if (!approx_equal(nu_grid[nu0_idx], nu_bar))
             throw std::invalid_argument(
                 "SolverConfig: nu_grid middle point must equal nu_bar.");
-    }
-};
-
-// ============================================================
-// No-copy interpolator over FlatCube3D
-// ============================================================
-
-struct HInterp3D {
-    const std::vector<double>& q_grid;
-    const std::vector<double>& y_grid;
-    const std::vector<double>& nu_grid;
-    const FlatCube3D& h;
-
-    HInterp3D(
-        const std::vector<double>& q_grid_,
-        const std::vector<double>& y_grid_,
-        const std::vector<double>& nu_grid_,
-        const FlatCube3D& h_
-    )
-        : q_grid(q_grid_), y_grid(y_grid_), nu_grid(nu_grid_), h(h_) {
-        if (h.nq != q_grid.size())
-            throw std::invalid_argument("HInterp3D: q dimension mismatch.");
-        if (h.ny != y_grid.size())
-            throw std::invalid_argument("HInterp3D: y dimension mismatch.");
-        if (h.nnu != nu_grid.size())
-            throw std::invalid_argument("HInterp3D: nu dimension mismatch.");
-    }
-
-    double operator()(double q, double y, double nu) const {
-        const auto [iq, tq] = locate_segment_with_weight(q_grid, q);
-        const auto [iy, ty] = locate_segment_with_weight(y_grid, y);
-        const auto [in, tn] = locate_segment_with_weight(nu_grid, nu);
-
-        const double c000 = h.at(iq,     iy,     in    );
-        const double c100 = h.at(iq + 1, iy,     in    );
-        const double c010 = h.at(iq,     iy + 1, in    );
-        const double c110 = h.at(iq + 1, iy + 1, in    );
-        const double c001 = h.at(iq,     iy,     in + 1);
-        const double c101 = h.at(iq + 1, iy,     in + 1);
-        const double c011 = h.at(iq,     iy + 1, in + 1);
-        const double c111 = h.at(iq + 1, iy + 1, in + 1);
-
-        const double c00 = c000 + tq * (c100 - c000);
-        const double c10 = c010 + tq * (c110 - c010);
-        const double c01 = c001 + tq * (c101 - c001);
-        const double c11 = c011 + tq * (c111 - c011);
-        const double c0  = c00  + ty * (c10  - c00 );
-        const double c1  = c01  + ty * (c11  - c01 );
-        return c0 + tn * (c1 - c0);
     }
 };
 
@@ -473,7 +507,7 @@ struct GoldenSectionOptimizer {
         }
 
         const double x_star = 0.5 * (a + b);
-        const double f_star = (fc > fd) ? fc : fd;
+        const double f_star = f(x_star);
         return {x_star, f_star, it, std::abs(b - a) < opts.tol};
     }
 
@@ -542,13 +576,14 @@ struct LogisticFlowCurve final : public FlowCurve {
         if (A0 < 0.0) throw std::invalid_argument("A(z) must be nonnegative.");
         if (k <= 0.0) throw std::invalid_argument("k must be positive.");
 
+        const double az = A(z);
         const double x = k * (delta - m(z));
         if (x >= 0.0) {
             const double ex = std::exp(-x);
-            return A(z) * ex / (1.0 + ex);
+            return az * ex / (1.0 + ex);
         }
         const double ex = std::exp(x);
-        return A(z) / (1.0 + ex);
+        return az / (1.0 + ex);
     }
 };
 
@@ -687,6 +722,7 @@ struct PriceTier {
     double delta_max{4.0};
 
     QuotePolicy policy;
+    ContinuationCache continuation;
 
     PriceTier() = default;
 
@@ -736,7 +772,7 @@ struct LadderPolicyBuilder {
     const SolverConfig& config;
     const opt::GoldenSectionOptimizer& optimizer;
 
-    const HInterp3D* value_fn{nullptr};
+    const FlatCube3D* h_ptr{nullptr};
 
     LadderPolicyBuilder(
         const SolverConfig& config_,
@@ -758,16 +794,8 @@ struct LadderPolicyBuilder {
         };
     }
 
-    void set_value_function(const HInterp3D& value_fn_) {
-        value_fn = &value_fn_;
-    }
-
-    static double next_inventory(double q, double z, Side side) {
-        return (side == Side::Bid) ? (q + z) : (q - z);
-    }
-
-    static double next_drift(double y, double jump, Side side) {
-        return (side == Side::Bid) ? (y - jump) : (y + jump);
+    void set_value_function(const FlatCube3D& h_) {
+        h_ptr = &h_;
     }
 
     static bool is_shrink_mode(double q, Side side) {
@@ -826,13 +854,17 @@ struct LadderPolicyBuilder {
         double* delta,
         const double* prev_delta = nullptr
     ) {
-        if (!value_fn) {
+        if (!h_ptr) {
             throw std::logic_error(
                 "LadderPolicyBuilder::solve_side_ladder_inplace: value function not set.");
         }
 
         const std::size_t n = tier.sizes.size();
-        const double h_here = value_fn->h.at(s.iq, s.iy, s.inu);
+        const double h_here = h_ptr->at(s.iq, s.iy, s.inu);
+
+        const FlatBilinearLoc3D& cache = (side == Side::Bid)
+            ? tier.continuation.bid
+            : tier.continuation.ask;
 
         for (std::size_t j = 0; j < n; ++j) {
             auto [lower0, upper0] = rung_bounds(tier, j, delta, s.q, side, prev_delta);
@@ -846,10 +878,10 @@ struct LadderPolicyBuilder {
             }
             if (upper < lower) upper = lower;
 
-            const double z    = tier.sizes[j];
-            const double jump = tier.jump_size(z);
-            const double dh   = (*value_fn)(next_inventory(s.q, z, side),
-                                            next_drift(s.y, jump, side), s.nu) - h_here;
+            const double z = tier.sizes[j];
+            const BilinearLoc2D& loc = cache.at(s.iq, s.iy, j);
+            const double cont = eval_bilinear_qy_at_nu_index(*h_ptr, s.inu, loc);
+            const double dh = cont - h_here;
 
             auto objective = [&](double d) {
                 return tier.arrival_rate(d, z) * (z * d + dh);
@@ -861,7 +893,7 @@ struct LadderPolicyBuilder {
     }
 
     void build_policy_inplace(const PriceTier& tier, QuotePolicy& policy) {
-        if (!value_fn) {
+        if (!h_ptr) {
             throw std::logic_error(
                 "LadderPolicyBuilder::build_policy_inplace: value function not set.");
         }
@@ -1013,6 +1045,32 @@ struct HJBLadderSolver {
         };
     }
 
+    void build_continuation_cache(PriceTier& tier) {
+        const std::size_t nq = config.nq;
+        const std::size_t ny = config.ny;
+        const std::size_t nz = tier.sizes.size();
+
+        tier.continuation.ensure_shape(nq, ny, nz);
+
+        for (std::size_t iz = 0; iz < nz; ++iz) {
+            const double z = tier.sizes[iz];
+            const double jump = tier.jump_size(z);
+
+            for (std::size_t iq = 0; iq < nq; ++iq) {
+                const double q = config.q_grid[iq];
+                for (std::size_t iy = 0; iy < ny; ++iy) {
+                    const double y = config.y_grid[iy];
+
+                    tier.continuation.bid.at(iq, iy, iz) =
+                        locate_bilinear_qy(config.q_grid, config.y_grid, q + z, y - jump);
+
+                    tier.continuation.ask.at(iq, iy, iz) =
+                        locate_bilinear_qy(config.q_grid, config.y_grid, q - z, y + jump);
+                }
+            }
+        }
+    }
+
     void initialize_policies() {
         for (auto& tier : tiers) {
             if (!tier) throw std::invalid_argument("HJBLadderSolver: tier cannot be null.");
@@ -1020,6 +1078,7 @@ struct HJBLadderSolver {
             tier->policy.set_axes(config.q_grid, config.y_grid, config.nu_grid, tier->sizes);
             tier->policy.ensure_storage_shape();
             tier->policy.validate();
+            build_continuation_cache(*tier);
         }
     }
 
@@ -1087,17 +1146,12 @@ struct HJBLadderSolver {
         return 0.5 * config.eta_nu * config.eta_nu * second;
     }
 
-    void update_policies(const HInterp3D& value_fn) {
+    void update_policies(const FlatCube3D& h_mat) {
         sync_optimizer_from_config();
-        policy_builder.set_value_function(value_fn);
+        policy_builder.set_value_function(h_mat);
         for (auto& tier : tiers) {
             policy_builder.build_policy_inplace(*tier, tier->policy);
         }
-    }
-
-    void update_policies(const FlatCube3D& h_mat) {
-        HInterp3D value_fn{config.q_grid, config.y_grid, config.nu_grid, h_mat};
-        update_policies(value_fn);
     }
 
     HJBSolution solve() {
@@ -1105,8 +1159,6 @@ struct HJBLadderSolver {
 
         FlatCube3D h_curr(config.nq, config.ny, config.nnu, 0.0);
         FlatCube3D h_next(config.nq, config.ny, config.nnu, 0.0);
-
-        HInterp3D value_fn{config.q_grid, config.y_grid, config.nu_grid, h_curr};
 
         std::vector<double> penalty_q(config.nq);
         for (std::size_t iq = 0; iq < config.nq; ++iq)
@@ -1119,7 +1171,7 @@ struct HJBLadderSolver {
         SolveProgress progress{config.n_iter};
 
         for (int it = 1; it <= config.n_iter; ++it) {
-            update_policies(value_fn);
+            update_policies(h_curr);
 
             double max_h_change = 0.0;
             double max_rhs_now  = 0.0;
@@ -1136,24 +1188,24 @@ struct HJBLadderSolver {
                                    + nu_diffusion_term(h_curr, s)
                                    - exp_2nu[s.inu] * penalty_q[s.iq];
 
-                        // --------------------------------------------------------------------- //
-                        // Price tier optimization
-                        // --------------------------------------------------------------------- //
                         for (const auto& tier : tiers) {
                             const double* bid_row = tier->policy.bid.row_ptr(s.iq, s.iy, s.inu);
                             const double* ask_row = tier->policy.ask.row_ptr(s.iq, s.iy, s.inu);
 
                             for (std::size_t iz = 0; iz < tier->sizes.size(); ++iz) {
-                                const double z    = tier->sizes[iz];
-                                const double jump = tier->jump_size(z);
+                                const double z = tier->sizes[iz];
 
-                                const double d_b   = bid_row[iz];
+                                const double d_b = bid_row[iz];
                                 const double lam_b = tier->arrival_rate(d_b, z);
-                                rhs += lam_b * (z * d_b + value_fn(s.q + z, s.y - jump, s.nu) - h_here);
+                                const double cont_b = eval_bilinear_qy_at_nu_index(
+                                    h_curr, s.inu, tier->continuation.bid.at(s.iq, s.iy, iz));
+                                rhs += lam_b * (z * d_b + cont_b - h_here);
 
-                                const double d_a   = ask_row[iz];
+                                const double d_a = ask_row[iz];
                                 const double lam_a = tier->arrival_rate(d_a, z);
-                                rhs += lam_a * (z * d_a + value_fn(s.q - z, s.y + jump, s.nu) - h_here);
+                                const double cont_a = eval_bilinear_qy_at_nu_index(
+                                    h_curr, s.inu, tier->continuation.ask.at(s.iq, s.iy, iz));
+                                rhs += lam_a * (z * d_a + cont_a - h_here);
                             }
                         }
 
@@ -1178,10 +1230,7 @@ struct HJBLadderSolver {
             }
         }
 
-        // --------------------------------------------------------------------- //
-        // Final policy update with the last value function
-        // --------------------------------------------------------------------- //
-        update_policies(value_fn);
+        update_policies(h_curr);
 
         HJBSolution out;
         out.h                    = std::move(h_curr);

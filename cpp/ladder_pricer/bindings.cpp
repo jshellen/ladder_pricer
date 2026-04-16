@@ -360,7 +360,6 @@ PYBIND11_MODULE(ladder_pricer, m) {
           py::arg("q"),
           py::arg("y"),
           py::arg("nu"));
-
     m.def("interp_trilinear_rung", &hjb::interp_trilinear_rung,
           py::arg("q_grid"),
           py::arg("y_grid"),
@@ -370,7 +369,6 @@ PYBIND11_MODULE(ladder_pricer, m) {
           py::arg("y"),
           py::arg("nu"),
           py::arg("iz"));
-
     m.def("max_abs_vec", &hjb::max_abs_vec, py::arg("x"));
     m.def("max_abs_3d", &hjb::max_abs_3d, py::arg("x"));
 }
