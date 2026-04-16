@@ -285,6 +285,7 @@ def make_quote_inventory_figure(cpp_tier: lp.PriceTier, spec: TierSpec) -> go.Fi
         xaxis_title="Inventory q",
         yaxis_title="Quote around mid (mid = 0)",
         height=520,
+        yaxis=dict(range=[-10, 10])
     )
     return fig
 
