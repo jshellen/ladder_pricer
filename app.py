@@ -62,6 +62,92 @@ class TierSpec:
 
 
 # ============================================================
+# Interop helpers for flat C++ cubes / enum side
+# ============================================================
+
+def _cube_shape(cube, ndim: int) -> tuple[int, ...]:
+    if hasattr(cube, "shape"):
+        shape = tuple(int(x) for x in cube.shape)
+        if len(shape) == ndim:
+            return shape
+
+    if ndim == 3 and all(hasattr(cube, x) for x in ("nq", "ny", "nnu")):
+        return (int(cube.nq), int(cube.ny), int(cube.nnu))
+
+    if ndim == 4 and all(hasattr(cube, x) for x in ("nq", "ny", "nnu", "nz")):
+        return (int(cube.nq), int(cube.ny), int(cube.nnu), int(cube.nz))
+
+    raise TypeError(
+        f"Could not infer shape for {type(cube).__name__}. "
+        "Expose either .shape or the nq/ny/nnu(/nz) fields in pybind."
+    )
+
+
+def flatcube3d_to_numpy(cube) -> np.ndarray:
+    if isinstance(cube, np.ndarray):
+        arr = np.asarray(cube, dtype=float)
+        if arr.ndim != 3:
+            raise ValueError(f"Expected 3D array, got ndim={arr.ndim}.")
+        return arr
+
+    if hasattr(cube, "numpy") and callable(cube.numpy):
+        arr = np.asarray(cube.numpy(), dtype=float)
+        if arr.ndim != 3:
+            raise ValueError(f"Expected 3D array, got ndim={arr.ndim}.")
+        return arr
+
+    if hasattr(cube, "data"):
+        data = np.asarray(cube.data, dtype=float)
+        shape = _cube_shape(cube, ndim=3)
+        return data.reshape(shape)
+
+    raise TypeError(
+        f"Unsupported FlatCube3D conversion for object of type {type(cube).__name__}."
+    )
+
+
+def flatcube4d_to_numpy(cube) -> np.ndarray:
+    if isinstance(cube, np.ndarray):
+        arr = np.asarray(cube, dtype=float)
+        if arr.ndim != 4:
+            raise ValueError(f"Expected 4D array, got ndim={arr.ndim}.")
+        return arr
+
+    if hasattr(cube, "numpy") and callable(cube.numpy):
+        arr = np.asarray(cube.numpy(), dtype=float)
+        if arr.ndim != 4:
+            raise ValueError(f"Expected 4D array, got ndim={arr.ndim}.")
+        return arr
+
+    if hasattr(cube, "data"):
+        data = np.asarray(cube.data, dtype=float)
+        shape = _cube_shape(cube, ndim=4)
+        return data.reshape(shape)
+
+    raise TypeError(
+        f"Unsupported FlatCube4D conversion for object of type {type(cube).__name__}."
+    )
+
+
+def side_value(side_name: str):
+    side_name = side_name.lower()
+    if side_name not in {"bid", "ask"}:
+        raise ValueError(f"Unknown side: {side_name}")
+
+    if hasattr(lp, "Side"):
+        return lp.Side.Bid if side_name == "bid" else lp.Side.Ask
+
+    if hasattr(lp, "parse_side") and callable(lp.parse_side):
+        return lp.parse_side(side_name)
+
+    return side_name
+
+
+LP_BID = side_value("bid")
+LP_ASK = side_value("ask")
+
+
+# ============================================================
 # UI helpers
 # ============================================================
 
@@ -242,8 +328,8 @@ def policy_arrays(
     q_grid = np.array(cpp_tier.policy.q_grid, dtype=float)
     y_grid = np.array(cpp_tier.policy.y_grid, dtype=float)
     nu_grid = np.array(cpp_tier.policy.nu_grid, dtype=float)
-    bid = np.array(cpp_tier.policy.bid, dtype=float)   # [nq, ny, nnu, nz]
-    ask = np.array(cpp_tier.policy.ask, dtype=float)   # [nq, ny, nnu, nz]
+    bid = flatcube4d_to_numpy(cpp_tier.policy.bid)   # [nq, ny, nnu, nz]
+    ask = flatcube4d_to_numpy(cpp_tier.policy.ask)   # [nq, ny, nnu, nz]
     return q_grid, y_grid, nu_grid, bid, ask
 
 
@@ -273,7 +359,7 @@ def make_h_slice_figure(solution: lp.HJBSolution, y_selected: float, sigma_state
     y_grid = np.array(solution.y_grid, dtype=float)
     nu_grid = np.array(solution.nu_grid, dtype=float)
     sigma_state_grid = np.exp(nu_grid)
-    h = np.array(solution.h, dtype=float)  # [nq, ny, nnu]
+    h = flatcube3d_to_numpy(solution.h)  # [nq, ny, nnu]
 
     iy = nearest_index(y_grid, y_selected)
     inu = nearest_index(sigma_state_grid, sigma_state_selected)
@@ -450,8 +536,8 @@ def make_ladder_figure(
 ) -> go.Figure:
     nu = float(np.log(sigma_state))
     sizes = [float(z) for z in spec.sizes]
-    bid_vals = [-cpp_tier.quote(float(q), float(y), nu, z, "bid") for z in sizes]
-    ask_vals = [cpp_tier.quote(float(q), float(y), nu, z, "ask") for z in sizes]
+    bid_vals = [-cpp_tier.quote(float(q), float(y), nu, z, LP_BID) for z in sizes]
+    ask_vals = [cpp_tier.quote(float(q), float(y), nu, z, LP_ASK) for z in sizes]
 
     fig = go.Figure()
     fig.add_trace(
@@ -493,8 +579,8 @@ def make_state_ladder_table(
     rows = []
     for z in spec.sizes:
         zf = float(z)
-        bid_delta = cpp_tier.quote(float(q), float(y), nu, zf, "bid")
-        ask_delta = cpp_tier.quote(float(q), float(y), nu, zf, "ask")
+        bid_delta = cpp_tier.quote(float(q), float(y), nu, zf, LP_BID)
+        ask_delta = cpp_tier.quote(float(q), float(y), nu, zf, LP_ASK)
         rows.append(
             {
                 "q": float(q),

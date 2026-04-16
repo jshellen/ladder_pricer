@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
-#include <functional>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -14,6 +13,85 @@
 namespace hjb {
 
 // ============================================================
+// Flat array containers (replace nested-vector Cube3D / Cube4D)
+// ============================================================
+
+struct FlatCube3D {
+    std::vector<double> data;
+    std::size_t nq{0}, ny{0}, nnu{0};
+
+    FlatCube3D() = default;
+
+    FlatCube3D(std::size_t nq_, std::size_t ny_, std::size_t nnu_, double init = 0.0)
+        : data(nq_ * ny_ * nnu_, init), nq(nq_), ny(ny_), nnu(nnu_) {}
+
+    void reset(std::size_t nq_, std::size_t ny_, std::size_t nnu_, double init = 0.0) {
+        nq = nq_; ny = ny_; nnu = nnu_;
+        data.assign(nq_ * ny_ * nnu_, init);
+    }
+
+    std::size_t index(std::size_t iq, std::size_t iy, std::size_t inu) const noexcept {
+        return (iq * ny + iy) * nnu + inu;
+    }
+
+    double& at(std::size_t iq, std::size_t iy, std::size_t inu) noexcept {
+        return data[index(iq, iy, inu)];
+    }
+
+    double at(std::size_t iq, std::size_t iy, std::size_t inu) const noexcept {
+        return data[index(iq, iy, inu)];
+    }
+
+    bool empty() const noexcept { return data.empty(); }
+};
+
+struct FlatCube4D {
+    std::vector<double> data;
+    std::size_t nq{0}, ny{0}, nnu{0}, nz{0};
+
+    FlatCube4D() = default;
+
+    FlatCube4D(std::size_t nq_, std::size_t ny_, std::size_t nnu_, std::size_t nz_,
+               double init = 0.0)
+        : data(nq_ * ny_ * nnu_ * nz_, init),
+          nq(nq_), ny(ny_), nnu(nnu_), nz(nz_) {}
+
+    // Reallocates (zeroed) only when shape changes.
+    void ensure_shape(std::size_t nq_, std::size_t ny_, std::size_t nnu_, std::size_t nz_) {
+        if (nq_ == nq && ny_ == ny && nnu_ == nnu && nz_ == nz) return;
+        nq = nq_; ny = ny_; nnu = nnu_; nz = nz_;
+        data.assign(nq_ * ny_ * nnu_ * nz_, 0.0);
+    }
+
+    std::size_t index(std::size_t iq, std::size_t iy,
+                      std::size_t inu, std::size_t iz) const noexcept {
+        return ((iq * ny + iy) * nnu + inu) * nz + iz;
+    }
+
+    double& at(std::size_t iq, std::size_t iy,
+               std::size_t inu, std::size_t iz) noexcept {
+        return data[index(iq, iy, inu, iz)];
+    }
+
+    double at(std::size_t iq, std::size_t iy,
+              std::size_t inu, std::size_t iz) const noexcept {
+        return data[index(iq, iy, inu, iz)];
+    }
+
+    // Pointer to the contiguous nz-element row at (iq, iy, inu).
+    double* row_ptr(std::size_t iq, std::size_t iy, std::size_t inu) noexcept {
+        return data.data() + ((iq * ny + iy) * nnu + inu) * nz;
+    }
+
+    const double* row_ptr(std::size_t iq, std::size_t iy,
+                          std::size_t inu) const noexcept {
+        return data.data() + ((iq * ny + iy) * nnu + inu) * nz;
+    }
+
+    bool empty() const noexcept { return data.empty(); }
+};
+
+// ============================================================
 // Helpers
 // ============================================================
 
@@ -21,37 +99,38 @@ inline double clamp(double x, double lo, double hi) {
     return std::min(std::max(x, lo), hi);
 }
 
+enum class Side : unsigned char { Bid, Ask };
+
+inline Side parse_side(const std::string& side) {
+    if (side == "bid") return Side::Bid;
+    if (side == "ask") return Side::Ask;
+    throw std::invalid_argument("Unknown side: " + side);
+}
+
+inline const char* side_name(Side side) {
+    return (side == Side::Bid) ? "bid" : "ask";
+}
+
 inline std::pair<std::size_t, double> locate_segment_with_weight(
     const std::vector<double>& grid,
     double x
 ) {
-    if (grid.empty()) {
-        throw std::invalid_argument("Grid cannot be empty.");
-    }
-    if (grid.size() == 1) {
-        return {0, 0.0};
-    }
+    if (grid.empty()) throw std::invalid_argument("Grid cannot be empty.");
+    if (grid.size() == 1) return {0, 0.0};
 
     if (x <= grid.front()) {
-        const double x0 = grid[0];
-        const double x1 = grid[1];
-        const double t = (x - x0) / (x1 - x0);
+        const double t = (x - grid[0]) / (grid[1] - grid[0]);
         return {0, t};
     }
-
     if (x >= grid.back()) {
         const std::size_t i = grid.size() - 2;
-        const double x0 = grid[i];
-        const double x1 = grid[i + 1];
-        const double t = (x - x0) / (x1 - x0);
+        const double t = (x - grid[i]) / (grid[i + 1] - grid[i]);
         return {i, t};
     }
 
     auto it = std::upper_bound(grid.begin(), grid.end(), x);
     const std::size_t i = static_cast<std::size_t>(it - grid.begin() - 1);
-    const double x0 = grid[i];
-    const double x1 = grid[i + 1];
-    const double t = (x - x0) / (x1 - x0);
+    const double t = (x - grid[i]) / (grid[i + 1] - grid[i]);
     return {i, t};
 }
 
@@ -60,15 +139,9 @@ inline double interp_linear(
     const std::vector<double>& vals,
     double x
 ) {
-    if (grid.size() != vals.size()) {
-        throw std::invalid_argument("interp_linear: size mismatch.");
-    }
-    if (grid.empty()) {
-        throw std::invalid_argument("interp_linear: empty input.");
-    }
-    if (grid.size() == 1) {
-        return vals.front();
-    }
+    if (grid.size() != vals.size()) throw std::invalid_argument("interp_linear: size mismatch.");
+    if (grid.empty())               throw std::invalid_argument("interp_linear: empty input.");
+    if (grid.size() == 1)           return vals.front();
 
     const auto [i, t] = locate_segment_with_weight(grid, x);
     return vals[i] + t * (vals[i + 1] - vals[i]);
@@ -78,91 +151,218 @@ inline double interp_trilinear(
     const std::vector<double>& q_grid,
     const std::vector<double>& y_grid,
     const std::vector<double>& nu_grid,
-    const std::vector<std::vector<std::vector<double>>>& vals,
-    double q,
-    double y,
-    double nu
+    const FlatCube3D& vals,
+    double q, double y, double nu
 ) {
-    if (vals.size() != q_grid.size()) {
+    if (vals.nq != q_grid.size())
         throw std::invalid_argument("interp_trilinear: q dimension mismatch.");
-    }
-    for (const auto& slab : vals) {
-        if (slab.size() != y_grid.size()) {
-            throw std::invalid_argument("interp_trilinear: y dimension mismatch.");
-        }
-        for (const auto& row : slab) {
-            if (row.size() != nu_grid.size()) {
-                throw std::invalid_argument("interp_trilinear: nu dimension mismatch.");
-            }
-        }
-    }
+    if (vals.ny != y_grid.size())
+        throw std::invalid_argument("interp_trilinear: y dimension mismatch.");
+    if (vals.nnu != nu_grid.size())
+        throw std::invalid_argument("interp_trilinear: nu dimension mismatch.");
 
     const auto [iq, tq] = locate_segment_with_weight(q_grid, q);
     const auto [iy, ty] = locate_segment_with_weight(y_grid, y);
     const auto [in, tn] = locate_segment_with_weight(nu_grid, nu);
 
-    const double c000 = vals[iq][iy][in];
-    const double c100 = vals[iq + 1][iy][in];
-    const double c010 = vals[iq][iy + 1][in];
-    const double c110 = vals[iq + 1][iy + 1][in];
-
-    const double c001 = vals[iq][iy][in + 1];
-    const double c101 = vals[iq + 1][iy][in + 1];
-    const double c011 = vals[iq][iy + 1][in + 1];
-    const double c111 = vals[iq + 1][iy + 1][in + 1];
+    const double c000 = vals.at(iq,     iy,     in    );
+    const double c100 = vals.at(iq + 1, iy,     in    );
+    const double c010 = vals.at(iq,     iy + 1, in    );
+    const double c110 = vals.at(iq + 1, iy + 1, in    );
+    const double c001 = vals.at(iq,     iy,     in + 1);
+    const double c101 = vals.at(iq + 1, iy,     in + 1);
+    const double c011 = vals.at(iq,     iy + 1, in + 1);
+    const double c111 = vals.at(iq + 1, iy + 1, in + 1);
 
     const double c00 = c000 + tq * (c100 - c000);
     const double c10 = c010 + tq * (c110 - c010);
     const double c01 = c001 + tq * (c101 - c001);
     const double c11 = c011 + tq * (c111 - c011);
+    const double c0  = c00  + ty * (c10  - c00 );
+    const double c1  = c01  + ty * (c11  - c01 );
+    return c0 + tn * (c1 - c0);
+}
 
-    const double c0 = c00 + ty * (c10 - c00);
-    const double c1 = c01 + ty * (c11 - c01);
+inline double interp_trilinear_rung(
+    const std::vector<double>& q_grid,
+    const std::vector<double>& y_grid,
+    const std::vector<double>& nu_grid,
+    const FlatCube4D& vals,
+    double q, double y, double nu,
+    std::size_t iz
+) {
+    const auto [iq, tq] = locate_segment_with_weight(q_grid, q);
+    const auto [iy, ty] = locate_segment_with_weight(y_grid, y);
+    const auto [in, tn] = locate_segment_with_weight(nu_grid, nu);
 
+    const double c000 = vals.at(iq,     iy,     in,     iz);
+    const double c100 = vals.at(iq + 1, iy,     in,     iz);
+    const double c010 = vals.at(iq,     iy + 1, in,     iz);
+    const double c110 = vals.at(iq + 1, iy + 1, in,     iz);
+    const double c001 = vals.at(iq,     iy,     in + 1, iz);
+    const double c101 = vals.at(iq + 1, iy,     in + 1, iz);
+    const double c011 = vals.at(iq,     iy + 1, in + 1, iz);
+    const double c111 = vals.at(iq + 1, iy + 1, in + 1, iz);
+
+    const double c00 = c000 + tq * (c100 - c000);
+    const double c10 = c010 + tq * (c110 - c010);
+    const double c01 = c001 + tq * (c101 - c001);
+    const double c11 = c011 + tq * (c111 - c011);
+    const double c0  = c00  + ty * (c10  - c00 );
+    const double c1  = c01  + ty * (c11  - c01 );
     return c0 + tn * (c1 - c0);
 }
 
 inline double max_abs_vec(const std::vector<double>& x) {
     double out = 0.0;
-    for (double v : x) {
-        out = std::max(out, std::abs(v));
-    }
+    for (double v : x) out = std::max(out, std::abs(v));
     return out;
 }
 
-inline double max_abs_3d(const std::vector<std::vector<std::vector<double>>>& x) {
-    double out = 0.0;
-    for (const auto& slab : x) {
-        for (const auto& row : slab) {
-            out = std::max(out, max_abs_vec(row));
-        }
-    }
-    return out;
+// With a flat layout this collapses to a single pass over contiguous memory.
+inline double max_abs_3d(const FlatCube3D& x) {
+    return max_abs_vec(x.data);
 }
 
-inline std::vector<double> diff(const std::vector<double>& x) {
-    if (x.size() < 2) return {};
-    std::vector<double> out(x.size() - 1);
-    for (std::size_t i = 0; i + 1 < x.size(); ++i) {
-        out[i] = x[i + 1] - x[i];
-    }
-    return out;
+// Writes differences of the n-element array x into out.
+inline void diff_inplace(const double* x, std::size_t n, std::vector<double>& out) {
+    if (n < 2) { out.clear(); return; }
+    out.resize(n - 1);
+    for (std::size_t i = 0; i + 1 < n; ++i) out[i] = x[i + 1] - x[i];
 }
 
 // ============================================================
-// No-copy interpolator
+// No-copy interpolator over FlatCube3D
 // ============================================================
 
 struct HInterp3D {
     const std::vector<double>& q_grid;
     const std::vector<double>& y_grid;
     const std::vector<double>& nu_grid;
-    const std::vector<std::vector<std::vector<double>>>& h;
+    const FlatCube3D& h;
+
+    HInterp3D(
+        const std::vector<double>& q_grid_,
+        const std::vector<double>& y_grid_,
+        const std::vector<double>& nu_grid_,
+        const FlatCube3D& h_
+    ) : q_grid(q_grid_), y_grid(y_grid_), nu_grid(nu_grid_), h(h_) {
+        if (h.nq != q_grid.size())
+            throw std::invalid_argument("HInterp3D: q dimension mismatch.");
+        if (h.ny != y_grid.size())
+            throw std::invalid_argument("HInterp3D: y dimension mismatch.");
+        if (h.nnu != nu_grid.size())
+            throw std::invalid_argument("HInterp3D: nu dimension mismatch.");
+    }
 
     double operator()(double q, double y, double nu) const {
-        return interp_trilinear(q_grid, y_grid, nu_grid, h, q, y, nu);
+        const auto [iq, tq] = locate_segment_with_weight(q_grid, q);
+        const auto [iy, ty] = locate_segment_with_weight(y_grid, y);
+        const auto [in, tn] = locate_segment_with_weight(nu_grid, nu);
+
+        const double c000 = h.at(iq,     iy,     in    );
+        const double c100 = h.at(iq + 1, iy,     in    );
+        const double c010 = h.at(iq,     iy + 1, in    );
+        const double c110 = h.at(iq + 1, iy + 1, in    );
+        const double c001 = h.at(iq,     iy,     in + 1);
+        const double c101 = h.at(iq + 1, iy,     in + 1);
+        const double c011 = h.at(iq,     iy + 1, in + 1);
+        const double c111 = h.at(iq + 1, iy + 1, in + 1);
+
+        const double c00 = c000 + tq * (c100 - c000);
+        const double c10 = c010 + tq * (c110 - c010);
+        const double c01 = c001 + tq * (c101 - c001);
+        const double c11 = c011 + tq * (c111 - c011);
+        const double c0  = c00  + ty * (c10  - c00 );
+        const double c1  = c01  + ty * (c11  - c01 );
+        return c0 + tn * (c1 - c0);
     }
 };
+
+// ============================================================
+// Optimization utility
+// ============================================================
+
+namespace opt {
+
+struct GoldenSectionOptions {
+    double tol{1e-4};
+    int max_iter{32};
+};
+
+struct GoldenSectionResult {
+    double x_star{0.0};
+    double f_star{0.0};
+    int iterations{0};
+    bool converged{false};
+};
+
+struct GoldenSectionOptimizer {
+    template <class ObjectiveFn>
+    static GoldenSectionResult maximize(
+        const ObjectiveFn& f,
+        double lower,
+        double upper,
+        const GoldenSectionOptions& opts = {}
+    ) {
+        if (upper < lower)
+            throw std::invalid_argument("GoldenSectionOptimizer::maximize: invalid bounds.");
+        if (opts.tol <= 0.0)
+            throw std::invalid_argument("GoldenSectionOptimizer::maximize: tol must be positive.");
+        if (opts.max_iter < 1)
+            throw std::invalid_argument("GoldenSectionOptimizer::maximize: max_iter must be >= 1.");
+
+        if (std::abs(upper - lower) < opts.tol) {
+            const double x = 0.5 * (lower + upper);
+            return {x, f(x), 0, true};
+        }
+
+        constexpr double gr = 1.6180339887498948482; // (sqrt(5)+1)/2
+
+        double a = lower;
+        double b = upper;
+        double c = b - (b - a) / gr;
+        double d = a + (b - a) / gr;
+
+        double fc = f(c);
+        double fd = f(d);
+
+        int it = 0;
+        for (; it < opts.max_iter; ++it) {
+            if (std::abs(b - a) < opts.tol) break;
+
+            if (fc > fd) {
+                b = d; d = c; fd = fc;
+                c = b - (b - a) / gr;
+                fc = f(c);
+            } else {
+                a = c; c = d; fc = fd;
+                d = a + (b - a) / gr;
+                fd = f(d);
+            }
+        }
+
+        const double x_star = 0.5 * (a + b);
+        // Reuse the closer bracket evaluation instead of an extra f() call.
+        const double f_star = (fc > fd) ? fc : fd;
+        return {x_star, f_star, it, std::abs(b - a) < opts.tol};
+    }
+
+    template <class ObjectiveFn>
+    static GoldenSectionResult minimize(
+        const ObjectiveFn& f,
+        double lower,
+        double upper,
+        const GoldenSectionOptions& opts = {}
+    ) {
+        auto neg_f = [&](double x) { return -f(x); };
+        auto res = maximize(neg_f, lower, upper, opts);
+        res.f_star = f(res.x_star);
+        return res;
+    }
+};
+
+} // namespace opt
 
 // ============================================================
 // Abstract model components
@@ -180,7 +380,6 @@ struct DriftJumpModel {
 
 struct InventoryPenalty {
     virtual ~InventoryPenalty() = default;
-    // Base penalty ψ(q). Solver multiplies it by exp(2*nu).
     virtual double value(double q) const = 0;
 };
 
@@ -198,50 +397,30 @@ struct LogisticFlowCurve final : public FlowCurve {
 
     LogisticFlowCurve() = default;
 
-    LogisticFlowCurve(
-        double A0_,
-        double theta_,
-        double k_,
-        double m0_,
-        double m_alpha_,
-        double z_floor_ = 1e-8
-    )
-        : A0(A0_),
-          theta(theta_),
-          k(k_),
-          m0(m0_),
-          m_alpha(m_alpha_),
-          z_floor(z_floor_) {}
+    LogisticFlowCurve(double A0_, double theta_, double k_,
+                      double m0_, double m_alpha_, double z_floor_ = 1e-8)
+        : A0(A0_), theta(theta_), k(k_),
+          m0(m0_), m_alpha(m_alpha_), z_floor(z_floor_) {}
 
     double A(double z) const {
-        z = std::max(z, z_floor);
-        return A0 * std::pow(z, -theta);
+        return A0 * std::pow(std::max(z, z_floor), -theta);
     }
 
     double m(double z) const {
-        z = std::max(z, z_floor);
-        return m0 + m_alpha * z;
+        return m0 + m_alpha * std::max(z, z_floor);
     }
 
     double arrival_rate(double delta, double z) const override {
-        const double Az = A(z);
-        const double mz = m(z);
+        if (A0 < 0.0) throw std::invalid_argument("A(z) must be nonnegative.");
+        if (k <= 0.0) throw std::invalid_argument("k must be positive.");
 
-        if (Az < 0.0) {
-            throw std::invalid_argument("A(z) must be nonnegative.");
-        }
-        if (k <= 0.0) {
-            throw std::invalid_argument("k must be positive.");
-        }
-
-        const double x = k * (delta - mz);
-
+        const double x = k * (delta - m(z));
         if (x >= 0.0) {
             const double ex = std::exp(-x);
-            return Az * ex / (1.0 + ex);
+            return A(z) * ex / (1.0 + ex);
         }
         const double ex = std::exp(x);
-        return Az / (1.0 + ex);
+        return A(z) / (1.0 + ex);
     }
 };
 
@@ -250,9 +429,7 @@ struct SqrtDriftJumpModel final : public DriftJumpModel {
     double coeff{0.01};
 
     SqrtDriftJumpModel() = default;
-
-    SqrtDriftJumpModel(double base_, double coeff_)
-        : base(base_), coeff(coeff_) {}
+    SqrtDriftJumpModel(double base_, double coeff_) : base(base_), coeff(coeff_) {}
 
     double jump_size(double z) const override {
         return base + coeff * std::sqrt(z);
@@ -268,28 +445,21 @@ struct PolynomialInventoryPenalty final : public InventoryPenalty {
 
     PolynomialInventoryPenalty() = default;
 
-    PolynomialInventoryPenalty(
-        double risk_aversion_,
-        double sigma_ref_,
-        double tau0_,
-        double cubic_coeff_,
-        double quartic_coeff_
-    )
-        : risk_aversion(risk_aversion_),
-          sigma_ref(sigma_ref_),
-          tau0(tau0_),
-          cubic_coeff(cubic_coeff_),
-          quartic_coeff(quartic_coeff_) {}
+    PolynomialInventoryPenalty(double risk_aversion_, double sigma_ref_, double tau0_,
+                               double cubic_coeff_, double quartic_coeff_)
+        : risk_aversion(risk_aversion_), sigma_ref(sigma_ref_), tau0(tau0_),
+          cubic_coeff(cubic_coeff_), quartic_coeff(quartic_coeff_) {}
 
     double value(double q) const override {
         const double x = std::abs(q);
+        const double x2 = x * x;
         return risk_aversion * sigma_ref * sigma_ref *
-               (tau0 * x * x + cubic_coeff * x * x * x + quartic_coeff * x * x * x * x);
+               (tau0 * x2 + cubic_coeff * x2 * x + quartic_coeff * x2 * x2);
     }
 };
 
 // ============================================================
-// Quote policy: indexed by q, y, nu, size
+// Quote policy: indexed by q, y, nu, size (FlatCube4D storage)
 // ============================================================
 
 struct QuotePolicy {
@@ -298,9 +468,8 @@ struct QuotePolicy {
     std::vector<double> nu_grid;
     std::vector<double> sizes;
 
-    // shapes: [nq][ny][nnu][nz]
-    std::vector<std::vector<std::vector<std::vector<double>>>> bid;
-    std::vector<std::vector<std::vector<std::vector<double>>>> ask;
+    FlatCube4D bid;
+    FlatCube4D ask;
 
     QuotePolicy() = default;
 
@@ -309,8 +478,8 @@ struct QuotePolicy {
         std::vector<double> y_grid_,
         std::vector<double> nu_grid_,
         std::vector<double> sizes_,
-        std::vector<std::vector<std::vector<std::vector<double>>>> bid_,
-        std::vector<std::vector<std::vector<std::vector<double>>>> ask_
+        FlatCube4D bid_,
+        FlatCube4D ask_
     )
         : q_grid(std::move(q_grid_)),
           y_grid(std::move(y_grid_)),
@@ -321,76 +490,52 @@ struct QuotePolicy {
         validate();
     }
 
+    void ensure_shape(
+        const std::vector<double>& q_grid_,
+        const std::vector<double>& y_grid_,
+        const std::vector<double>& nu_grid_,
+        const std::vector<double>& sizes_
+    ) {
+        q_grid = q_grid_; y_grid = y_grid_; nu_grid = nu_grid_; sizes = sizes_;
+        bid.ensure_shape(q_grid.size(), y_grid.size(), nu_grid.size(), sizes.size());
+        ask.ensure_shape(q_grid.size(), y_grid.size(), nu_grid.size(), sizes.size());
+    }
+
     void validate() const {
-        const std::size_t nq = q_grid.size();
-        const std::size_t ny = y_grid.size();
+        const std::size_t nq  = q_grid.size();
+        const std::size_t ny  = y_grid.size();
         const std::size_t nnu = nu_grid.size();
-        const std::size_t nz = sizes.size();
+        const std::size_t nz  = sizes.size();
 
-        if (bid.size() != nq || ask.size() != nq) {
-            throw std::invalid_argument("QuotePolicy: q dimension mismatch.");
-        }
-
-        auto check_cube = [&](const auto& cube, const std::string& name) {
-            for (const auto& slab_y : cube) {
-                if (slab_y.size() != ny) {
-                    throw std::invalid_argument("QuotePolicy: " + name + " y dimension mismatch.");
-                }
-                for (const auto& slab_nu : slab_y) {
-                    if (slab_nu.size() != nnu) {
-                        throw std::invalid_argument("QuotePolicy: " + name + " nu dimension mismatch.");
-                    }
-                    for (const auto& row : slab_nu) {
-                        if (row.size() != nz) {
-                            throw std::invalid_argument("QuotePolicy: " + name + " size dimension mismatch.");
-                        }
-                    }
-                }
-            }
+        auto check = [&](const FlatCube4D& c, const char* name) {
+            if (c.nq != nq || c.ny != ny || c.nnu != nnu || c.nz != nz)
+                throw std::invalid_argument(
+                    std::string("QuotePolicy: ") + name + " shape mismatch.");
         };
-
-        check_cube(bid, "bid");
-        check_cube(ask, "ask");
+        check(bid, "bid");
+        check(ask, "ask");
     }
 
     double delta_at_index(
-        std::size_t iq,
-        std::size_t iy,
-        std::size_t inu,
-        std::size_t iz,
-        const std::string& side
+        std::size_t iq, std::size_t iy, std::size_t inu, std::size_t iz, Side side
     ) const {
-        if (side == "bid") return bid.at(iq).at(iy).at(inu).at(iz);
-        if (side == "ask") return ask.at(iq).at(iy).at(inu).at(iz);
-        throw std::invalid_argument("Unknown side: " + side);
+        return (side == Side::Bid) ? bid.at(iq, iy, inu, iz)
+                                   : ask.at(iq, iy, inu, iz);
     }
 
-    double quote(double q, double y, double nu, double z, const std::string& side) const {
-        const auto& cube = (side == "bid") ? bid : ask;
-        if (side != "bid" && side != "ask") {
-            throw std::invalid_argument("Unknown side: " + side);
-        }
+    double quote(double q, double y, double nu, double z, Side side) const {
+        const FlatCube4D& cube = (side == Side::Bid) ? bid : ask;
 
-        std::vector<double> vals_by_z(sizes.size(), 0.0);
+        if (sizes.empty())
+            throw std::invalid_argument("QuotePolicy::quote: sizes cannot be empty.");
 
-        for (std::size_t iz = 0; iz < sizes.size(); ++iz) {
-            std::vector<std::vector<std::vector<double>>> slice(
-                q_grid.size(),
-                std::vector<std::vector<double>>(y_grid.size(), std::vector<double>(nu_grid.size(), 0.0))
-            );
+        if (sizes.size() == 1)
+            return interp_trilinear_rung(q_grid, y_grid, nu_grid, cube, q, y, nu, 0);
 
-            for (std::size_t iq = 0; iq < q_grid.size(); ++iq) {
-                for (std::size_t iy = 0; iy < y_grid.size(); ++iy) {
-                    for (std::size_t inu = 0; inu < nu_grid.size(); ++inu) {
-                        slice[iq][iy][inu] = cube[iq][iy][inu][iz];
-                    }
-                }
-            }
-
-            vals_by_z[iz] = interp_trilinear(q_grid, y_grid, nu_grid, slice, q, y, nu);
-        }
-
-        return interp_linear(sizes, vals_by_z, z);
+        const auto [iz, tz] = locate_segment_with_weight(sizes, z);
+        const double v0 = interp_trilinear_rung(q_grid, y_grid, nu_grid, cube, q, y, nu, iz);
+        const double v1 = interp_trilinear_rung(q_grid, y_grid, nu_grid, cube, q, y, nu, iz + 1);
+        return v0 + tz * (v1 - v0);
     }
 };
 
@@ -435,136 +580,65 @@ struct PriceTier {
     }
 
     void validate() const {
-        if (sizes.empty()) {
-            throw std::invalid_argument("PriceTier: sizes cannot be empty.");
-        }
-        if (!flow_curve) {
-            throw std::invalid_argument("PriceTier: flow_curve cannot be null.");
-        }
-        if (!jump_model) {
-            throw std::invalid_argument("PriceTier: jump_model cannot be null.");
-        }
-        if (delta_max <= delta_min) {
+        if (sizes.empty())   throw std::invalid_argument("PriceTier: sizes cannot be empty.");
+        if (!flow_curve)     throw std::invalid_argument("PriceTier: flow_curve cannot be null.");
+        if (!jump_model)     throw std::invalid_argument("PriceTier: jump_model cannot be null.");
+        if (delta_max <= delta_min)
             throw std::invalid_argument("PriceTier: delta_max must be > delta_min.");
-        }
-        for (double z : sizes) {
-            if (z <= 0.0) {
-                throw std::invalid_argument("PriceTier: sizes must be positive.");
-            }
-        }
-        for (std::size_t i = 1; i < sizes.size(); ++i) {
-            if (sizes[i] <= sizes[i - 1]) {
+        for (double z : sizes)
+            if (z <= 0.0) throw std::invalid_argument("PriceTier: sizes must be positive.");
+        for (std::size_t i = 1; i < sizes.size(); ++i)
+            if (sizes[i] <= sizes[i - 1])
                 throw std::invalid_argument("PriceTier: sizes must be strictly increasing.");
-            }
-        }
     }
 
-    static double next_inventory(double q, double z, const std::string& side) {
-        if (side == "bid") return q + z;
-        if (side == "ask") return q - z;
-        throw std::invalid_argument("Unknown side: " + side);
+    double arrival_rate(double delta, double z) const { return flow_curve->arrival_rate(delta, z); }
+    double jump_size(double z)                  const { return jump_model->jump_size(z); }
+
+    double quote(double q, double y, double nu, double z, Side side) const {
+        return policy.quote(q, y, nu, z, side);
+    }
+};
+
+// ============================================================
+// Ladder policy builder
+// ============================================================
+
+struct LadderPolicyBuilder {
+    static double next_inventory(double q, double z, Side side) {
+        return (side == Side::Bid) ? (q + z) : (q - z);
     }
 
-    static double next_drift(double y, double jump, const std::string& side) {
-        if (side == "bid") return y - jump;
-        if (side == "ask") return y + jump;
-        throw std::invalid_argument("Unknown side: " + side);
+    static double next_drift(double y, double jump, Side side) {
+        return (side == Side::Bid) ? (y - jump) : (y + jump);
     }
 
-    double arrival_rate(double delta, double z) const {
-        return flow_curve->arrival_rate(delta, z);
+    static bool is_shrink_mode(double q, Side side) {
+        return (q > 0.0 && side == Side::Ask) || (q < 0.0 && side == Side::Bid);
     }
 
-    double jump_size(double z) const {
-        return jump_model->jump_size(z);
+    static bool is_expand_mode(double q, Side side) {
+        return (q > 0.0 && side == Side::Bid) || (q < 0.0 && side == Side::Ask);
     }
 
-    double single_size_objective(
-        double delta,
-        const HInterp3D& h_fn,
-        double q,
-        double y,
-        double nu,
-        double z,
-        const std::string& side
-    ) const {
-        const double q_next = next_inventory(q, z, side);
-        const double y_next = next_drift(y, jump_size(z), side);
-        const double dh = h_fn(q_next, y_next, nu) - h_fn(q, y, nu);
-        const double lam = arrival_rate(delta, z);
-        return lam * (z * delta + dh);
-    }
-
-    double golden_search_max(
-        const std::function<double(double)>& objective_fn,
-        double lower,
-        double upper
-    ) const {
-        if (upper < lower) {
-            throw std::invalid_argument("golden_search_max: invalid interval.");
-        }
-        if (std::abs(upper - lower) < golden_tol) {
-            return 0.5 * (lower + upper);
-        }
-
-        const double gr = (std::sqrt(5.0) + 1.0) / 2.0;
-        double a = lower;
-        double b = upper;
-        double c = b - (b - a) / gr;
-        double d = a + (b - a) / gr;
-        double fc = objective_fn(c);
-        double fd = objective_fn(d);
-
-        for (int it = 0; it < golden_max_iter; ++it) {
-            if (std::abs(b - a) < golden_tol) break;
-
-            if (fc > fd) {
-                b = d;
-                d = c;
-                fd = fc;
-                c = b - (b - a) / gr;
-                fc = objective_fn(c);
-            } else {
-                a = c;
-                c = d;
-                fc = fd;
-                d = a + (b - a) / gr;
-                fd = objective_fn(d);
-            }
-        }
-
-        return 0.5 * (a + b);
-    }
-
-    static bool is_shrink_mode(double q, const std::string& side) {
-        return (q > 0.0 && side == "ask") || (q < 0.0 && side == "bid");
-    }
-
-    static bool is_expand_mode(double q, const std::string& side) {
-        return (q > 0.0 && side == "bid") || (q < 0.0 && side == "ask");
-    }
-
-    std::pair<double, double> rung_bounds(
+    // current_delta: pointer to the already-solved rungs [0..rung_idx-1].
+    static std::pair<double, double> rung_bounds(
+        const PriceTier& tier,
         std::size_t rung_idx,
-        const std::vector<double>& current_delta,
+        const double* current_delta,
         double q,
-        const std::string& side,
-        const std::vector<double>* prev_delta
-    ) const {
-        const std::size_t n = sizes.size();
-        double lower = delta_min;
-        double upper = delta_max;
-
-        std::vector<double> prev_gaps;
-        if (prev_delta != nullptr) {
-            prev_gaps = diff(*prev_delta);
-        }
+        Side side,
+        const std::vector<double>* prev_gaps
+    ) {
+        const std::size_t n = tier.sizes.size();
+        double lower = tier.delta_min;
+        double upper = tier.delta_max;
 
         if (rung_idx == 0) {
-            if (!prev_gaps.empty() && is_expand_mode(q, side)) {
-                double required_total_gap = 0.0;
-                for (double g : prev_gaps) required_total_gap += g;
-                upper = std::min(upper, delta_max - required_total_gap);
+            if (prev_gaps != nullptr && is_expand_mode(q, side)) {
+                double total = 0.0;
+                for (double g : *prev_gaps) total += g;
+                upper = std::min(upper, tier.delta_max - total);
             }
             return {lower, upper};
         }
@@ -572,125 +646,140 @@ struct PriceTier {
         const double prev_curr = current_delta[rung_idx - 1];
         lower = std::max(lower, prev_curr);
 
-        if (prev_gaps.empty()) {
+        if (prev_gaps == nullptr || prev_gaps->empty())
             return {lower, upper};
-        }
 
-        const double prev_gap = prev_gaps[rung_idx - 1];
+        const double prev_gap = (*prev_gaps)[rung_idx - 1];
 
         if (is_shrink_mode(q, side)) {
             upper = std::min(upper, prev_curr + prev_gap);
         } else if (is_expand_mode(q, side)) {
             lower = std::max(lower, prev_curr + prev_gap);
 
-            double remaining_future_gap = 0.0;
-            for (std::size_t k = rung_idx; k + 1 < n; ++k) {
-                remaining_future_gap += prev_gaps[k];
-            }
-            upper = std::min(upper, delta_max - remaining_future_gap);
+            double remaining = 0.0;
+            for (std::size_t k = rung_idx; k + 1 < n; ++k)
+                remaining += (*prev_gaps)[k];
+            upper = std::min(upper, tier.delta_max - remaining);
         }
 
         return {lower, upper};
     }
 
-    std::vector<double> solve_side_ladder(
+    // Writes nz optimised deltas directly into the FlatCube4D row pointed to by `delta`.
+    // `prev_delta` (optional) points to the corresponding row from the adjacent q-slice.
+    static void solve_side_ladder_inplace(
+        const PriceTier& tier,
         const HInterp3D& h_fn,
         double q,
         double y,
         double nu,
-        const std::string& side,
-        const std::vector<double>* prev_delta = nullptr
-    ) const {
-        const std::size_t n = sizes.size();
-        std::vector<double> delta(n, 0.0);
+        Side side,
+        double* delta,                      // length = tier.sizes.size()
+        std::vector<double>& prev_gaps_storage,
+        const double* prev_delta = nullptr  // length = tier.sizes.size(), or nullptr
+    ) {
+        const std::size_t n = tier.sizes.size();
+        const double h_here = h_fn(q, y, nu);
+
+        const std::vector<double>* prev_gaps = nullptr;
+        if (prev_delta != nullptr) {
+            diff_inplace(prev_delta, n, prev_gaps_storage);
+            prev_gaps = &prev_gaps_storage;
+        } else {
+            prev_gaps_storage.clear();
+        }
+
+        const opt::GoldenSectionOptions gs_opts{tier.golden_tol, tier.golden_max_iter};
 
         for (std::size_t j = 0; j < n; ++j) {
-            auto [lower0, upper0] = rung_bounds(j, delta, q, side, prev_delta);
-            double lower = std::max(delta_min, lower0);
-            double upper = std::min(delta_max, upper0);
+            auto [lower0, upper0] = rung_bounds(tier, j, delta, q, side, prev_gaps);
+            double lower = std::max(tier.delta_min, lower0);
+            double upper = std::min(tier.delta_max, upper0);
 
             if (lower > upper + 1e-12) {
                 throw std::runtime_error(
-                    "Infeasible ladder bounds for tier '" + name + "', side '" + side + "'."
-                );
+                    "Infeasible ladder bounds for tier '" + tier.name +
+                    "', side '" + std::string(side_name(side)) + "'.");
             }
-            if (upper < lower) {
-                upper = lower;
-            }
+            if (upper < lower) upper = lower;
 
-            const double z = sizes[j];
-            auto obj = [&](double d) {
-                return single_size_objective(d, h_fn, q, y, nu, z, side);
+            const double z    = tier.sizes[j];
+            const double jump = tier.jump_size(z);
+            const double dh   = h_fn(next_inventory(q, z, side),
+                                     next_drift(y, jump, side), nu) - h_here;
+
+            auto objective = [&](double d) {
+                return tier.arrival_rate(d, z) * (z * d + dh);
             };
 
-            delta[j] = golden_search_max(obj, lower, upper);
-            delta[j] = clamp(delta[j], lower, upper);
+            const auto res = opt::GoldenSectionOptimizer::maximize(objective, lower, upper, gs_opts);
+            delta[j] = clamp(res.x_star, lower, upper);
         }
-
-        return delta;
     }
 
-    QuotePolicy build_policy(
+    static void build_policy_inplace(
+        const PriceTier& tier,
         const HInterp3D& h_fn,
         const std::vector<double>& q_grid,
         const std::vector<double>& y_grid,
-        const std::vector<double>& nu_grid
+        const std::vector<double>& nu_grid,
+        QuotePolicy& policy
     ) {
-        const std::size_t nq = q_grid.size();
-        const std::size_t ny = y_grid.size();
+        const std::size_t nq  = q_grid.size();
+        const std::size_t ny  = y_grid.size();
         const std::size_t nnu = nu_grid.size();
-        const std::size_t nz = sizes.size();
 
-        std::vector<std::vector<std::vector<std::vector<double>>>> bid(
-            nq,
-            std::vector<std::vector<std::vector<double>>>(
-                ny,
-                std::vector<std::vector<double>>(nnu, std::vector<double>(nz, 0.0))
-            )
-        );
+        policy.ensure_shape(q_grid, y_grid, nu_grid, tier.sizes);
 
-        std::vector<std::vector<std::vector<std::vector<double>>>> ask = bid;
-
+        // Find the index closest to q = 0 as the unseeded starting point.
         std::size_t q0_idx = 0;
         double best_abs = std::numeric_limits<double>::infinity();
         for (std::size_t i = 0; i < nq; ++i) {
             const double a = std::abs(q_grid[i]);
-            if (a < best_abs) {
-                best_abs = a;
-                q0_idx = i;
-            }
+            if (a < best_abs) { best_abs = a; q0_idx = i; }
         }
+
+        std::vector<double> prev_gaps_storage;
 
         for (std::size_t iy = 0; iy < ny; ++iy) {
             const double y = y_grid[iy];
 
             for (std::size_t inu = 0; inu < nnu; ++inu) {
                 const double nu = nu_grid[inu];
-                const double q0 = q_grid[q0_idx];
 
-                ask[q0_idx][iy][inu] = solve_side_ladder(h_fn, q0, y, nu, "ask", nullptr);
-                bid[q0_idx][iy][inu] = solve_side_ladder(h_fn, q0, y, nu, "bid", nullptr);
+                // Seed at q0 with no gap constraints.
+                solve_side_ladder_inplace(
+                    tier, h_fn, q_grid[q0_idx], y, nu, Side::Ask,
+                    policy.ask.row_ptr(q0_idx, iy, inu), prev_gaps_storage, nullptr);
+                solve_side_ladder_inplace(
+                    tier, h_fn, q_grid[q0_idx], y, nu, Side::Bid,
+                    policy.bid.row_ptr(q0_idx, iy, inu), prev_gaps_storage, nullptr);
 
+                // Sweep q upward.
                 for (std::size_t iq = q0_idx + 1; iq < nq; ++iq) {
-                    const double q = q_grid[iq];
-                    ask[iq][iy][inu] = solve_side_ladder(h_fn, q, y, nu, "ask", &ask[iq - 1][iy][inu]);
-                    bid[iq][iy][inu] = solve_side_ladder(h_fn, q, y, nu, "bid", &bid[iq - 1][iy][inu]);
+                    solve_side_ladder_inplace(
+                        tier, h_fn, q_grid[iq], y, nu, Side::Ask,
+                        policy.ask.row_ptr(iq, iy, inu), prev_gaps_storage,
+                        policy.ask.row_ptr(iq - 1, iy, inu));
+                    solve_side_ladder_inplace(
+                        tier, h_fn, q_grid[iq], y, nu, Side::Bid,
+                        policy.bid.row_ptr(iq, iy, inu), prev_gaps_storage,
+                        policy.bid.row_ptr(iq - 1, iy, inu));
                 }
 
+                // Sweep q downward.
                 for (std::size_t ii = q0_idx; ii-- > 0;) {
-                    const double q = q_grid[ii];
-                    ask[ii][iy][inu] = solve_side_ladder(h_fn, q, y, nu, "ask", &ask[ii + 1][iy][inu]);
-                    bid[ii][iy][inu] = solve_side_ladder(h_fn, q, y, nu, "bid", &bid[ii + 1][iy][inu]);
+                    solve_side_ladder_inplace(
+                        tier, h_fn, q_grid[ii], y, nu, Side::Ask,
+                        policy.ask.row_ptr(ii, iy, inu), prev_gaps_storage,
+                        policy.ask.row_ptr(ii + 1, iy, inu));
+                    solve_side_ladder_inplace(
+                        tier, h_fn, q_grid[ii], y, nu, Side::Bid,
+                        policy.bid.row_ptr(ii, iy, inu), prev_gaps_storage,
+                        policy.bid.row_ptr(ii + 1, iy, inu));
                 }
             }
         }
-
-        policy = QuotePolicy(q_grid, y_grid, nu_grid, sizes, bid, ask);
-        return policy;
-    }
-
-    double quote(double q, double y, double nu, double z, const std::string& side) const {
-        return policy.quote(q, y, nu, z, side);
     }
 };
 
@@ -718,42 +807,34 @@ struct SolverConfig {
     int consecutive_passes_required{3};
 
     void validate() const {
-        if (q_grid.size() < 2 || y_grid.size() < 2 || nu_grid.size() < 2) {
+        if (q_grid.size() < 2 || y_grid.size() < 2 || nu_grid.size() < 2)
             throw std::invalid_argument("SolverConfig: all grids must have at least 2 points.");
-        }
-        if (dt <= 0.0) {
+        if (dt <= 0.0)
             throw std::invalid_argument("SolverConfig: dt must be positive.");
-        }
-        if (n_iter < 1) {
+        if (n_iter < 1)
             throw std::invalid_argument("SolverConfig: n_iter must be at least 1.");
-        }
-        if (kappa_y < 0.0 || kappa_nu < 0.0 || eta_nu < 0.0) {
-            throw std::invalid_argument("SolverConfig: mean reversion and vol-of-vol must be nonnegative.");
-        }
-        if (tol_h < 0.0 || tol_rhs < 0.0) {
+        if (kappa_y < 0.0 || kappa_nu < 0.0 || eta_nu < 0.0)
+            throw std::invalid_argument(
+                "SolverConfig: mean reversion and vol-of-vol must be nonneg.");
+        if (tol_h < 0.0 || tol_rhs < 0.0)
             throw std::invalid_argument("SolverConfig: tolerances must be nonnegative.");
-        }
-        if (min_iter < 0 || consecutive_passes_required < 1) {
+        if (min_iter < 0 || consecutive_passes_required < 1)
             throw std::invalid_argument("SolverConfig: invalid stopping parameters.");
-        }
 
-        auto check_increasing = [](const std::vector<double>& g, const std::string& name) {
-            for (std::size_t i = 1; i < g.size(); ++i) {
-                if (g[i] <= g[i - 1]) {
-                    throw std::invalid_argument("SolverConfig: " + name + " must be strictly increasing.");
-                }
-            }
+        auto check_inc = [](const std::vector<double>& g, const std::string& name) {
+            for (std::size_t i = 1; i < g.size(); ++i)
+                if (g[i] <= g[i - 1])
+                    throw std::invalid_argument(
+                        "SolverConfig: " + name + " must be strictly increasing.");
         };
-
-        check_increasing(q_grid, "q_grid");
-        check_increasing(y_grid, "y_grid");
-        check_increasing(nu_grid, "nu_grid");
+        check_inc(q_grid,  "q_grid");
+        check_inc(y_grid,  "y_grid");
+        check_inc(nu_grid, "nu_grid");
     }
 };
 
 struct HJBSolution {
-    // [nq][ny][nnu]
-    std::vector<std::vector<std::vector<double>>> h;
+    FlatCube3D h;
     std::vector<double> q_grid;
     std::vector<double> y_grid;
     std::vector<double> nu_grid;
@@ -781,276 +862,207 @@ struct HJBLadderSolver {
           penalty(std::move(penalty_)),
           tiers(std::move(tiers_)) {
         config.validate();
-        if (!penalty) {
-            throw std::invalid_argument("HJBLadderSolver: penalty cannot be null.");
-        }
+        if (!penalty) throw std::invalid_argument("HJBLadderSolver: penalty cannot be null.");
     }
 
-    HInterp3D make_h_interp(
-        const std::vector<std::vector<std::vector<double>>>& h_mat
-    ) const {
+    HInterp3D make_h_interp(const FlatCube3D& h_mat) const {
         return HInterp3D{config.q_grid, config.y_grid, config.nu_grid, h_mat};
     }
 
     double y_drift_term(
-        const std::vector<std::vector<std::vector<double>>>& h_mat,
-        std::size_t iq,
-        std::size_t iy,
-        std::size_t inu
+        const FlatCube3D& h_mat,
+        std::size_t iq, std::size_t iy, std::size_t inu
     ) const {
-        const double y = config.y_grid[iy];
-        const double b = -config.kappa_y * y;
+        const double b = -config.kappa_y * config.y_grid[iy];
+        if (std::abs(b) < 1e-14 || config.y_grid.size() == 1) return 0.0;
 
-        if (std::abs(b) < 1e-14 || config.y_grid.size() == 1) {
-            return 0.0;
-        }
-
-        double dh_dy = 0.0;
         const std::size_t ny = config.y_grid.size();
+        double dh_dy = 0.0;
 
         if (b > 0.0) {
-            if (iy == 0) {
-                const double dy = config.y_grid[1] - config.y_grid[0];
-                dh_dy = (h_mat[iq][1][inu] - h_mat[iq][0][inu]) / dy;
-            } else {
-                const double dy = config.y_grid[iy] - config.y_grid[iy - 1];
-                dh_dy = (h_mat[iq][iy][inu] - h_mat[iq][iy - 1][inu]) / dy;
-            }
+            const std::size_t lo = (iy == 0) ? 0 : iy - 1;
+            const std::size_t hi = lo + 1;
+            const double dy = config.y_grid[hi] - config.y_grid[lo];
+            dh_dy = (h_mat.at(iq, hi, inu) - h_mat.at(iq, lo, inu)) / dy;
         } else {
-            if (iy + 1 >= ny) {
-                const double dy = config.y_grid[ny - 1] - config.y_grid[ny - 2];
-                dh_dy = (h_mat[iq][ny - 1][inu] - h_mat[iq][ny - 2][inu]) / dy;
-            } else {
-                const double dy = config.y_grid[iy + 1] - config.y_grid[iy];
-                dh_dy = (h_mat[iq][iy + 1][inu] - h_mat[iq][iy][inu]) / dy;
-            }
+            const std::size_t hi = (iy + 1 >= ny) ? ny - 1 : iy + 1;
+            const std::size_t lo = hi - 1;
+            const double dy = config.y_grid[hi] - config.y_grid[lo];
+            dh_dy = (h_mat.at(iq, hi, inu) - h_mat.at(iq, lo, inu)) / dy;
         }
-
         return b * dh_dy;
     }
 
     double nu_drift_term(
-        const std::vector<std::vector<std::vector<double>>>& h_mat,
-        std::size_t iq,
-        std::size_t iy,
-        std::size_t inu
+        const FlatCube3D& h_mat,
+        std::size_t iq, std::size_t iy, std::size_t inu
     ) const {
-        const double nu = config.nu_grid[inu];
-        const double b = config.kappa_nu * (config.nu_bar - nu);
+        const double b = config.kappa_nu * (config.nu_bar - config.nu_grid[inu]);
+        if (std::abs(b) < 1e-14 || config.nu_grid.size() == 1) return 0.0;
 
-        if (std::abs(b) < 1e-14 || config.nu_grid.size() == 1) {
-            return 0.0;
-        }
-
-        double dh_dnu = 0.0;
         const std::size_t nnu = config.nu_grid.size();
+        double dh_dnu = 0.0;
 
         if (b > 0.0) {
-            if (inu == 0) {
-                const double dnu = config.nu_grid[1] - config.nu_grid[0];
-                dh_dnu = (h_mat[iq][iy][1] - h_mat[iq][iy][0]) / dnu;
-            } else {
-                const double dnu = config.nu_grid[inu] - config.nu_grid[inu - 1];
-                dh_dnu = (h_mat[iq][iy][inu] - h_mat[iq][iy][inu - 1]) / dnu;
-            }
+            const std::size_t lo = (inu == 0) ? 0 : inu - 1;
+            const std::size_t hi = lo + 1;
+            const double dnu = config.nu_grid[hi] - config.nu_grid[lo];
+            dh_dnu = (h_mat.at(iq, iy, hi) - h_mat.at(iq, iy, lo)) / dnu;
         } else {
-            if (inu + 1 >= nnu) {
-                const double dnu = config.nu_grid[nnu - 1] - config.nu_grid[nnu - 2];
-                dh_dnu = (h_mat[iq][iy][nnu - 1] - h_mat[iq][iy][nnu - 2]) / dnu;
-            } else {
-                const double dnu = config.nu_grid[inu + 1] - config.nu_grid[inu];
-                dh_dnu = (h_mat[iq][iy][inu + 1] - h_mat[iq][iy][inu]) / dnu;
-            }
+            const std::size_t hi = (inu + 1 >= nnu) ? nnu - 1 : inu + 1;
+            const std::size_t lo = hi - 1;
+            const double dnu = config.nu_grid[hi] - config.nu_grid[lo];
+            dh_dnu = (h_mat.at(iq, iy, hi) - h_mat.at(iq, iy, lo)) / dnu;
         }
-
         return b * dh_dnu;
     }
 
     double nu_diffusion_term(
-        const std::vector<std::vector<std::vector<double>>>& h_mat,
-        std::size_t iq,
-        std::size_t iy,
-        std::size_t inu
+        const FlatCube3D& h_mat,
+        std::size_t iq, std::size_t iy, std::size_t inu
     ) const {
-        if (config.eta_nu == 0.0 || config.nu_grid.size() < 3) {
-            return 0.0;
-        }
+        if (config.eta_nu == 0.0 || config.nu_grid.size() < 3) return 0.0;
 
         const std::size_t nnu = config.nu_grid.size();
         double second = 0.0;
 
         if (inu == 0) {
             const double d = config.nu_grid[1] - config.nu_grid[0];
-            second = (h_mat[iq][iy][0] - 2.0 * h_mat[iq][iy][1] + h_mat[iq][iy][2]) / (d * d);
+            second = (h_mat.at(iq, iy, 0) - 2.0 * h_mat.at(iq, iy, 1)
+                      + h_mat.at(iq, iy, 2)) / (d * d);
         } else if (inu + 1 == nnu) {
             const double d = config.nu_grid[nnu - 1] - config.nu_grid[nnu - 2];
-            second = (h_mat[iq][iy][nnu - 3] - 2.0 * h_mat[iq][iy][nnu - 2] + h_mat[iq][iy][nnu - 1]) / (d * d);
+            second = (h_mat.at(iq, iy, nnu - 3) - 2.0 * h_mat.at(iq, iy, nnu - 2)
+                      + h_mat.at(iq, iy, nnu - 1)) / (d * d);
         } else {
             const double d = config.nu_grid[inu + 1] - config.nu_grid[inu];
-            second = (h_mat[iq][iy][inu + 1] - 2.0 * h_mat[iq][iy][inu] + h_mat[iq][iy][inu - 1]) / (d * d);
+            second = (h_mat.at(iq, iy, inu + 1) - 2.0 * h_mat.at(iq, iy, inu)
+                      + h_mat.at(iq, iy, inu - 1)) / (d * d);
         }
-
         return 0.5 * config.eta_nu * config.eta_nu * second;
     }
 
-    void update_policies(const std::vector<std::vector<std::vector<double>>>& h_mat) {
-        const auto h_fn = make_h_interp(h_mat);
+    void update_policies(const HInterp3D& h_fn) {
         for (auto& tier : tiers) {
-            tier->build_policy(h_fn, config.q_grid, config.y_grid, config.nu_grid);
+            LadderPolicyBuilder::build_policy_inplace(
+                *tier, h_fn,
+                config.q_grid, config.y_grid, config.nu_grid,
+                tier->policy);
         }
-    }
-
-    std::vector<std::vector<std::vector<double>>> bellman_rhs_from_policies(
-        const std::vector<std::vector<std::vector<double>>>& h_mat
-    ) const {
-        const auto h_fn = make_h_interp(h_mat);
-
-        const std::size_t nq = config.q_grid.size();
-        const std::size_t ny = config.y_grid.size();
-        const std::size_t nnu = config.nu_grid.size();
-
-        std::vector<std::vector<std::vector<double>>> rhs(
-            nq,
-            std::vector<std::vector<double>>(ny, std::vector<double>(nnu, 0.0))
-        );
-
-        for (std::size_t iq = 0; iq < nq; ++iq) {
-            const double q = config.q_grid[iq];
-
-            for (std::size_t iy = 0; iy < ny; ++iy) {
-                const double y = config.y_grid[iy];
-
-                for (std::size_t inu = 0; inu < nnu; ++inu) {
-                    const double nu = config.nu_grid[inu];
-                    double val = q * y;
-
-                    val += y_drift_term(h_mat, iq, iy, inu);
-                    val += nu_drift_term(h_mat, iq, iy, inu);
-                    val += nu_diffusion_term(h_mat, iq, iy, inu);
-
-                    val -= std::exp(2.0 * nu) * penalty->value(q);
-
-                    for (const auto& tier : tiers) {
-                        for (std::size_t iz = 0; iz < tier->sizes.size(); ++iz) {
-                            const double z = tier->sizes[iz];
-                            const double jump = tier->jump_size(z);
-
-                            const double d_b = tier->policy.delta_at_index(iq, iy, inu, iz, "bid");
-                            const double lam_b = tier->arrival_rate(d_b, z);
-                            const double cont_b = h_fn(q + z, y - jump, nu) - h_fn(q, y, nu);
-                            val += lam_b * (z * d_b + cont_b);
-
-                            const double d_a = tier->policy.delta_at_index(iq, iy, inu, iz, "ask");
-                            const double lam_a = tier->arrival_rate(d_a, z);
-                            const double cont_a = h_fn(q - z, y + jump, nu) - h_fn(q, y, nu);
-                            val += lam_a * (z * d_a + cont_a);
-                        }
-                    }
-
-                    rhs[iq][iy][inu] = val;
-                }
-            }
-        }
-
-        return rhs;
     }
 
     HJBSolution solve() {
-        const std::size_t nq = config.q_grid.size();
-        const std::size_t ny = config.y_grid.size();
+        const std::size_t nq  = config.q_grid.size();
+        const std::size_t ny  = config.y_grid.size();
         const std::size_t nnu = config.nu_grid.size();
 
-        std::vector<std::vector<std::vector<double>>> h(
-            nq,
-            std::vector<std::vector<double>>(ny, std::vector<double>(nnu, 0.0))
-        );
+        FlatCube3D h_curr(nq, ny, nnu, 0.0);
+        FlatCube3D h_next(nq, ny, nnu, 0.0);
 
-        std::size_t q0_idx = 0;
-        std::size_t y0_idx = 0;
-        std::size_t nu0_idx = 0;
-
-        double best_abs_q = std::numeric_limits<double>::infinity();
-        for (std::size_t i = 0; i < nq; ++i) {
-            const double a = std::abs(config.q_grid[i]);
-            if (a < best_abs_q) {
-                best_abs_q = a;
-                q0_idx = i;
+        // Locate anchor indices (closest grid points to 0).
+        auto find_zero_idx = [](const std::vector<double>& g) {
+            std::size_t idx = 0;
+            double best = std::numeric_limits<double>::infinity();
+            for (std::size_t i = 0; i < g.size(); ++i) {
+                const double a = std::abs(g[i]);
+                if (a < best) { best = a; idx = i; }
             }
-        }
+            return idx;
+        };
 
-        double best_abs_y = std::numeric_limits<double>::infinity();
-        for (std::size_t i = 0; i < ny; ++i) {
-            const double a = std::abs(config.y_grid[i]);
-            if (a < best_abs_y) {
-                best_abs_y = a;
-                y0_idx = i;
-            }
-        }
+        const std::size_t q0_idx  = find_zero_idx(config.q_grid);
+        const std::size_t y0_idx  = find_zero_idx(config.y_grid);
+        const std::size_t nu0_idx = find_zero_idx(config.nu_grid);
 
-        double best_abs_nu = std::numeric_limits<double>::infinity();
-        for (std::size_t i = 0; i < nnu; ++i) {
-            const double a = std::abs(config.nu_grid[i]);
-            if (a < best_abs_nu) {
-                best_abs_nu = a;
-                nu0_idx = i;
-            }
-        }
+        // Pre-compute per-row quantities.
+        std::vector<double> penalty_q(nq);
+        for (std::size_t iq = 0; iq < nq; ++iq)
+            penalty_q[iq] = penalty->value(config.q_grid[iq]);
+
+        std::vector<double> exp_2nu(nnu);
+        for (std::size_t inu = 0; inu < nnu; ++inu)
+            exp_2nu[inu] = std::exp(2.0 * config.nu_grid[inu]);
 
         bool converged = false;
-        int iterations_used = 0;
+        int  iterations_used = 0;
         double final_max_h_change = std::numeric_limits<double>::infinity();
-        double final_max_rhs = std::numeric_limits<double>::infinity();
-        int consecutive_passes = 0;
+        double final_max_rhs      = std::numeric_limits<double>::infinity();
+        int consecutive_passes    = 0;
 
-        std::vector<double> hist_h;
-        std::vector<double> hist_rhs;
+        std::vector<double> hist_h, hist_rhs;
+        hist_h.reserve(static_cast<std::size_t>(config.n_iter));
+        hist_rhs.reserve(static_cast<std::size_t>(config.n_iter));
 
         for (int it = 1; it <= config.n_iter; ++it) {
-            const auto h_old = h;
+            // Build interpolator once; reuse for both policy update and RHS.
+            const auto h_fn = make_h_interp(h_curr);
+            update_policies(h_fn);
 
-            update_policies(h_old);
-            const auto rhs = bellman_rhs_from_policies(h_old);
-
-            std::vector<std::vector<std::vector<double>>> dh = h;
+            double max_h_change = 0.0;
+            double max_rhs_now  = 0.0;
 
             for (std::size_t iq = 0; iq < nq; ++iq) {
+                const double q = config.q_grid[iq];
+
                 for (std::size_t iy = 0; iy < ny; ++iy) {
+                    const double y = config.y_grid[iy];
+
                     for (std::size_t inu = 0; inu < nnu; ++inu) {
-                        h[iq][iy][inu] = h_old[iq][iy][inu] + config.dt * rhs[iq][iy][inu];
-                        dh[iq][iy][inu] = h[iq][iy][inu] - h_old[iq][iy][inu];
+                        const double h_here = h_curr.at(iq, iy, inu);
+
+                        double rhs = q * y
+                                   + y_drift_term(h_curr, iq, iy, inu)
+                                   + nu_drift_term(h_curr, iq, iy, inu)
+                                   + nu_diffusion_term(h_curr, iq, iy, inu)
+                                   - exp_2nu[inu] * penalty_q[iq];
+
+                        const double nu = config.nu_grid[inu];
+                        for (const auto& tier : tiers) {
+                            const double* bid_row = tier->policy.bid.row_ptr(iq, iy, inu);
+                            const double* ask_row = tier->policy.ask.row_ptr(iq, iy, inu);
+
+                            for (std::size_t iz = 0; iz < tier->sizes.size(); ++iz) {
+                                const double z    = tier->sizes[iz];
+                                const double jump = tier->jump_size(z);
+
+                                const double d_b   = bid_row[iz];
+                                const double lam_b = tier->arrival_rate(d_b, z);
+                                rhs += lam_b * (z * d_b + h_fn(q + z, y - jump, nu) - h_here);
+
+                                const double d_a   = ask_row[iz];
+                                const double lam_a = tier->arrival_rate(d_a, z);
+                                rhs += lam_a * (z * d_a + h_fn(q - z, y + jump, nu) - h_here);
+                            }
+                        }
+
+                        const double new_h = h_here + config.dt * rhs;
+                        h_next.at(iq, iy, inu) = new_h;
+
+                        max_h_change = std::max(max_h_change, std::abs(new_h - h_here));
+                        max_rhs_now  = std::max(max_rhs_now,  std::abs(rhs));
                     }
                 }
             }
 
-            const double anchor = h[q0_idx][y0_idx][nu0_idx];
-            for (std::size_t iq = 0; iq < nq; ++iq) {
-                for (std::size_t iy = 0; iy < ny; ++iy) {
-                    for (std::size_t inu = 0; inu < nnu; ++inu) {
-                        h[iq][iy][inu] -= anchor;
-                    }
-                }
-            }
-
-            const double max_h_change = max_abs_3d(dh);
-            const double max_rhs_now = max_abs_3d(rhs);
+            // Normalise so h = 0 at the anchor point (removes the gauge degree of freedom).
+            const double anchor = h_next.at(q0_idx, y0_idx, nu0_idx);
+            for (double& v : h_next.data) v -= anchor;  // single vectorisable pass
 
             hist_h.push_back(max_h_change);
             hist_rhs.push_back(max_rhs_now);
-
             final_max_h_change = max_h_change;
-            final_max_rhs = max_rhs_now;
-            iterations_used = it;
+            final_max_rhs      = max_rhs_now;
+            iterations_used    = it;
 
             const bool passes_now =
                 it >= config.min_iter &&
                 max_h_change <= config.tol_h &&
-                max_rhs_now <= config.tol_rhs;
+                max_rhs_now  <= config.tol_rhs;
 
-            if (passes_now) {
-                consecutive_passes += 1;
-            } else {
-                consecutive_passes = 0;
-            }
+            consecutive_passes = passes_now ? consecutive_passes + 1 : 0;
+
+            // Swap flat buffers — O(1), no allocation.
+            h_curr.data.swap(h_next.data);
 
             if (config.early_stop &&
                 consecutive_passes >= config.consecutive_passes_required) {
@@ -1059,20 +1071,21 @@ struct HJBLadderSolver {
             }
         }
 
-        update_policies(h);
+        const auto h_fn_final = make_h_interp(h_curr);
+        update_policies(h_fn_final);
 
         HJBSolution out;
-        out.h = std::move(h);
-        out.q_grid = config.q_grid;
-        out.y_grid = config.y_grid;
-        out.nu_grid = config.nu_grid;
-        out.tiers = tiers;
-        out.converged = converged;
-        out.iterations_used = iterations_used;
-        out.final_max_h_change = final_max_h_change;
-        out.final_max_rhs = final_max_rhs;
+        out.h                    = std::move(h_curr);
+        out.q_grid               = config.q_grid;
+        out.y_grid               = config.y_grid;
+        out.nu_grid              = config.nu_grid;
+        out.tiers                = tiers;
+        out.converged            = converged;
+        out.iterations_used      = iterations_used;
+        out.final_max_h_change   = final_max_h_change;
+        out.final_max_rhs        = final_max_rhs;
         out.history_max_h_change = std::move(hist_h);
-        out.history_max_rhs = std::move(hist_rhs);
+        out.history_max_rhs      = std::move(hist_rhs);
         return out;
     }
 };
