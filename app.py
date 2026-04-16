@@ -318,6 +318,72 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
     )
 
 
+def build_centered_q_grid(q_min: float, q_max: float, q_step: float) -> np.ndarray:
+    if q_step <= 0:
+        raise ValueError("q_step must be positive.")
+
+    half_width = max(abs(float(q_min)), abs(float(q_max)))
+    half_steps = max(1, int(np.ceil(half_width / float(q_step))))
+    grid = float(q_step) * np.arange(-half_steps, half_steps + 1, dtype=float)
+    grid[half_steps] = 0.0
+    return grid
+
+
+def build_centered_linear_grid(
+    x_min: float,
+    x_max: float,
+    n_points: int,
+    center: float,
+    field_name: str,
+) -> np.ndarray:
+    if n_points < 3:
+        raise ValueError(f"{field_name} must have at least 3 points.")
+    if n_points % 2 == 0:
+        raise ValueError(f"{field_name} must have odd length.")
+
+    half_width = max(abs(float(x_min) - float(center)), abs(float(x_max) - float(center)))
+    if half_width <= 0.0:
+        raise ValueError(f"{field_name} range must have positive width.")
+
+    grid = np.linspace(
+        float(center) - half_width,
+        float(center) + half_width,
+        int(n_points),
+        dtype=float,
+    )
+    grid[int(n_points) // 2] = float(center)
+    return np.round(grid, 12)
+
+
+def build_centered_nu_grid(
+    sigma_state_min: float,
+    sigma_state_max: float,
+    n_points: int,
+    sigma_bar_state: float,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    if sigma_state_min <= 0.0 or sigma_state_max <= 0.0 or sigma_bar_state <= 0.0:
+        raise ValueError("Volatility state values must be strictly positive.")
+    if n_points < 3:
+        raise ValueError("Volatility grid must have at least 3 points.")
+    if n_points % 2 == 0:
+        raise ValueError("Volatility grid must have odd length.")
+
+    nu_bar = float(np.log(float(sigma_bar_state)))
+    nu_min_requested = float(np.log(float(sigma_state_min)))
+    nu_max_requested = float(np.log(float(sigma_state_max)))
+
+    half_width = max(abs(nu_min_requested - nu_bar), abs(nu_max_requested - nu_bar))
+    if half_width <= 0.0:
+        raise ValueError("Volatility state range must have positive width.")
+
+    nu_grid = np.linspace(nu_bar - half_width, nu_bar + half_width, int(n_points), dtype=float)
+    nu_grid[int(n_points) // 2] = nu_bar
+    nu_grid = np.round(nu_grid, 12)
+
+    sigma_state_grid = np.exp(nu_grid)
+    return nu_grid, sigma_state_grid, nu_bar
+
+
 def nearest_index(arr: np.ndarray, x: float) -> int:
     return int(np.argmin(np.abs(arr - x)))
 
@@ -328,8 +394,8 @@ def policy_arrays(
     q_grid = np.array(cpp_tier.policy.q_grid, dtype=float)
     y_grid = np.array(cpp_tier.policy.y_grid, dtype=float)
     nu_grid = np.array(cpp_tier.policy.nu_grid, dtype=float)
-    bid = flatcube4d_to_numpy(cpp_tier.policy.bid)   # [nq, ny, nnu, nz]
-    ask = flatcube4d_to_numpy(cpp_tier.policy.ask)   # [nq, ny, nnu, nz]
+    bid = flatcube4d_to_numpy(cpp_tier.policy.bid)
+    ask = flatcube4d_to_numpy(cpp_tier.policy.ask)
     return q_grid, y_grid, nu_grid, bid, ask
 
 
@@ -359,7 +425,7 @@ def make_h_slice_figure(solution: lp.HJBSolution, y_selected: float, sigma_state
     y_grid = np.array(solution.y_grid, dtype=float)
     nu_grid = np.array(solution.nu_grid, dtype=float)
     sigma_state_grid = np.exp(nu_grid)
-    h = flatcube3d_to_numpy(solution.h)  # [nq, ny, nnu]
+    h = flatcube3d_to_numpy(solution.h)
 
     iy = nearest_index(y_grid, y_selected)
     inu = nearest_index(sigma_state_grid, sigma_state_selected)
@@ -711,13 +777,15 @@ st.markdown(
 
 with st.sidebar:
     st.header("Inventory grid")
-    q_min = st.number_input("q min", value=-20, step=1)
-    q_max = st.number_input("q max", value=20, step=1)
+    st.caption("The solver grid is forced to be symmetric around 0 with 0 exactly in the middle.")
+    q_min = st.number_input("Requested q min", value=-20, step=1)
+    q_max = st.number_input("Requested q max", value=20, step=1)
     q_step = st.number_input("q step", value=1, step=1, min_value=1)
 
     st.header("Drift-state grid")
+    st.caption("The solver grid is forced to be symmetric around 0 with 0 exactly in the middle.")
     y_range = st.slider(
-        "Drift state range",
+        "Requested drift-state range",
         min_value=-10.0,
         max_value=10.0,
         value=(-5.0, 5.0),
@@ -733,8 +801,12 @@ with st.sidebar:
     kappa_y = st.number_input("kappa_y (drift decay speed)", value=2.0, step=0.1, format="%.4f")
 
     st.header("Volatility-state grid")
+    st.caption(
+        "The solver grid is forced to be symmetric in log-volatility around ν̄, "
+        "so σ = exp(ν) will generally be asymmetric in level."
+    )
     sigma_state_range = st.slider(
-        "Volatility state range σ = exp(ν)",
+        "Requested volatility state range σ = exp(ν)",
         min_value=0.10,
         max_value=3.00,
         value=(0.50, 1.50),
@@ -796,14 +868,12 @@ for i in range(num_tiers):
     except ValueError as exc:
         errors.append(str(exc))
 
-if q_max <= q_min:
-    errors.append("q_max must be greater than q_min.")
+if q_step <= 0:
+    errors.append("q_step must be positive.")
 
 y_min, y_max = float(y_range[0]), float(y_range[1])
-if y_max <= y_min:
-    errors.append("Drift state range must have upper bound greater than lower bound.")
-
 sigma_state_min, sigma_state_max = float(sigma_state_range[0]), float(sigma_state_range[1])
+
 if sigma_state_max <= sigma_state_min:
     errors.append("Volatility state range must have upper bound greater than lower bound.")
 if sigma_state_min <= 0.0:
@@ -817,21 +887,50 @@ if kappa_nu < 0.0:
 if eta_nu < 0.0:
     errors.append("eta_nu must be nonnegative.")
 
-q_grid = np.arange(float(q_min), float(q_max) + float(q_step), float(q_step), dtype=float)
-y_grid = np.round(np.linspace(y_min, y_max, int(n_y_points), dtype=float), 10)
-sigma_state_grid = np.round(
-    np.linspace(sigma_state_min, sigma_state_max, int(n_sigma_points), dtype=float),
-    10,
-)
-nu_grid = np.log(sigma_state_grid)
-nu_bar = float(np.log(sigma_bar_state))
+try:
+    q_grid = build_centered_q_grid(float(q_min), float(q_max), float(q_step))
+except ValueError as exc:
+    errors.append(str(exc))
+    q_grid = np.array([], dtype=float)
 
-if len(q_grid) < 2:
-    errors.append("q_grid must contain at least two points.")
-if len(y_grid) < 2:
-    errors.append("y_grid must contain at least two points.")
-if len(nu_grid) < 2:
-    errors.append("nu_grid must contain at least two points.")
+try:
+    y_grid = build_centered_linear_grid(
+        float(y_min),
+        float(y_max),
+        int(n_y_points),
+        center=0.0,
+        field_name="y_grid",
+    )
+except ValueError as exc:
+    errors.append(str(exc))
+    y_grid = np.array([], dtype=float)
+
+try:
+    nu_grid, sigma_state_grid, nu_bar = build_centered_nu_grid(
+        float(sigma_state_min),
+        float(sigma_state_max),
+        int(n_sigma_points),
+        float(sigma_bar_state),
+    )
+except ValueError as exc:
+    errors.append(str(exc))
+    nu_grid = np.array([], dtype=float)
+    sigma_state_grid = np.array([], dtype=float)
+    nu_bar = float(np.log(max(float(sigma_bar_state), 1e-12)))
+
+if len(q_grid) < 3:
+    errors.append("q_grid must contain at least 3 points.")
+if len(y_grid) < 3:
+    errors.append("y_grid must contain at least 3 points.")
+if len(nu_grid) < 3:
+    errors.append("nu_grid must contain at least 3 points.")
+
+if len(q_grid) > 0 and not np.isclose(q_grid[len(q_grid) // 2], 0.0):
+    errors.append("Internal error: q_grid is not centered at 0.")
+if len(y_grid) > 0 and not np.isclose(y_grid[len(y_grid) // 2], 0.0):
+    errors.append("Internal error: y_grid is not centered at 0.")
+if len(nu_grid) > 0 and not np.isclose(nu_grid[len(nu_grid) // 2], nu_bar):
+    errors.append("Internal error: nu_grid is not centered at nu_bar.")
 
 if errors:
     for e in errors:
@@ -862,7 +961,17 @@ signature = build_signature(
 )
 
 with st.sidebar:
-    compute_clicked = st.button("Compute / refresh", type="primary", use_container_width=True)
+    st.button("Compute / refresh", type="primary", use_container_width=True, key="compute_button")
+
+compute_clicked = st.session_state.get("compute_button", False)
+
+st.caption(
+    "Actual solver grids are centered by construction: "
+    f"q ∈ [{q_grid[0]:g}, {q_grid[-1]:g}] with {len(q_grid)} points; "
+    f"y ∈ [{y_grid[0]:g}, {y_grid[-1]:g}] with {len(y_grid)} points; "
+    f"σ ∈ [{sigma_state_grid[0]:.4g}, {sigma_state_grid[-1]:.4g}] with {len(sigma_state_grid)} points, "
+    f"centered at σ̄ = {float(np.exp(nu_bar)):.4g} in log-vol space."
+)
 
 state_count = len(q_grid) * len(y_grid) * len(nu_grid)
 st.caption(
@@ -944,19 +1053,23 @@ available_y = [float(y) for y in solution.y_grid]
 available_q = [float(q) for q in solution.q_grid]
 available_sigma_state = [float(s) for s in sigma_state_grid_from_solution(solution)]
 
+center_y_value = available_y[len(available_y) // 2]
+center_q_value = available_q[len(available_q) // 2]
+center_sigma_value = available_sigma_state[len(available_sigma_state) // 2]
+
 c_top1, c_top2 = st.columns(2)
 with c_top1:
     global_y_for_h = st.select_slider(
         "Drift level for value-function slice",
         options=available_y,
-        value=0.0 if 0.0 in available_y else available_y[len(available_y) // 2],
+        value=center_y_value,
         key="global_y_slice",
     )
 with c_top2:
     global_sigma_for_h = st.select_slider(
         "Volatility level for value-function slice",
         options=available_sigma_state,
-        value=1.0 if 1.0 in available_sigma_state else available_sigma_state[len(available_sigma_state) // 2],
+        value=center_sigma_value,
         key="global_sigma_slice",
     )
 
@@ -986,14 +1099,14 @@ for tab, spec, cpp_tier in zip(tabs, solved_tier_specs, solution.tiers):
             y_for_inventory = st.select_slider(
                 f"Drift level for quotes vs inventory — {spec.name}",
                 options=available_y,
-                value=0.0 if 0.0 in available_y else available_y[len(available_y) // 2],
+                value=center_y_value,
                 key=f"y_for_inventory_{spec.name}",
             )
         with c_q2:
             sigma_for_inventory = st.select_slider(
                 f"Volatility level for quotes vs inventory — {spec.name}",
                 options=available_sigma_state,
-                value=1.0 if 1.0 in available_sigma_state else available_sigma_state[len(available_sigma_state) // 2],
+                value=center_sigma_value,
                 key=f"sigma_for_inventory_{spec.name}",
             )
 
@@ -1012,14 +1125,14 @@ for tab, spec, cpp_tier in zip(tabs, solved_tier_specs, solution.tiers):
             q_for_vol = st.selectbox(
                 f"Inventory level for quotes vs volatility — {spec.name}",
                 options=available_q,
-                index=available_q.index(0.0) if 0.0 in available_q else len(available_q) // 2,
+                index=len(available_q) // 2,
                 key=f"q_for_vol_{spec.name}",
             )
         with c_v2:
             y_for_vol = st.select_slider(
                 f"Drift level for quotes vs volatility — {spec.name}",
                 options=available_y,
-                value=0.0 if 0.0 in available_y else available_y[len(available_y) // 2],
+                value=center_y_value,
                 key=f"y_for_vol_{spec.name}",
             )
 
@@ -1045,7 +1158,7 @@ for tab, spec, cpp_tier in zip(tabs, solved_tier_specs, solution.tiers):
             sigma_for_heatmap = st.select_slider(
                 f"Volatility level for ask policy heatmap — {spec.name}",
                 options=available_sigma_state,
-                value=1.0 if 1.0 in available_sigma_state else available_sigma_state[len(available_sigma_state) // 2],
+                value=center_sigma_value,
                 key=f"sigma_heat_{spec.name}",
             )
 
@@ -1064,21 +1177,21 @@ for tab, spec, cpp_tier in zip(tabs, solved_tier_specs, solution.tiers):
             q_for_ladder = st.selectbox(
                 f"Inventory level for ladder — {spec.name}",
                 options=available_q,
-                index=available_q.index(0.0) if 0.0 in available_q else len(available_q) // 2,
+                index=len(available_q) // 2,
                 key=f"q_ladder_{spec.name}",
             )
         with c_l2:
             y_for_ladder = st.select_slider(
                 f"Drift level for ladder — {spec.name}",
                 options=available_y,
-                value=0.0 if 0.0 in available_y else available_y[len(available_y) // 2],
+                value=center_y_value,
                 key=f"y_ladder_{spec.name}",
             )
         with c_l3:
             sigma_for_ladder = st.select_slider(
                 f"Volatility level for ladder — {spec.name}",
                 options=available_sigma_state,
-                value=1.0 if 1.0 in available_sigma_state else available_sigma_state[len(available_sigma_state) // 2],
+                value=center_sigma_value,
                 key=f"sigma_ladder_{spec.name}",
             )
 
@@ -1181,5 +1294,5 @@ so the volatility selectors are easier to interpret than raw log-vol values.
 
 st.caption(
     "Use the Compute / refresh button to run the solver. "
-    "You can now inspect policy slices over inventory, drift, and volatility."
+    "The app now constructs centered odd grids automatically so they satisfy the solver invariants."
 )

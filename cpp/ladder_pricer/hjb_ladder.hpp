@@ -104,6 +104,10 @@ inline double clamp(double x, double lo, double hi) {
     return std::min(std::max(x, lo), hi);
 }
 
+inline bool approx_equal(double a, double b, double tol = 1e-12) {
+    return std::abs(a - b) <= tol;
+}
+
 enum class Side : unsigned char { Bid, Ask };
 
 inline Side parse_side(const std::string& side) {
@@ -224,12 +228,10 @@ inline double max_abs_vec(const std::vector<double>& x) {
     return out;
 }
 
-// With a flat layout this collapses to a single pass over contiguous memory.
 inline double max_abs_3d(const FlatCube3D& x) {
     return max_abs_vec(x.data);
 }
 
-// Writes differences of the n-element array x into out.
 inline void diff_inplace(const double* x, std::size_t n, std::vector<double>& out) {
     if (n < 2) {
         out.clear();
@@ -326,7 +328,7 @@ struct GoldenSectionOptimizer {
             return {x, f(x), 0, true};
         }
 
-        constexpr double gr = 1.6180339887498948482; // (sqrt(5)+1)/2
+        constexpr double gr = 1.6180339887498948482;
 
         double a = lower;
         double b = upper;
@@ -356,7 +358,6 @@ struct GoldenSectionOptimizer {
         }
 
         const double x_star = 0.5 * (a + b);
-        // Reuse the closer bracket evaluation instead of an extra f() call.
         const double f_star = (fc > fd) ? fc : fd;
         return {x_star, f_star, it, std::abs(b - a) < opts.tol};
     }
@@ -503,7 +504,6 @@ struct QuotePolicy {
         validate();
     }
 
-    // Copy metadata once up front.
     void set_axes(
         const std::vector<double>& q_grid_,
         const std::vector<double>& y_grid_,
@@ -516,7 +516,6 @@ struct QuotePolicy {
         sizes = sizes_;
     }
 
-    // Allocate storage once up front (or reallocate only if shape actually changed).
     void ensure_storage_shape() {
         bid.ensure_shape(q_grid.size(), y_grid.size(), nu_grid.size(), sizes.size());
         ask.ensure_shape(q_grid.size(), y_grid.size(), nu_grid.size(), sizes.size());
@@ -642,7 +641,6 @@ struct LadderPolicyBuilder {
         return (q > 0.0 && side == Side::Bid) || (q < 0.0 && side == Side::Ask);
     }
 
-    // current_delta: pointer to the already-solved rungs [0..rung_idx-1].
     static std::pair<double, double> rung_bounds(
         const PriceTier& tier,
         std::size_t rung_idx,
@@ -686,8 +684,6 @@ struct LadderPolicyBuilder {
         return {lower, upper};
     }
 
-    // Writes nz optimised deltas directly into the FlatCube4D row pointed to by `delta`.
-    // `prev_delta` (optional) points to the corresponding row from the adjacent q-slice.
     static void solve_side_ladder_inplace(
         const PriceTier& tier,
         const HInterp3D& h_fn,
@@ -695,9 +691,9 @@ struct LadderPolicyBuilder {
         double y,
         double nu,
         Side side,
-        double* delta,                      // length = tier.sizes.size()
+        double* delta,
         std::vector<double>& prev_gaps_storage,
-        const double* prev_delta = nullptr  // length = tier.sizes.size(), or nullptr
+        const double* prev_delta = nullptr
     ) {
         const std::size_t n = tier.sizes.size();
         const double h_here = h_fn(q, y, nu);
@@ -750,18 +746,12 @@ struct LadderPolicyBuilder {
         const std::size_t ny  = y_grid.size();
         const std::size_t nnu = nu_grid.size();
 
-        // Storage and metadata are assumed to have been initialised once up front.
-        // This routine only overwrites the existing bid/ask values.
+        const std::size_t q0_idx = nq / 2;
 
-        // Find the index closest to q = 0 as the unseeded starting point.
-        std::size_t q0_idx = 0;
-        double best_abs = std::numeric_limits<double>::infinity();
-        for (std::size_t i = 0; i < nq; ++i) {
-            const double a = std::abs(q_grid[i]);
-            if (a < best_abs) {
-                best_abs = a;
-                q0_idx = i;
-            }
+        // Assumes solver config validation has enforced centered odd grids.
+        if (!approx_equal(q_grid[q0_idx], 0.0)) {
+            throw std::invalid_argument(
+                "LadderPolicyBuilder::build_policy_inplace: q_grid middle point must be 0.");
         }
 
         std::vector<double> prev_gaps_storage;
@@ -772,7 +762,6 @@ struct LadderPolicyBuilder {
             for (std::size_t inu = 0; inu < nnu; ++inu) {
                 const double nu = nu_grid[inu];
 
-                // Seed at q0 with no gap constraints.
                 solve_side_ladder_inplace(
                     tier, h_fn, q_grid[q0_idx], y, nu, Side::Ask,
                     policy.ask.row_ptr(q0_idx, iy, inu), prev_gaps_storage, nullptr);
@@ -780,7 +769,6 @@ struct LadderPolicyBuilder {
                     tier, h_fn, q_grid[q0_idx], y, nu, Side::Bid,
                     policy.bid.row_ptr(q0_idx, iy, inu), prev_gaps_storage, nullptr);
 
-                // Sweep q upward.
                 for (std::size_t iq = q0_idx + 1; iq < nq; ++iq) {
                     solve_side_ladder_inplace(
                         tier, h_fn, q_grid[iq], y, nu, Side::Ask,
@@ -792,7 +780,6 @@ struct LadderPolicyBuilder {
                         policy.bid.row_ptr(iq - 1, iy, inu));
                 }
 
-                // Sweep q downward.
                 for (std::size_t ii = q0_idx; ii-- > 0;) {
                     solve_side_ladder_inplace(
                         tier, h_fn, q_grid[ii], y, nu, Side::Ask,
@@ -832,8 +819,17 @@ struct SolverConfig {
     int consecutive_passes_required{3};
 
     void validate() const {
-        if (q_grid.size() < 2 || y_grid.size() < 2 || nu_grid.size() < 2)
-            throw std::invalid_argument("SolverConfig: all grids must have at least 2 points.");
+        if (q_grid.size() < 3 || y_grid.size() < 3 || nu_grid.size() < 3)
+            throw std::invalid_argument(
+                "SolverConfig: q_grid, y_grid and nu_grid must each have at least 3 points.");
+
+        if (q_grid.size() % 2 == 0)
+            throw std::invalid_argument("SolverConfig: q_grid must have odd length.");
+        if (y_grid.size() % 2 == 0)
+            throw std::invalid_argument("SolverConfig: y_grid must have odd length.");
+        if (nu_grid.size() % 2 == 0)
+            throw std::invalid_argument("SolverConfig: nu_grid must have odd length.");
+
         if (dt <= 0.0)
             throw std::invalid_argument("SolverConfig: dt must be positive.");
         if (n_iter < 1)
@@ -847,14 +843,29 @@ struct SolverConfig {
             throw std::invalid_argument("SolverConfig: invalid stopping parameters.");
 
         auto check_inc = [](const std::vector<double>& g, const std::string& name) {
-            for (std::size_t i = 1; i < g.size(); ++i)
-                if (g[i] <= g[i - 1])
+            for (std::size_t i = 1; i < g.size(); ++i) {
+                if (g[i] <= g[i - 1]) {
                     throw std::invalid_argument(
                         "SolverConfig: " + name + " must be strictly increasing.");
+                }
+            }
         };
+
         check_inc(q_grid,  "q_grid");
         check_inc(y_grid,  "y_grid");
         check_inc(nu_grid, "nu_grid");
+
+        const std::size_t q_mid  = q_grid.size() / 2;
+        const std::size_t y_mid  = y_grid.size() / 2;
+        const std::size_t nu_mid = nu_grid.size() / 2;
+
+        if (!approx_equal(q_grid[q_mid], 0.0))
+            throw std::invalid_argument("SolverConfig: q_grid middle point must be 0.");
+        if (!approx_equal(y_grid[y_mid], 0.0))
+            throw std::invalid_argument("SolverConfig: y_grid middle point must be 0.");
+        if (!approx_equal(nu_grid[nu_mid], nu_bar))
+            throw std::invalid_argument(
+                "SolverConfig: nu_grid middle point must equal nu_bar.");
     }
 };
 
@@ -995,25 +1006,10 @@ struct HJBLadderSolver {
         FlatCube3D h_curr(nq, ny, nnu, 0.0);
         FlatCube3D h_next(nq, ny, nnu, 0.0);
 
-        // Locate anchor indices (closest grid points to 0).
-        auto find_zero_idx = [](const std::vector<double>& g) {
-            std::size_t idx = 0;
-            double best = std::numeric_limits<double>::infinity();
-            for (std::size_t i = 0; i < g.size(); ++i) {
-                const double a = std::abs(g[i]);
-                if (a < best) {
-                    best = a;
-                    idx = i;
-                }
-            }
-            return idx;
-        };
+        const std::size_t q0_idx  = nq / 2;
+        const std::size_t y0_idx  = ny / 2;
+        const std::size_t nu0_idx = nnu / 2;
 
-        const std::size_t q0_idx  = find_zero_idx(config.q_grid);
-        const std::size_t y0_idx  = find_zero_idx(config.y_grid);
-        const std::size_t nu0_idx = find_zero_idx(config.nu_grid);
-
-        // Pre-compute per-row quantities.
         std::vector<double> penalty_q(nq);
         for (std::size_t iq = 0; iq < nq; ++iq)
             penalty_q[iq] = penalty->value(config.q_grid[iq]);
@@ -1033,7 +1029,6 @@ struct HJBLadderSolver {
         hist_rhs.reserve(static_cast<std::size_t>(config.n_iter));
 
         for (int it = 1; it <= config.n_iter; ++it) {
-            // Build interpolator once; reuse for both policy update and RHS.
             const auto h_fn = make_h_interp(h_curr);
             update_policies(h_fn);
 
@@ -1083,7 +1078,8 @@ struct HJBLadderSolver {
                 }
             }
 
-            // Normalise so h = 0 at the anchor point (removes the gauge degree of freedom).
+            // Normalise so h = 0 at the reference middle state:
+            // (q, y, nu) = (0, 0, nu_bar).
             const double anchor = h_next.at(q0_idx, y0_idx, nu0_idx);
             for (double& v : h_next.data) v -= anchor;
 
@@ -1100,7 +1096,6 @@ struct HJBLadderSolver {
 
             consecutive_passes = passes_now ? consecutive_passes + 1 : 0;
 
-            // Swap flat buffers — O(1), no allocation.
             h_curr.data.swap(h_next.data);
 
             if (config.early_stop &&
