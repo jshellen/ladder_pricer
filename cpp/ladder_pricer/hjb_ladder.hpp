@@ -549,6 +549,11 @@ struct SolverConfig {
     double dt{0.002};
     int n_iter{140};
 
+    // Constant drift in the spot process:
+    // dS_t = spot_drift * dt + sigma * dW_t
+    // In the reduced inventory-only HJB this contributes + spot_drift * q
+    double spot_drift{0.0};
+
     bool early_stop{true};
     double tol_h{1e-5};
     double tol_rhs{1e-4};
@@ -627,7 +632,9 @@ struct HJBLadderSolver {
 
         for (std::size_t i = 0; i < config.q_grid.size(); ++i) {
             const double q = config.q_grid[i];
-            double val = -penalty->value(q);
+
+            // Constant spot drift contribution in reduced HJB
+            double val = -penalty->value(q) + config.spot_drift * q;
 
             for (const auto& tier : tiers) {
                 for (std::size_t j = 0; j < tier->sizes.size(); ++j) {

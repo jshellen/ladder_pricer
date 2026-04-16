@@ -103,6 +103,7 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("q_grid", &SolverConfig::q_grid)
         .def_readwrite("dt", &SolverConfig::dt)
         .def_readwrite("n_iter", &SolverConfig::n_iter)
+        .def_readwrite("spot_drift", &SolverConfig::spot_drift)
         .def_readwrite("early_stop", &SolverConfig::early_stop)
         .def_readwrite("tol_h", &SolverConfig::tol_h)
         .def_readwrite("tol_rhs", &SolverConfig::tol_rhs)

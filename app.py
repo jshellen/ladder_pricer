@@ -89,8 +89,8 @@ def default_tier_values(i: int) -> dict:
             "flow_m_alpha": 0.075,
             "markout_base": 0.005,
             "markout_coeff": 0.003,
-            "delta_min": -0.5,
-            "delta_max": 4.0,
+            "delta_min": -100,
+            "delta_max": 100.0,
         },
         {
             "name": "aggressive_clients",
@@ -102,8 +102,8 @@ def default_tier_values(i: int) -> dict:
             "flow_m_alpha": 0.070,
             "markout_base": 0.007,
             "markout_coeff": 0.004,
-            "delta_min": -0.5,
-            "delta_max": 4.0,
+            "delta_min": -100,
+            "delta_max": 100.0,
         },
         {
             "name": "sticky_clients",
@@ -115,8 +115,8 @@ def default_tier_values(i: int) -> dict:
             "flow_m_alpha": 0.090,
             "markout_base": 0.003,
             "markout_coeff": 0.002,
-            "delta_min": -0.5,
-            "delta_max": 4.0,
+            "delta_min": -100,
+            "delta_max": 100.0,
         },
     ]
     return presets[min(i, len(presets) - 1)]
@@ -285,7 +285,7 @@ def make_quote_inventory_figure(cpp_tier: lp.PriceTier, spec: TierSpec) -> go.Fi
         xaxis_title="Inventory q",
         yaxis_title="Quote around mid (mid = 0)",
         height=520,
-        yaxis=dict(range=[-10, 10])
+        yaxis=dict(range=[-10, 10]),
     )
     return fig
 
@@ -443,6 +443,16 @@ with st.sidebar:
     dt = st.number_input("dt", value=0.002, step=0.001, format="%.4f")
     n_iter = st.number_input("n_iter", value=140, step=10, min_value=1)
 
+    st.header("Spot process")
+    spot_drift = st.number_input(
+        "spot_drift",
+        value=0.0,
+        step=0.001,
+        format="%.5f",
+        help="Constant drift in the spot process dS = spot_drift * dt + sigma * dW. "
+             "In the reduced HJB this contributes + spot_drift * q.",
+    )
+
     st.header("Convergence / stopping")
     early_stop = st.checkbox("Enable early stopping", value=True)
     tol_h = st.number_input("tol_h", value=1e-5, format="%.1e")
@@ -500,6 +510,7 @@ config = lp.SolverConfig()
 config.q_grid = [float(q) for q in q_grid]
 config.dt = float(dt)
 config.n_iter = int(n_iter)
+config.spot_drift = float(spot_drift)
 config.early_stop = bool(early_stop)
 config.tol_h = float(tol_h)
 config.tol_rhs = float(tol_rhs)
@@ -525,15 +536,16 @@ else:
         f"final max |rhs| = {solution.final_max_rhs:.2e}."
     )
 
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("q points", len(config.q_grid))
 c2.metric("tiers", len(solution.tiers))
 c3.metric("iterations used", solution.iterations_used)
 c4.metric("converged", "yes" if solution.converged else "no")
+c5.metric("spot drift", f"{config.spot_drift:.5f}")
 
-c5, c6 = st.columns(2)
-c5.metric("final max |Δh|", f"{solution.final_max_h_change:.2e}")
-c6.metric("final max |rhs|", f"{solution.final_max_rhs:.2e}")
+c6, c7 = st.columns(2)
+c6.metric("final max |Δh|", f"{solution.final_max_h_change:.2e}")
+c7.metric("final max |rhs|", f"{solution.final_max_rhs:.2e}")
 
 st.plotly_chart(make_h_figure(solution), use_container_width=True)
 st.plotly_chart(make_convergence_figure(solution), use_container_width=True)
@@ -589,16 +601,26 @@ for tab, spec, cpp_tier in zip(tabs, tier_specs, solution.tiers):
 with st.expander("What this app is solving"):
     st.markdown(
         r"""
+Assume the spot process is
+
+$$
+dS_t = \mu_{\text{spot}}\,dt + \sigma\,dW_t.
+$$
+
 For each inventory point $q$, the Bellman right-hand side is
 
 $$
--\phi(q)
+-\phi(q) + \mu_{\text{spot}} q
 + \sum_{\text{tier}} \sum_z \Big[
 \lambda(\delta^b, z) \big(z(\delta^b - \mu(z)) + h(q+z)-h(q)\big)
 +
 \lambda(\delta^a, z) \big(z(\delta^a - \mu(z)) + h(q-z)-h(q)\big)
 \Big].
 $$
+
+So:
+- positive spot drift favors long inventory
+- negative spot drift favors short inventory
 
 The C++ backend solves the ladder sequentially:
 - first near $q = 0$,
