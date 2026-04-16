@@ -58,7 +58,6 @@ struct FlatCube4D {
         : data(nq_ * ny_ * nnu_ * nz_, init),
           nq(nq_), ny(ny_), nnu(nnu_), nz(nz_) {}
 
-    // Reallocates (zeroed) only when shape changes.
     void ensure_shape(std::size_t nq_, std::size_t ny_, std::size_t nnu_, std::size_t nz_) {
         if (nq_ == nq && ny_ == ny && nnu_ == nnu && nz_ == nz) return;
         nq = nq_;
@@ -83,7 +82,6 @@ struct FlatCube4D {
         return data[index(iq, iy, inu, iz)];
     }
 
-    // Pointer to the contiguous nz-element row at (iq, iy, inu).
     double* row_ptr(std::size_t iq, std::size_t iy, std::size_t inu) noexcept {
         return data.data() + ((iq * ny + iy) * nnu + inu) * nz;
     }
@@ -621,10 +619,21 @@ struct PriceTier {
 };
 
 // ============================================================
-// Ladder policy builder
+// Ladder policy builder (stateful)
 // ============================================================
 
 struct LadderPolicyBuilder {
+    explicit LadderPolicyBuilder(const std::vector<double>& q_grid,
+                                 const std::vector<double>& y_grid,
+                                 const std::vector<double>& nu_grid)
+        : q_grid_(q_grid),
+          y_grid_(y_grid),
+          nu_grid_(nu_grid),
+          nq_(q_grid_.size()),
+          ny_(y_grid_.size()),
+          nnu_(nu_grid_.size()),
+          q0_idx_(nq_ / 2) {}
+
     static double next_inventory(double q, double z, Side side) {
         return (side == Side::Bid) ? (q + z) : (q - z);
     }
@@ -684,7 +693,7 @@ struct LadderPolicyBuilder {
         return {lower, upper};
     }
 
-    static void solve_side_ladder_inplace(
+    void solve_side_ladder_inplace(
         const PriceTier& tier,
         const HInterp3D& h_fn,
         double q,
@@ -692,7 +701,6 @@ struct LadderPolicyBuilder {
         double nu,
         Side side,
         double* delta,
-        std::vector<double>& prev_gaps_storage,
         const double* prev_delta = nullptr
     ) {
         const std::size_t n = tier.sizes.size();
@@ -700,10 +708,10 @@ struct LadderPolicyBuilder {
 
         const std::vector<double>* prev_gaps = nullptr;
         if (prev_delta != nullptr) {
-            diff_inplace(prev_delta, n, prev_gaps_storage);
-            prev_gaps = &prev_gaps_storage;
+            diff_inplace(prev_delta, n, prev_gaps_storage_);
+            prev_gaps = &prev_gaps_storage_;
         } else {
-            prev_gaps_storage.clear();
+            prev_gaps_storage_.clear();
         }
 
         const opt::GoldenSectionOptions gs_opts{tier.golden_tol, tier.golden_max_iter};
@@ -734,65 +742,63 @@ struct LadderPolicyBuilder {
         }
     }
 
-    static void build_policy_inplace(
+    void build_policy_inplace(
         const PriceTier& tier,
         const HInterp3D& h_fn,
-        const std::vector<double>& q_grid,
-        const std::vector<double>& y_grid,
-        const std::vector<double>& nu_grid,
         QuotePolicy& policy
     ) {
-        const std::size_t nq  = q_grid.size();
-        const std::size_t ny  = y_grid.size();
-        const std::size_t nnu = nu_grid.size();
+        for (std::size_t iy = 0; iy < ny_; ++iy) {
+            const double y = y_grid_[iy];
 
-        const std::size_t q0_idx = nq / 2;
-
-        // Assumes solver config validation has enforced centered odd grids.
-        if (!approx_equal(q_grid[q0_idx], 0.0)) {
-            throw std::invalid_argument(
-                "LadderPolicyBuilder::build_policy_inplace: q_grid middle point must be 0.");
-        }
-
-        std::vector<double> prev_gaps_storage;
-
-        for (std::size_t iy = 0; iy < ny; ++iy) {
-            const double y = y_grid[iy];
-
-            for (std::size_t inu = 0; inu < nnu; ++inu) {
-                const double nu = nu_grid[inu];
+            for (std::size_t inu = 0; inu < nnu_; ++inu) {
+                const double nu = nu_grid_[inu];
 
                 solve_side_ladder_inplace(
-                    tier, h_fn, q_grid[q0_idx], y, nu, Side::Ask,
-                    policy.ask.row_ptr(q0_idx, iy, inu), prev_gaps_storage, nullptr);
-                solve_side_ladder_inplace(
-                    tier, h_fn, q_grid[q0_idx], y, nu, Side::Bid,
-                    policy.bid.row_ptr(q0_idx, iy, inu), prev_gaps_storage, nullptr);
+                    tier, h_fn, q_grid_[q0_idx_], y, nu, Side::Ask,
+                    policy.ask.row_ptr(q0_idx_, iy, inu), nullptr);
 
-                for (std::size_t iq = q0_idx + 1; iq < nq; ++iq) {
+                solve_side_ladder_inplace(
+                    tier, h_fn, q_grid_[q0_idx_], y, nu, Side::Bid,
+                    policy.bid.row_ptr(q0_idx_, iy, inu), nullptr);
+
+                for (std::size_t iq = q0_idx_ + 1; iq < nq_; ++iq) {
                     solve_side_ladder_inplace(
-                        tier, h_fn, q_grid[iq], y, nu, Side::Ask,
-                        policy.ask.row_ptr(iq, iy, inu), prev_gaps_storage,
+                        tier, h_fn, q_grid_[iq], y, nu, Side::Ask,
+                        policy.ask.row_ptr(iq, iy, inu),
                         policy.ask.row_ptr(iq - 1, iy, inu));
+
                     solve_side_ladder_inplace(
-                        tier, h_fn, q_grid[iq], y, nu, Side::Bid,
-                        policy.bid.row_ptr(iq, iy, inu), prev_gaps_storage,
+                        tier, h_fn, q_grid_[iq], y, nu, Side::Bid,
+                        policy.bid.row_ptr(iq, iy, inu),
                         policy.bid.row_ptr(iq - 1, iy, inu));
                 }
 
-                for (std::size_t ii = q0_idx; ii-- > 0;) {
+                for (std::size_t ii = q0_idx_; ii-- > 0;) {
                     solve_side_ladder_inplace(
-                        tier, h_fn, q_grid[ii], y, nu, Side::Ask,
-                        policy.ask.row_ptr(ii, iy, inu), prev_gaps_storage,
+                        tier, h_fn, q_grid_[ii], y, nu, Side::Ask,
+                        policy.ask.row_ptr(ii, iy, inu),
                         policy.ask.row_ptr(ii + 1, iy, inu));
+
                     solve_side_ladder_inplace(
-                        tier, h_fn, q_grid[ii], y, nu, Side::Bid,
-                        policy.bid.row_ptr(ii, iy, inu), prev_gaps_storage,
+                        tier, h_fn, q_grid_[ii], y, nu, Side::Bid,
+                        policy.bid.row_ptr(ii, iy, inu),
                         policy.bid.row_ptr(ii + 1, iy, inu));
                 }
             }
         }
     }
+
+private:
+    const std::vector<double>& q_grid_;
+    const std::vector<double>& y_grid_;
+    const std::vector<double>& nu_grid_;
+
+    std::size_t nq_{0};
+    std::size_t ny_{0};
+    std::size_t nnu_{0};
+    std::size_t q0_idx_{0};
+
+    std::vector<double> prev_gaps_storage_;
 };
 
 // ============================================================
@@ -888,16 +894,22 @@ struct HJBLadderSolver {
     SolverConfig config;
     std::shared_ptr<InventoryPenalty> penalty;
     std::vector<std::shared_ptr<PriceTier>> tiers;
+    LadderPolicyBuilder policy_builder;
+
+    static SolverConfig validated_config(SolverConfig cfg) {
+        cfg.validate();
+        return cfg;
+    }
 
     HJBLadderSolver(
         SolverConfig config_,
         std::shared_ptr<InventoryPenalty> penalty_,
         std::vector<std::shared_ptr<PriceTier>> tiers_
     )
-        : config(std::move(config_)),
+        : config(validated_config(std::move(config_))),
           penalty(std::move(penalty_)),
-          tiers(std::move(tiers_)) {
-        config.validate();
+          tiers(std::move(tiers_)),
+          policy_builder(config.q_grid, config.y_grid, config.nu_grid) {
         if (!penalty) throw std::invalid_argument("HJBLadderSolver: penalty cannot be null.");
         initialize_policies();
     }
@@ -991,10 +1003,7 @@ struct HJBLadderSolver {
 
     void update_policies(const HInterp3D& h_fn) {
         for (auto& tier : tiers) {
-            LadderPolicyBuilder::build_policy_inplace(
-                *tier, h_fn,
-                config.q_grid, config.y_grid, config.nu_grid,
-                tier->policy);
+            policy_builder.build_policy_inplace(*tier, h_fn, tier->policy);
         }
     }
 
@@ -1078,8 +1087,6 @@ struct HJBLadderSolver {
                 }
             }
 
-            // Normalise so h = 0 at the reference middle state:
-            // (q, y, nu) = (0, 0, nu_bar).
             const double anchor = h_next.at(q0_idx, y0_idx, nu0_idx);
             for (double& v : h_next.data) v -= anchor;
 
