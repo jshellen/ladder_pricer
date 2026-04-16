@@ -253,6 +253,104 @@ struct GridState {
 };
 
 // ============================================================
+// Solver config
+// ============================================================
+
+struct SolverConfig {
+    std::vector<double> q_grid;
+    std::vector<double> y_grid;
+    std::vector<double> nu_grid;
+
+    double dt{0.001};
+    int n_iter{200};
+
+    double kappa_y{2.0};
+    double kappa_nu{1.0};
+    double nu_bar{0.0};
+    double eta_nu{0.2};
+
+    double golden_tol{1e-4};
+    int golden_max_iter{32};
+
+    bool early_stop{true};
+    double tol_h{1e-5};
+    double tol_rhs{1e-4};
+    int min_iter{5};
+    int consecutive_passes_required{3};
+
+    // Derived grid metadata
+    std::size_t nq{0};
+    std::size_t ny{0};
+    std::size_t nnu{0};
+
+    std::size_t q0_idx{0};
+    std::size_t y0_idx{0};
+    std::size_t nu0_idx{0};
+
+    void refresh_derived() {
+        nq  = q_grid.size();
+        ny  = y_grid.size();
+        nnu = nu_grid.size();
+
+        q0_idx  = nq / 2;
+        y0_idx  = ny / 2;
+        nu0_idx = nnu / 2;
+    }
+
+    void validate() {
+        refresh_derived();
+
+        if (nq < 3 || ny < 3 || nnu < 3)
+            throw std::invalid_argument(
+                "SolverConfig: q_grid, y_grid and nu_grid must each have at least 3 points.");
+
+        if (nq % 2 == 0)
+            throw std::invalid_argument("SolverConfig: q_grid must have odd length.");
+        if (ny % 2 == 0)
+            throw std::invalid_argument("SolverConfig: y_grid must have odd length.");
+        if (nnu % 2 == 0)
+            throw std::invalid_argument("SolverConfig: nu_grid must have odd length.");
+
+        if (dt <= 0.0)
+            throw std::invalid_argument("SolverConfig: dt must be positive.");
+        if (n_iter < 1)
+            throw std::invalid_argument("SolverConfig: n_iter must be at least 1.");
+        if (kappa_y < 0.0 || kappa_nu < 0.0 || eta_nu < 0.0)
+            throw std::invalid_argument(
+                "SolverConfig: mean reversion and vol-of-vol must be nonnegative.");
+        if (golden_tol <= 0.0)
+            throw std::invalid_argument("SolverConfig: golden_tol must be positive.");
+        if (golden_max_iter < 1)
+            throw std::invalid_argument("SolverConfig: golden_max_iter must be at least 1.");
+        if (tol_h < 0.0 || tol_rhs < 0.0)
+            throw std::invalid_argument("SolverConfig: tolerances must be nonnegative.");
+        if (min_iter < 0 || consecutive_passes_required < 1)
+            throw std::invalid_argument("SolverConfig: invalid stopping parameters.");
+
+        auto check_inc = [](const std::vector<double>& g, const std::string& name) {
+            for (std::size_t i = 1; i < g.size(); ++i) {
+                if (g[i] <= g[i - 1]) {
+                    throw std::invalid_argument(
+                        "SolverConfig: " + name + " must be strictly increasing.");
+                }
+            }
+        };
+
+        check_inc(q_grid,  "q_grid");
+        check_inc(y_grid,  "y_grid");
+        check_inc(nu_grid, "nu_grid");
+
+        if (!approx_equal(q_grid[q0_idx], 0.0))
+            throw std::invalid_argument("SolverConfig: q_grid middle point must be 0.");
+        if (!approx_equal(y_grid[y0_idx], 0.0))
+            throw std::invalid_argument("SolverConfig: y_grid middle point must be 0.");
+        if (!approx_equal(nu_grid[nu0_idx], nu_bar))
+            throw std::invalid_argument(
+                "SolverConfig: nu_grid middle point must equal nu_bar.");
+    }
+};
+
+// ============================================================
 // No-copy interpolator over FlatCube3D
 // ============================================================
 
@@ -644,38 +742,18 @@ struct PriceTier {
 // ============================================================
 
 struct LadderPolicyBuilder {
-    const std::vector<double>& q_grid;
-    const std::vector<double>& y_grid;
-    const std::vector<double>& nu_grid;
+    const SolverConfig& config;
     const opt::GoldenSectionOptimizer& optimizer;
-    std::size_t q0_idx{0};
 
-    const FlatCube3D* h_mat{nullptr};
-    const HInterp3D* h_fn{nullptr};
+    const HInterp3D* value_fn{nullptr};
 
     std::vector<double> prev_gaps_storage;
 
     LadderPolicyBuilder(
-        const std::vector<double>& q_grid_,
-        const std::vector<double>& y_grid_,
-        const std::vector<double>& nu_grid_,
+        const SolverConfig& config_,
         const opt::GoldenSectionOptimizer& optimizer_
     )
-        : q_grid(q_grid_),
-          y_grid(y_grid_),
-          nu_grid(nu_grid_),
-          optimizer(optimizer_) {
-        if (q_grid.empty())
-            throw std::invalid_argument("LadderPolicyBuilder: q_grid cannot be empty.");
-        if (q_grid.size() % 2 == 0)
-            throw std::invalid_argument("LadderPolicyBuilder: q_grid must have odd length.");
-
-        q0_idx = q_grid.size() / 2;
-        if (!approx_equal(q_grid[q0_idx], 0.0)) {
-            throw std::invalid_argument(
-                "LadderPolicyBuilder: q_grid middle point must be 0.");
-        }
-    }
+        : config(config_), optimizer(optimizer_) {}
 
     LadderPolicyBuilder(const LadderPolicyBuilder&) = delete;
     LadderPolicyBuilder& operator=(const LadderPolicyBuilder&) = delete;
@@ -683,12 +761,16 @@ struct LadderPolicyBuilder {
     LadderPolicyBuilder& operator=(LadderPolicyBuilder&&) = delete;
 
     GridState make_state(std::size_t iq, std::size_t iy, std::size_t inu) const {
-        return GridState{iq, iy, inu, q_grid[iq], y_grid[iy], nu_grid[inu]};
+        return GridState{
+            iq, iy, inu,
+            config.q_grid[iq],
+            config.y_grid[iy],
+            config.nu_grid[inu]
+        };
     }
 
-    void set_value_function(const FlatCube3D& h_mat_, const HInterp3D& h_fn_) {
-        h_mat = &h_mat_;
-        h_fn = &h_fn_;
+    void set_value_function(const HInterp3D& value_fn_) {
+        value_fn = &value_fn_;
     }
 
     static double next_inventory(double q, double z, Side side) {
@@ -757,13 +839,13 @@ struct LadderPolicyBuilder {
         double* delta,
         const double* prev_delta = nullptr
     ) {
-        if (!h_mat || !h_fn) {
+        if (!value_fn) {
             throw std::logic_error(
                 "LadderPolicyBuilder::solve_side_ladder_inplace: value function not set.");
         }
 
         const std::size_t n = tier.sizes.size();
-        const double h_here = h_mat->at(s.iq, s.iy, s.inu);
+        const double h_here = value_fn->h.at(s.iq, s.iy, s.inu);
 
         const std::vector<double>* prev_gaps = nullptr;
         if (prev_delta != nullptr) {
@@ -787,8 +869,8 @@ struct LadderPolicyBuilder {
 
             const double z    = tier.sizes[j];
             const double jump = tier.jump_size(z);
-            const double dh   = (*h_fn)(next_inventory(s.q, z, side),
-                                        next_drift(s.y, jump, side), s.nu) - h_here;
+            const double dh   = (*value_fn)(next_inventory(s.q, z, side),
+                                            next_drift(s.y, jump, side), s.nu) - h_here;
 
             auto objective = [&](double d) {
                 return tier.arrival_rate(d, z) * (z * d + dh);
@@ -800,27 +882,23 @@ struct LadderPolicyBuilder {
     }
 
     void build_policy_inplace(const PriceTier& tier, QuotePolicy& policy) {
-        if (!h_mat || !h_fn) {
+        if (!value_fn) {
             throw std::logic_error(
                 "LadderPolicyBuilder::build_policy_inplace: value function not set.");
         }
 
-        const std::size_t nq  = q_grid.size();
-        const std::size_t ny  = y_grid.size();
-        const std::size_t nnu = nu_grid.size();
-
-        for (std::size_t iy = 0; iy < ny; ++iy) {
-            for (std::size_t inu = 0; inu < nnu; ++inu) {
-                const GridState s0 = make_state(q0_idx, iy, inu);
+        for (std::size_t iy = 0; iy < config.ny; ++iy) {
+            for (std::size_t inu = 0; inu < config.nnu; ++inu) {
+                const GridState s0 = make_state(config.q0_idx, iy, inu);
 
                 solve_side_ladder_inplace(
                     tier, s0, Side::Ask,
-                    policy.ask.row_ptr(q0_idx, iy, inu), nullptr);
+                    policy.ask.row_ptr(config.q0_idx, iy, inu), nullptr);
                 solve_side_ladder_inplace(
                     tier, s0, Side::Bid,
-                    policy.bid.row_ptr(q0_idx, iy, inu), nullptr);
+                    policy.bid.row_ptr(config.q0_idx, iy, inu), nullptr);
 
-                for (std::size_t iq = q0_idx + 1; iq < nq; ++iq) {
+                for (std::size_t iq = config.q0_idx + 1; iq < config.nq; ++iq) {
                     const GridState s = make_state(iq, iy, inu);
 
                     solve_side_ladder_inplace(
@@ -833,7 +911,7 @@ struct LadderPolicyBuilder {
                         policy.bid.row_ptr(iq - 1, iy, inu));
                 }
 
-                for (std::size_t ii = q0_idx; ii-- > 0;) {
+                for (std::size_t ii = config.q0_idx; ii-- > 0;) {
                     const GridState s = make_state(ii, iy, inu);
 
                     solve_side_ladder_inplace(
@@ -851,85 +929,60 @@ struct LadderPolicyBuilder {
 };
 
 // ============================================================
-// Solver
+// Solver bookkeeping
 // ============================================================
 
-struct SolverConfig {
-    std::vector<double> q_grid;
-    std::vector<double> y_grid;
-    std::vector<double> nu_grid;
+struct SolveProgress {
+    bool converged{false};
+    int iterations_used{0};
+    double final_max_h_change{std::numeric_limits<double>::infinity()};
+    double final_max_rhs{std::numeric_limits<double>::infinity()};
+    int consecutive_passes{0};
 
-    double dt{0.001};
-    int n_iter{200};
+    std::vector<double> hist_h;
+    std::vector<double> hist_rhs;
 
-    double kappa_y{2.0};
-    double kappa_nu{1.0};
-    double nu_bar{0.0};
-    double eta_nu{0.2};
+    SolveProgress() = default;
 
-    double golden_tol{1e-4};
-    int golden_max_iter{32};
+    explicit SolveProgress(int n_iter) {
+        hist_h.reserve(static_cast<std::size_t>(n_iter));
+        hist_rhs.reserve(static_cast<std::size_t>(n_iter));
+    }
 
-    bool early_stop{true};
-    double tol_h{1e-5};
-    double tol_rhs{1e-4};
-    int min_iter{5};
-    int consecutive_passes_required{3};
+    void record_iteration(
+        int it,
+        double max_h_change,
+        double max_rhs,
+        const SolverConfig& config
+    ) {
+        hist_h.push_back(max_h_change);
+        hist_rhs.push_back(max_rhs);
 
-    void validate() const {
-        if (q_grid.size() < 3 || y_grid.size() < 3 || nu_grid.size() < 3)
-            throw std::invalid_argument(
-                "SolverConfig: q_grid, y_grid and nu_grid must each have at least 3 points.");
+        final_max_h_change = max_h_change;
+        final_max_rhs = max_rhs;
+        iterations_used = it;
 
-        if (q_grid.size() % 2 == 0)
-            throw std::invalid_argument("SolverConfig: q_grid must have odd length.");
-        if (y_grid.size() % 2 == 0)
-            throw std::invalid_argument("SolverConfig: y_grid must have odd length.");
-        if (nu_grid.size() % 2 == 0)
-            throw std::invalid_argument("SolverConfig: nu_grid must have odd length.");
+        const bool passes_now =
+            it >= config.min_iter &&
+            max_h_change <= config.tol_h &&
+            max_rhs <= config.tol_rhs;
 
-        if (dt <= 0.0)
-            throw std::invalid_argument("SolverConfig: dt must be positive.");
-        if (n_iter < 1)
-            throw std::invalid_argument("SolverConfig: n_iter must be at least 1.");
-        if (kappa_y < 0.0 || kappa_nu < 0.0 || eta_nu < 0.0)
-            throw std::invalid_argument(
-                "SolverConfig: mean reversion and vol-of-vol must be nonnegative.");
-        if (golden_tol <= 0.0)
-            throw std::invalid_argument("SolverConfig: golden_tol must be positive.");
-        if (golden_max_iter < 1)
-            throw std::invalid_argument("SolverConfig: golden_max_iter must be at least 1.");
-        if (tol_h < 0.0 || tol_rhs < 0.0)
-            throw std::invalid_argument("SolverConfig: tolerances must be nonnegative.");
-        if (min_iter < 0 || consecutive_passes_required < 1)
-            throw std::invalid_argument("SolverConfig: invalid stopping parameters.");
+        consecutive_passes = passes_now ? consecutive_passes + 1 : 0;
+    }
 
-        auto check_inc = [](const std::vector<double>& g, const std::string& name) {
-            for (std::size_t i = 1; i < g.size(); ++i) {
-                if (g[i] <= g[i - 1]) {
-                    throw std::invalid_argument(
-                        "SolverConfig: " + name + " must be strictly increasing.");
-                }
-            }
-        };
-
-        check_inc(q_grid,  "q_grid");
-        check_inc(y_grid,  "y_grid");
-        check_inc(nu_grid, "nu_grid");
-
-        const std::size_t q_mid  = q_grid.size() / 2;
-        const std::size_t y_mid  = y_grid.size() / 2;
-        const std::size_t nu_mid = nu_grid.size() / 2;
-
-        if (!approx_equal(q_grid[q_mid], 0.0))
-            throw std::invalid_argument("SolverConfig: q_grid middle point must be 0.");
-        if (!approx_equal(y_grid[y_mid], 0.0))
-            throw std::invalid_argument("SolverConfig: y_grid middle point must be 0.");
-        if (!approx_equal(nu_grid[nu_mid], nu_bar))
-            throw std::invalid_argument(
-                "SolverConfig: nu_grid middle point must equal nu_bar.");
+    bool should_stop(const SolverConfig& config) {
+        if (config.early_stop &&
+            consecutive_passes >= config.consecutive_passes_required) {
+            converged = true;
+            return true;
+        }
+        return false;
     }
 };
+
+// ============================================================
+// Solver
+// ============================================================
 
 struct HJBSolution {
     FlatCube3D h;
@@ -962,7 +1015,7 @@ struct HJBLadderSolver {
           penalty(std::move(penalty_)),
           tiers(std::move(tiers_)),
           optimizer(opt::GoldenSectionOptions{config.golden_tol, config.golden_max_iter}),
-          policy_builder(config.q_grid, config.y_grid, config.nu_grid, optimizer) {
+          policy_builder(config, optimizer) {
         config.validate();
         if (!penalty) throw std::invalid_argument("HJBLadderSolver: penalty cannot be null.");
         initialize_policies();
@@ -973,7 +1026,12 @@ struct HJBLadderSolver {
     }
 
     GridState make_state(std::size_t iq, std::size_t iy, std::size_t inu) const {
-        return GridState{iq, iy, inu, config.q_grid[iq], config.y_grid[iy], config.nu_grid[inu]};
+        return GridState{
+            iq, iy, inu,
+            config.q_grid[iq],
+            config.y_grid[iy],
+            config.nu_grid[inu]
+        };
     }
 
     void initialize_policies() {
@@ -988,9 +1046,9 @@ struct HJBLadderSolver {
 
     double y_drift_term(const FlatCube3D& h_mat, const GridState& s) const {
         const double b = -config.kappa_y * s.y;
-        if (std::abs(b) < 1e-14 || config.y_grid.size() == 1) return 0.0;
+        if (std::abs(b) < 1e-14 || config.ny == 1) return 0.0;
 
-        const std::size_t ny = config.y_grid.size();
+        const std::size_t ny = config.ny;
         double dh_dy = 0.0;
 
         if (b > 0.0) {
@@ -1009,9 +1067,9 @@ struct HJBLadderSolver {
 
     double nu_drift_term(const FlatCube3D& h_mat, const GridState& s) const {
         const double b = config.kappa_nu * (config.nu_bar - s.nu);
-        if (std::abs(b) < 1e-14 || config.nu_grid.size() == 1) return 0.0;
+        if (std::abs(b) < 1e-14 || config.nnu == 1) return 0.0;
 
-        const std::size_t nnu = config.nu_grid.size();
+        const std::size_t nnu = config.nnu;
         double dh_dnu = 0.0;
 
         if (b > 0.0) {
@@ -1029,9 +1087,9 @@ struct HJBLadderSolver {
     }
 
     double nu_diffusion_term(const FlatCube3D& h_mat, const GridState& s) const {
-        if (config.eta_nu == 0.0 || config.nu_grid.size() < 3) return 0.0;
+        if (config.eta_nu == 0.0 || config.nnu < 3) return 0.0;
 
-        const std::size_t nnu = config.nu_grid.size();
+        const std::size_t nnu = config.nnu;
         double second = 0.0;
 
         if (s.inu == 0) {
@@ -1050,62 +1108,46 @@ struct HJBLadderSolver {
         return 0.5 * config.eta_nu * config.eta_nu * second;
     }
 
-    void update_policies(const FlatCube3D& h_mat, const HInterp3D& h_fn) {
+    void update_policies(const HInterp3D& value_fn) {
         sync_optimizer_from_config();
-        policy_builder.set_value_function(h_mat, h_fn);
+        policy_builder.set_value_function(value_fn);
         for (auto& tier : tiers) {
             policy_builder.build_policy_inplace(*tier, tier->policy);
         }
     }
 
     void update_policies(const FlatCube3D& h_mat) {
-        HInterp3D h_fn{config.q_grid, config.y_grid, config.nu_grid, h_mat};
-        update_policies(h_mat, h_fn);
+        HInterp3D value_fn{config.q_grid, config.y_grid, config.nu_grid, h_mat};
+        update_policies(value_fn);
     }
 
     HJBSolution solve() {
         sync_optimizer_from_config();
 
-        const std::size_t nq  = config.q_grid.size();
-        const std::size_t ny  = config.y_grid.size();
-        const std::size_t nnu = config.nu_grid.size();
+        FlatCube3D h_curr(config.nq, config.ny, config.nnu, 0.0);
+        FlatCube3D h_next(config.nq, config.ny, config.nnu, 0.0);
 
-        FlatCube3D h_curr(nq, ny, nnu, 0.0);
-        FlatCube3D h_next(nq, ny, nnu, 0.0);
+        HInterp3D value_fn{config.q_grid, config.y_grid, config.nu_grid, h_curr};
 
-        HInterp3D h_fn{config.q_grid, config.y_grid, config.nu_grid, h_curr};
-
-        const std::size_t q0_idx  = nq / 2;
-        const std::size_t y0_idx  = ny / 2;
-        const std::size_t nu0_idx = nnu / 2;
-
-        std::vector<double> penalty_q(nq);
-        for (std::size_t iq = 0; iq < nq; ++iq)
+        std::vector<double> penalty_q(config.nq);
+        for (std::size_t iq = 0; iq < config.nq; ++iq)
             penalty_q[iq] = penalty->value(config.q_grid[iq]);
 
-        std::vector<double> exp_2nu(nnu);
-        for (std::size_t inu = 0; inu < nnu; ++inu)
+        std::vector<double> exp_2nu(config.nnu);
+        for (std::size_t inu = 0; inu < config.nnu; ++inu)
             exp_2nu[inu] = std::exp(2.0 * config.nu_grid[inu]);
 
-        bool converged = false;
-        int iterations_used = 0;
-        double final_max_h_change = std::numeric_limits<double>::infinity();
-        double final_max_rhs = std::numeric_limits<double>::infinity();
-        int consecutive_passes = 0;
-
-        std::vector<double> hist_h, hist_rhs;
-        hist_h.reserve(static_cast<std::size_t>(config.n_iter));
-        hist_rhs.reserve(static_cast<std::size_t>(config.n_iter));
+        SolveProgress progress{config.n_iter};
 
         for (int it = 1; it <= config.n_iter; ++it) {
-            update_policies(h_curr, h_fn);
+            update_policies(value_fn);
 
             double max_h_change = 0.0;
             double max_rhs_now  = 0.0;
 
-            for (std::size_t iq = 0; iq < nq; ++iq) {
-                for (std::size_t iy = 0; iy < ny; ++iy) {
-                    for (std::size_t inu = 0; inu < nnu; ++inu) {
+            for (std::size_t iq = 0; iq < config.nq; ++iq) {
+                for (std::size_t iy = 0; iy < config.ny; ++iy) {
+                    for (std::size_t inu = 0; inu < config.nnu; ++inu) {
                         const GridState s = make_state(iq, iy, inu);
                         const double h_here = h_curr.at(s.iq, s.iy, s.inu);
 
@@ -1115,9 +1157,9 @@ struct HJBLadderSolver {
                                    + nu_diffusion_term(h_curr, s)
                                    - exp_2nu[s.inu] * penalty_q[s.iq];
 
-                        // ----------------------------------------------------------------- //
+                        // --------------------------------------------------------------------- //
                         // Price tier optimization
-                        // ----------------------------------------------------------------- //
+                        // --------------------------------------------------------------------- //
                         for (const auto& tier : tiers) {
                             const double* bid_row = tier->policy.bid.row_ptr(s.iq, s.iy, s.inu);
                             const double* ask_row = tier->policy.ask.row_ptr(s.iq, s.iy, s.inu);
@@ -1128,11 +1170,11 @@ struct HJBLadderSolver {
 
                                 const double d_b   = bid_row[iz];
                                 const double lam_b = tier->arrival_rate(d_b, z);
-                                rhs += lam_b * (z * d_b + h_fn(s.q + z, s.y - jump, s.nu) - h_here);
+                                rhs += lam_b * (z * d_b + value_fn(s.q + z, s.y - jump, s.nu) - h_here);
 
                                 const double d_a   = ask_row[iz];
                                 const double lam_a = tier->arrival_rate(d_a, z);
-                                rhs += lam_a * (z * d_a + h_fn(s.q - z, s.y + jump, s.nu) - h_here);
+                                rhs += lam_a * (z * d_a + value_fn(s.q - z, s.y + jump, s.nu) - h_here);
                             }
                         }
 
@@ -1145,35 +1187,22 @@ struct HJBLadderSolver {
                 }
             }
 
-            const double anchor = h_next.at(q0_idx, y0_idx, nu0_idx);
+            const double anchor = h_next.at(config.q0_idx, config.y0_idx, config.nu0_idx);
             for (double& v : h_next.data) v -= anchor;
 
-            hist_h.push_back(max_h_change);
-            hist_rhs.push_back(max_rhs_now);
-            final_max_h_change = max_h_change;
-            final_max_rhs = max_rhs_now;
-            iterations_used = it;
-
-            const bool passes_now =
-                it >= config.min_iter &&
-                max_h_change <= config.tol_h &&
-                max_rhs_now  <= config.tol_rhs;
-
-            consecutive_passes = passes_now ? consecutive_passes + 1 : 0;
+            progress.record_iteration(it, max_h_change, max_rhs_now, config);
 
             h_curr.data.swap(h_next.data);
 
-            if (config.early_stop &&
-                consecutive_passes >= config.consecutive_passes_required) {
-                converged = true;
+            if (progress.should_stop(config)) {
                 break;
             }
         }
 
-        // ----------------------------------------------------------------- //
-        // Final policy update after convergence or max iterations
-        // ----------------------------------------------------------------- //
-        update_policies(h_curr, h_fn);
+        // --------------------------------------------------------------------- //
+        // Final policy update with the last value function
+        // --------------------------------------------------------------------- //
+        update_policies(value_fn);
 
         HJBSolution out;
         out.h                    = std::move(h_curr);
@@ -1181,12 +1210,12 @@ struct HJBLadderSolver {
         out.y_grid               = config.y_grid;
         out.nu_grid              = config.nu_grid;
         out.tiers                = tiers;
-        out.converged            = converged;
-        out.iterations_used      = iterations_used;
-        out.final_max_h_change   = final_max_h_change;
-        out.final_max_rhs        = final_max_rhs;
-        out.history_max_h_change = std::move(hist_h);
-        out.history_max_rhs      = std::move(hist_rhs);
+        out.converged            = progress.converged;
+        out.iterations_used      = progress.iterations_used;
+        out.final_max_h_change   = progress.final_max_h_change;
+        out.final_max_rhs        = progress.final_max_rhs;
+        out.history_max_h_change = std::move(progress.hist_h);
+        out.history_max_rhs      = std::move(progress.hist_rhs);
         return out;
     }
 };
