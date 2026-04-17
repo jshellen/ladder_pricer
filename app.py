@@ -81,7 +81,7 @@ def default_tier_values(i: int) -> dict:
     presets = [
         {
             "name": "core_clients",
-            "sizes": "1, 2, 5, 10",
+            "sizes": "1, 2, 3, 5, 10, 15, 20",
             "flow_A0": 1.00,
             "flow_theta": 0.00,
             "flow_k": 2.00,
@@ -94,7 +94,7 @@ def default_tier_values(i: int) -> dict:
         },
         {
             "name": "aggressive_clients",
-            "sizes": "1, 2, 5, 10",
+            "sizes": "1, 2, 3, 5, 10, 15, 20",
             "flow_A0": 1.30,
             "flow_theta": 0.20,
             "flow_k": 2.40,
@@ -107,7 +107,7 @@ def default_tier_values(i: int) -> dict:
         },
         {
             "name": "sticky_clients",
-            "sizes": "1, 2, 5, 10",
+            "sizes": "1, 2, 3, 5, 10, 15, 20",
             "flow_A0": 0.85,
             "flow_theta": 0.15,
             "flow_k": 1.60,
@@ -291,15 +291,23 @@ def make_quote_inventory_figure(cpp_tier: lp.PriceTier, spec: TierSpec) -> go.Fi
 
 
 def make_ladder_figure(cpp_tier: lp.PriceTier, spec: TierSpec, q: float) -> go.Figure:
+
     sizes = [float(z) for z in spec.sizes]
-    bid_vals = [-cpp_tier.quote(float(q), z, "bid") for z in sizes]
-    ask_vals = [cpp_tier.quote(float(q), z, "ask") for z in sizes]
+
+    bid_0_quote = np.array([cpp_tier.quote(float(q), 0, "bid") for z in sizes])
+    ask_0_quote = np.array([cpp_tier.quote(float(q), 0, "ask") for z in sizes])
+
+    bid_z_quote = np.array([cpp_tier.quote(float(q), z, "bid") for z in sizes])
+    ask_z_quote = np.array([cpp_tier.quote(float(q), z, "ask") for z in sizes])
+
+    bid_vp = bid_z_quote - bid_0_quote
+    ask_vp = ask_z_quote - ask_0_quote
 
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
             x=sizes,
-            y=bid_vals,
+            y=bid_vp,
             mode="lines+markers",
             name=f"Bid q={q:g}",
         )
@@ -307,7 +315,7 @@ def make_ladder_figure(cpp_tier: lp.PriceTier, spec: TierSpec, q: float) -> go.F
     fig.add_trace(
         go.Scatter(
             x=sizes,
-            y=ask_vals,
+            y=ask_vp,
             mode="lines+markers",
             line=dict(dash="dash"),
             name=f"Ask q={q:g}",
@@ -320,6 +328,7 @@ def make_ladder_figure(cpp_tier: lp.PriceTier, spec: TierSpec, q: float) -> go.F
         xaxis_title="Trade size z",
         yaxis_title="Quote around mid",
         height=520,
+        yaxis=dict(range=[-1, 10]),
     )
     return fig
 
@@ -427,8 +436,8 @@ def make_convergence_figure(solution: lp.HJBSolution) -> go.Figure:
 # App
 # ============================================================
 
-st.set_page_config(page_title="HJB ladder playground", layout="wide")
-st.title("HJB ladder playground")
+st.set_page_config(page_title="Trinity 2.0 Pricer", layout="wide")
+st.title("Trinity 2.0 Pricer")
 st.markdown(
     "This version uses the `ladder_pricer` C++ package via pybind11. "
     "The app recomputes automatically whenever parameters change."
@@ -536,19 +545,22 @@ else:
         f"final max |rhs| = {solution.final_max_rhs:.2e}."
     )
 
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("q points", len(config.q_grid))
-c2.metric("tiers", len(solution.tiers))
-c3.metric("iterations used", solution.iterations_used)
-c4.metric("converged", "yes" if solution.converged else "no")
-c5.metric("spot drift", f"{config.spot_drift:.5f}")
 
-c6, c7 = st.columns(2)
-c6.metric("final max |Δh|", f"{solution.final_max_h_change:.2e}")
-c7.metric("final max |rhs|", f"{solution.final_max_rhs:.2e}")
+with st.expander("Solver diagnostics"):
 
-st.plotly_chart(make_h_figure(solution), use_container_width=True)
-st.plotly_chart(make_convergence_figure(solution), use_container_width=True)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("q points", len(config.q_grid))
+    c2.metric("tiers", len(solution.tiers))
+    c3.metric("iterations used", solution.iterations_used)
+    c4.metric("converged", "yes" if solution.converged else "no")
+    c5.metric("spot drift", f"{config.spot_drift:.5f}")
+
+    c6, c7 = st.columns(2)
+    c6.metric("final max |Δh|", f"{solution.final_max_h_change:.2e}")
+    c7.metric("final max |rhs|", f"{solution.final_max_rhs:.2e}")
+
+    st.plotly_chart(make_h_figure(solution), use_container_width=True)
+    st.plotly_chart(make_convergence_figure(solution), use_container_width=True)
 
 tab_names = [spec.name for spec in tier_specs]
 tabs = st.tabs(tab_names)
