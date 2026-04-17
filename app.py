@@ -27,9 +27,9 @@ class TierSpec:
     sizes: list[float]
     flow_A0: float
     flow_theta: float
-    flow_k: float
-    flow_m0: float
-    flow_m_alpha: float
+    flow_steepness: float
+    flow_shift: float
+    flow_volume_shift: float
     markout_base: float
     markout_coeff: float
     delta_min: float
@@ -41,9 +41,9 @@ class TierSpec:
         flow = lp.LogisticFlowCurve(
             A0=float(self.flow_A0),
             theta=float(self.flow_theta),
-            k=float(self.flow_k),
-            m0=float(self.flow_m0),
-            m_alpha=float(self.flow_m_alpha),
+            shift=float(self.flow_shift),
+            steepness=float(self.flow_steepness),
+            volume_shift=float(self.flow_volume_shift),
         )
         markout = lp.SqrtMarkoutModel(
             base=float(self.markout_base),
@@ -81,28 +81,28 @@ def default_tier_values(i: int) -> dict:
     presets = [
         {
             "name": "core_clients",
-            "sizes": "1, 2, 3, 5, 10, 15, 20",
+            "sizes": "1, 2, 3, 5, 10, 20",
             "flow_A0": 1.00,
-            "flow_theta": 0.00,
-            "flow_k": 2.00,
-            "flow_m0": 0.15,
-            "flow_m_alpha": 0.075,
-            "markout_base": 0.005,
-            "markout_coeff": 0.003,
-            "delta_min": -100,
+            "flow_theta": 0.0,
+            "flow_steepness": 10.00,
+            "flow_shift": 0.50,
+            "flow_volume_shift": 0.015,
+            "markout_base": 0.000,
+            "markout_coeff": 0.000,
+            "delta_min": -100.0,
             "delta_max": 100.0,
         },
         {
             "name": "aggressive_clients",
-            "sizes": "1, 2, 3, 5, 10, 15, 20",
-            "flow_A0": 1.30,
-            "flow_theta": 0.20,
-            "flow_k": 2.40,
-            "flow_m0": 0.05,
-            "flow_m_alpha": 0.070,
-            "markout_base": 0.007,
-            "markout_coeff": 0.004,
-            "delta_min": -100,
+            "sizes": "1, 2, 3, 5, 10, 20",
+            "flow_A0": 1.0,
+            "flow_theta": 0.0,
+            "flow_steepness": 10.0,
+            "flow_shift": 0.30,
+            "flow_volume_shift": 0.01,
+            "markout_base": 0.000,
+            "markout_coeff": 0.000,
+            "delta_min": -100.0,
             "delta_max": 100.0,
         },
         {
@@ -110,12 +110,12 @@ def default_tier_values(i: int) -> dict:
             "sizes": "1, 2, 3, 5, 10, 15, 20",
             "flow_A0": 0.85,
             "flow_theta": 0.15,
-            "flow_k": 1.60,
-            "flow_m0": 0.28,
-            "flow_m_alpha": 0.090,
-            "markout_base": 0.003,
-            "markout_coeff": 0.002,
-            "delta_min": -100,
+            "flow_steepness": 1.60,
+            "flow_shift": 0.28,
+            "flow_volume_shift": 0.090,
+            "markout_base": 0.000,
+            "markout_coeff": 0.000,
+            "delta_min": -100.0,
             "delta_max": 100.0,
         },
     ]
@@ -147,27 +147,27 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
         )
 
         c3, c4 = st.columns(2)
-        flow_k = c3.number_input(
-            f"k {i + 1}",
-            value=float(defaults["flow_k"]),
+        flow_steepness = c3.number_input(
+            f"steepness {i + 1}",
+            value=float(defaults["flow_steepness"]),
             step=0.05,
             format="%.4f",
-            key=f"flow_k_{i}",
+            key=f"flow_steepness_{i}",
         )
-        flow_m0 = c4.number_input(
-            f"m0 {i + 1}",
-            value=float(defaults["flow_m0"]),
+        flow_shift = c4.number_input(
+            f"shift {i + 1}",
+            value=float(defaults["flow_shift"]),
             step=0.05,
             format="%.4f",
-            key=f"flow_m0_{i}",
+            key=f"flow_shift_{i}",
         )
 
-        flow_m_alpha = st.number_input(
-            f"m_alpha {i + 1}",
-            value=float(defaults["flow_m_alpha"]),
-            step=0.01,
+        flow_volume_shift = st.number_input(
+            f"volume_shift {i + 1}",
+            value=float(defaults["flow_volume_shift"]),
+            step=0.001,
             format="%.4f",
-            key=f"flow_m_alpha_{i}",
+            key=f"flow_volume_shift_{i}",
         )
 
         st.markdown("**Markout parameters**")
@@ -192,14 +192,14 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
         tier_delta_min = c7.number_input(
             f"Tier delta_min {i + 1}",
             value=float(defaults["delta_min"]),
-            step=0.1,
+            step=0.05,
             format="%.4f",
             key=f"tier_delta_min_{i}",
         )
         tier_delta_max = c8.number_input(
             f"Tier delta_max {i + 1}",
             value=float(defaults["delta_max"]),
-            step=0.1,
+            step=0.05,
             format="%.4f",
             key=f"tier_delta_max_{i}",
         )
@@ -208,8 +208,8 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
 
     if flow_A0 < 0.0:
         raise ValueError(f"A0 for tier {i + 1} must be nonnegative.")
-    if flow_k <= 0.0:
-        raise ValueError(f"k for tier {i + 1} must be positive.")
+    if flow_steepness <= 0.0:
+        raise ValueError(f"steepness for tier {i + 1} must be positive.")
     if tier_delta_max <= tier_delta_min:
         raise ValueError(f"Tier {i + 1}: delta_max must be greater than delta_min.")
     if any(z <= 0.0 for z in sizes):
@@ -222,9 +222,9 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
         sizes=sizes,
         flow_A0=float(flow_A0),
         flow_theta=float(flow_theta),
-        flow_k=float(flow_k),
-        flow_m0=float(flow_m0),
-        flow_m_alpha=float(flow_m_alpha),
+        flow_steepness=float(flow_steepness),
+        flow_shift=float(flow_shift),
+        flow_volume_shift=float(flow_volume_shift),
         markout_base=float(markout_base),
         markout_coeff=float(markout_coeff),
         delta_min=float(tier_delta_min),
@@ -240,8 +240,8 @@ def make_flow_parameter_table(spec: TierSpec, cpp_tier: lp.PriceTier) -> pd.Data
             {
                 "z": zf,
                 "A(z)": spec.flow_A0 * zf ** (-spec.flow_theta),
-                "m(z)": spec.flow_m0 + spec.flow_m_alpha * zf,
-                "k": spec.flow_k,
+                "delta_50(z)": spec.flow_shift - spec.flow_volume_shift * (zf - 1.0),
+                "steepness": spec.flow_steepness,
                 "mu(z)": cpp_tier.expected_markout(zf),
             }
         )
@@ -255,7 +255,22 @@ def policy_arrays(cpp_tier: lp.PriceTier) -> tuple[np.ndarray, np.ndarray, np.nd
     return q_grid, bid, ask
 
 
-def make_quote_inventory_figure(cpp_tier: lp.PriceTier, spec: TierSpec) -> go.Figure:
+def bid_quote_rel_mid(delta: np.ndarray | float, spread: float) -> np.ndarray | float:
+    x = np.asarray(delta, dtype=float)
+    return spread * (x - 0.5)
+
+
+def ask_quote_rel_mid(delta: np.ndarray | float, spread: float) -> np.ndarray | float:
+    x = np.asarray(delta, dtype=float)
+    return spread * (0.5 - x)
+
+
+def edge_vs_mid(delta: np.ndarray | float, spread: float) -> np.ndarray | float:
+    x = np.asarray(delta, dtype=float)
+    return spread * (0.5 - x)
+
+
+def make_quote_inventory_figure(cpp_tier: lp.PriceTier, spec: TierSpec, spread: float) -> go.Figure:
     q_grid, bid, ask = policy_arrays(cpp_tier)
 
     fig = go.Figure()
@@ -264,7 +279,7 @@ def make_quote_inventory_figure(cpp_tier: lp.PriceTier, spec: TierSpec) -> go.Fi
         fig.add_trace(
             go.Scatter(
                 x=q_grid,
-                y=-bid[:, j],
+                y=10_000*bid_quote_rel_mid(bid[:, j], spread),
                 mode="lines",
                 name=f"{zf:g} bid",
             )
@@ -272,7 +287,7 @@ def make_quote_inventory_figure(cpp_tier: lp.PriceTier, spec: TierSpec) -> go.Fi
         fig.add_trace(
             go.Scatter(
                 x=q_grid,
-                y=ask[:, j],
+                y=10_000*ask_quote_rel_mid(ask[:, j], spread),
                 mode="lines",
                 line=dict(dash="dash"),
                 name=f"{zf:g} ask",
@@ -283,25 +298,24 @@ def make_quote_inventory_figure(cpp_tier: lp.PriceTier, spec: TierSpec) -> go.Fi
     fig.update_layout(
         title=f"Quotes vs inventory — {spec.name}",
         xaxis_title="Inventory q",
-        yaxis_title="Quote around mid (mid = 0)",
+        yaxis_title="Quote relative to mid",
         height=520,
-        yaxis=dict(range=[-10, 10]),
     )
     return fig
 
 
-def make_ladder_figure(cpp_tier: lp.PriceTier, spec: TierSpec, q: float) -> go.Figure:
-
+def make_ladder_figure(cpp_tier: lp.PriceTier, spec: TierSpec, q: float, spread: float) -> go.Figure:
     sizes = [float(z) for z in spec.sizes]
+    z_ref = sizes[0]
 
-    bid_0_quote = np.array([cpp_tier.quote(float(q), 0, "bid") for z in sizes])
-    ask_0_quote = np.array([cpp_tier.quote(float(q), 0, "ask") for z in sizes])
+    bid_ref_delta = float(cpp_tier.quote(float(q), z_ref, "bid"))
+    ask_ref_delta = float(cpp_tier.quote(float(q), z_ref, "ask"))
 
-    bid_z_quote = np.array([cpp_tier.quote(float(q), z, "bid") for z in sizes])
-    ask_z_quote = np.array([cpp_tier.quote(float(q), z, "ask") for z in sizes])
+    bid_delta = np.array([float(cpp_tier.quote(float(q), z, "bid")) for z in sizes], dtype=float)
+    ask_delta = np.array([float(cpp_tier.quote(float(q), z, "ask")) for z in sizes], dtype=float)
 
-    bid_vp = bid_z_quote - bid_0_quote
-    ask_vp = ask_z_quote - ask_0_quote
+    bid_vp = 10_000 * spread * (bid_ref_delta - bid_delta)
+    ask_vp = 10_000 * spread * (ask_ref_delta - ask_delta)
 
     fig = go.Figure()
     fig.add_trace(
@@ -324,17 +338,16 @@ def make_ladder_figure(cpp_tier: lp.PriceTier, spec: TierSpec, q: float) -> go.F
 
     fig.add_hline(y=0.0)
     fig.update_layout(
-        title=f"Ladders — {spec.name} at q = {q:g}",
+        title=f"Ladder premium vs smallest size — {spec.name} at q = {q:g}",
         xaxis_title="Trade size z",
-        yaxis_title="Quote around mid",
+        yaxis_title="Premium vs 1M quote (in pips)",
         height=520,
-        yaxis=dict(range=[-1, 10]),
     )
     return fig
 
 
 def make_flow_curve_figure(cpp_tier: lp.PriceTier, spec: TierSpec) -> go.Figure:
-    grid = np.linspace(spec.delta_min, spec.delta_max, 200)
+    grid = np.linspace(-1.0, +1.0, 100)
     fig = go.Figure()
 
     for z in spec.sizes:
@@ -351,27 +364,37 @@ def make_flow_curve_figure(cpp_tier: lp.PriceTier, spec: TierSpec) -> go.Figure:
 
     fig.update_layout(
         title=f"Flow curves λ(δ, z) — {spec.name}",
-        xaxis_title="delta",
+        xaxis_title="delta (fraction of spread improvement)",
         yaxis_title="arrival rate",
         height=520,
     )
     return fig
 
 
-def make_q_ladder_table(cpp_tier: lp.PriceTier, spec: TierSpec, q: float) -> pd.DataFrame:
+def make_q_ladder_table(cpp_tier: lp.PriceTier, spec: TierSpec, q: float, spread: float) -> pd.DataFrame:
     rows = []
+    z_ref = float(spec.sizes[0])
+
+    bid_ref_delta = float(cpp_tier.quote(float(q), z_ref, "bid"))
+    ask_ref_delta = float(cpp_tier.quote(float(q), z_ref, "ask"))
+
     for z in spec.sizes:
         zf = float(z)
-        bid_delta = cpp_tier.quote(float(q), zf, "bid")
-        ask_delta = cpp_tier.quote(float(q), zf, "ask")
+        bid_delta = float(cpp_tier.quote(float(q), zf, "bid"))
+        ask_delta = float(cpp_tier.quote(float(q), zf, "ask"))
+
         rows.append(
             {
                 "q": float(q),
                 "z": zf,
-                "bid_quote_plot_value": -bid_delta,
-                "ask_quote_plot_value": ask_delta,
-                "raw_bid_delta": bid_delta,
-                "raw_ask_delta": ask_delta,
+                "bid_delta": bid_delta,
+                "ask_delta": ask_delta,
+                "bid_quote_rel_mid": spread * (bid_delta - 0.5),
+                "ask_quote_rel_mid": spread * (0.5 - ask_delta),
+                "bid_edge_vs_mid": spread * (0.5 - bid_delta),
+                "ask_edge_vs_mid": spread * (0.5 - ask_delta),
+                "bid_extra_edge_vs_smallest": spread * (bid_ref_delta - bid_delta),
+                "ask_extra_edge_vs_smallest": spread * (ask_ref_delta - ask_delta),
             }
         )
     return pd.DataFrame(rows)
@@ -396,11 +419,9 @@ def make_h_figure(solution: lp.HJBSolution) -> go.Figure:
     return fig
 
 
-def make_convergence_figure(solution: lp.HJBSolution) -> go.Figure:
+def make_convergence_h_figure(solution: lp.HJBSolution) -> go.Figure:
     fig = go.Figure()
-
     hist_h = list(solution.history_max_h_change)
-    hist_rhs = list(solution.history_max_rhs)
 
     if hist_h:
         fig.add_trace(
@@ -411,6 +432,20 @@ def make_convergence_figure(solution: lp.HJBSolution) -> go.Figure:
                 name="max |Δh|",
             )
         )
+
+    fig.update_layout(
+        title="Convergence: max |Δh|",
+        xaxis_title="Iteration",
+        yaxis_title="max |Δh|",
+        yaxis_type="log",
+        height=420,
+    )
+    return fig
+
+
+def make_convergence_rhs_figure(solution: lp.HJBSolution) -> go.Figure:
+    fig = go.Figure()
+    hist_rhs = list(solution.history_max_rhs)
 
     if hist_rhs:
         fig.add_trace(
@@ -423,9 +458,9 @@ def make_convergence_figure(solution: lp.HJBSolution) -> go.Figure:
         )
 
     fig.update_layout(
-        title="Convergence diagnostics",
+        title="Convergence: max |rhs|",
         xaxis_title="Iteration",
-        yaxis_title="Value",
+        yaxis_title="max |rhs|",
         yaxis_type="log",
         height=420,
     )
@@ -452,14 +487,27 @@ with st.sidebar:
     dt = st.number_input("dt", value=0.002, step=0.001, format="%.4f")
     n_iter = st.number_input("n_iter", value=140, step=10, min_value=1)
 
+    spread = st.number_input(
+        "reference spread",
+        value=20.0 / 10000.0,
+        step=1.0 / 10000.0,
+        format="%.6f",
+        help=(
+            "Reference spread used to define reference bid/ask and quote-improvement delta. "
+            "ref_bid = mid - 0.5 * spread, ref_ask = mid + 0.5 * spread."
+        ),
+    )
+
     st.header("Spot process")
     spot_drift = st.number_input(
         "spot_drift",
         value=0.0,
         step=0.001,
         format="%.5f",
-        help="Constant drift in the spot process dS = spot_drift * dt + sigma * dW. "
-             "In the reduced HJB this contributes + spot_drift * q.",
+        help=(
+            "Constant drift in the spot process dS = spot_drift * dt + sigma * dW. "
+            "In the reduced HJB this contributes + spot_drift * q."
+        ),
     )
 
     st.header("Convergence / stopping")
@@ -475,11 +523,12 @@ with st.sidebar:
     )
 
     st.header("Inventory penalty")
-    sigma = st.number_input("sigma", value=0.25, step=0.01, format="%.4f")
-    risk_aversion = st.number_input("risk_aversion", value=2.0, step=0.1, format="%.4f")
-    tau0 = st.number_input("tau0", value=2.0, step=0.1, format="%.4f")
-    cubic_coeff = st.number_input("cubic coeff", value=0.1, step=0.01, format="%.4f")
-    quartic_coeff = st.number_input("quartic coeff", value=0.0015, step=0.0005, format="%.5f")
+    sigma = st.number_input("Volatility [pips / 1min]", value=20.0, step=1.0, format="%.2f")
+    sigma = sigma / 10_000.0
+    risk_aversion = st.number_input("risk_aversion", value=10.0, step=1.0, format="%.2f")
+    tau0 = st.number_input("tau0", value=5.0, step=1.0, format="%.4f")
+    tau1 = st.number_input("cubic coeff", value=0.1, step=0.01, format="%.4f")
+    tau2 = st.number_input("quartic coeff", value=0.0015, step=0.0005, format="%.5f")
 
     st.header("Pricing tiers")
     num_tiers = st.slider("Number of tiers", min_value=1, max_value=4, value=2)
@@ -494,6 +543,8 @@ for i in range(num_tiers):
 
 if q_max <= q_min:
     errors.append("q_max must be greater than q_min.")
+if spread <= 0.0:
+    errors.append("spread must be positive.")
 
 q_grid = np.arange(float(q_min), float(q_max) + float(q_step), float(q_step), dtype=float)
 
@@ -511,14 +562,15 @@ penalty = lp.PolynomialInventoryPenalty(
     risk_aversion=float(risk_aversion),
     sigma=float(sigma),
     tau0=float(tau0),
-    cubic_coeff=float(cubic_coeff),
-    quartic_coeff=float(quartic_coeff),
+    cubic_coeff=float(tau1),
+    quartic_coeff=float(tau2),
 )
 
 config = lp.SolverConfig()
 config.q_grid = [float(q) for q in q_grid]
 config.dt = float(dt)
 config.n_iter = int(n_iter)
+config.spread = float(spread)
 config.spot_drift = float(spot_drift)
 config.early_stop = bool(early_stop)
 config.tol_h = float(tol_h)
@@ -545,22 +597,22 @@ else:
         f"final max |rhs| = {solution.final_max_rhs:.2e}."
     )
 
-
-with st.expander("Solver diagnostics"):
-
-    c1, c2, c3, c4, c5 = st.columns(5)
+with st.expander("Solver diagnostics", expanded=False):
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("q points", len(config.q_grid))
     c2.metric("tiers", len(solution.tiers))
     c3.metric("iterations used", solution.iterations_used)
     c4.metric("converged", "yes" if solution.converged else "no")
     c5.metric("spot drift", f"{config.spot_drift:.5f}")
+    c6.metric("spread", f"{config.spread:.6f}")
 
-    c6, c7 = st.columns(2)
-    c6.metric("final max |Δh|", f"{solution.final_max_h_change:.2e}")
-    c7.metric("final max |rhs|", f"{solution.final_max_rhs:.2e}")
+    c7, c8 = st.columns(2)
+    c7.metric("final max |Δh|", f"{solution.final_max_h_change:.2e}")
+    c8.metric("final max |rhs|", f"{solution.final_max_rhs:.2e}")
 
     st.plotly_chart(make_h_figure(solution), use_container_width=True)
-    st.plotly_chart(make_convergence_figure(solution), use_container_width=True)
+    st.plotly_chart(make_convergence_h_figure(solution), use_container_width=True)
+    st.plotly_chart(make_convergence_rhs_figure(solution), use_container_width=True)
 
 tab_names = [spec.name for spec in tier_specs]
 tabs = st.tabs(tab_names)
@@ -571,16 +623,13 @@ for tab, spec, cpp_tier in zip(tabs, tier_specs, solution.tiers):
     with tab:
         st.subheader(f"Tier: {spec.name}")
 
-        st.markdown("**Implied parameters at ladder sizes**")
-        st.dataframe(make_flow_parameter_table(spec, cpp_tier), use_container_width=True)
-
         st.plotly_chart(
             make_flow_curve_figure(cpp_tier, spec),
             use_container_width=True,
         )
 
         st.plotly_chart(
-            make_quote_inventory_figure(cpp_tier, spec),
+            make_quote_inventory_figure(cpp_tier, spec, float(config.spread)),
             use_container_width=True,
         )
 
@@ -594,7 +643,7 @@ for tab, spec, cpp_tier in zip(tabs, tier_specs, solution.tiers):
         )
 
         st.plotly_chart(
-            make_ladder_figure(cpp_tier, spec, float(q_for_ladder)),
+            make_ladder_figure(cpp_tier, spec, float(q_for_ladder), float(config.spread)),
             use_container_width=True,
         )
 
@@ -606,7 +655,7 @@ for tab, spec, cpp_tier in zip(tabs, tier_specs, solution.tiers):
         )
 
         st.dataframe(
-            make_q_ladder_table(cpp_tier, spec, float(q_for_table)),
+            make_q_ladder_table(cpp_tier, spec, float(q_for_table), float(config.spread)),
             use_container_width=True,
         )
 
@@ -619,36 +668,59 @@ $$
 dS_t = \mu_{\text{spot}}\,dt + \sigma\,dW_t.
 $$
 
-For each inventory point $q$, the Bellman right-hand side is
+Let the reference spread be \(s\), and define
+
+$$
+\text{ref bid} = \text{mid} - \tfrac12 s,
+\qquad
+\text{ref ask} = \text{mid} + \tfrac12 s.
+$$
+
+The quote improvement \(\delta\) is measured as a fraction of that spread:
+
+$$
+\text{bid quote} = \text{ref bid} + s\,\delta,
+\qquad
+\text{ask quote} = \text{ref ask} - s\,\delta.
+$$
+
+So the immediate edge versus mid on either side is
+
+$$
+s(0.5 - \delta).
+$$
+
+For each inventory point \(q\), the Bellman right-hand side is
 
 $$
 -\phi(q) + \mu_{\text{spot}} q
 + \sum_{\text{tier}} \sum_z \Big[
-\lambda(\delta^b, z) \big(z(\delta^b - \mu(z)) + h(q+z)-h(q)\big)
+\lambda(\delta^b, z)\big(z\,s(0.5-\delta^b) - z\mu(z) + h(q+z)-h(q)\big)
 +
-\lambda(\delta^a, z) \big(z(\delta^a - \mu(z)) + h(q-z)-h(q)\big)
+\lambda(\delta^a, z)\big(z\,s(0.5-\delta^a) - z\mu(z) + h(q-z)-h(q)\big)
 \Big].
 $$
 
 So:
 - positive spot drift favors long inventory
 - negative spot drift favors short inventory
+- larger \(\delta\) means a more aggressive quote on both sides
 
 The C++ backend solves the ladder sequentially:
-- first near $q = 0$,
-- then for $q > 0$ moving outward,
-- then for $q < 0$ moving outward.
+- first near \(q = 0\),
+- then for \(q > 0\) moving outward,
+- then for \(q < 0\) moving outward.
 
 For each side and inventory, the ladder is built rung-by-rung in size order using bounded golden-section search.
 
 Hard constraints:
 1. Larger sizes cannot be more aggressive than smaller sizes:
    $$
-   \delta(q, z_{j+1}) \ge \delta(q, z_j).
+   \delta(q, z_{j+1}) \le \delta(q, z_j).
    $$
 2. Inventory-dependent gap rules:
-   - for $q > 0$: ask gaps shrink, bid gaps increase
-   - for $q < 0$: ask gaps increase, bid gaps decrease
+   - for \(q > 0\): ask gaps shrink, bid gaps increase
+   - for \(q < 0\): ask gaps increase, bid gaps decrease
         """
     )
 

@@ -54,24 +54,30 @@ inline double interp_linear(
     }
 
     if (x <= grid.front()) {
-        double x0 = grid[0], x1 = grid[1];
-        double y0 = vals[0], y1 = vals[1];
-        double t = (x - x0) / (x1 - x0);
+        const double x0 = grid[0];
+        const double x1 = grid[1];
+        const double y0 = vals[0];
+        const double y1 = vals[1];
+        const double t = (x - x0) / (x1 - x0);
         return y0 + t * (y1 - y0);
     }
     if (x >= grid.back()) {
-        std::size_t n = grid.size();
-        double x0 = grid[n - 2], x1 = grid[n - 1];
-        double y0 = vals[n - 2], y1 = vals[n - 1];
-        double t = (x - x0) / (x1 - x0);
+        const std::size_t n = grid.size();
+        const double x0 = grid[n - 2];
+        const double x1 = grid[n - 1];
+        const double y0 = vals[n - 2];
+        const double y1 = vals[n - 1];
+        const double t = (x - x0) / (x1 - x0);
         return y0 + t * (y1 - y0);
     }
 
-    auto it = std::upper_bound(grid.begin(), grid.end(), x);
-    std::size_t idx = static_cast<std::size_t>(it - grid.begin() - 1);
-    double x0 = grid[idx], x1 = grid[idx + 1];
-    double y0 = vals[idx], y1 = vals[idx + 1];
-    double t = (x - x0) / (x1 - x0);
+    const auto it = std::upper_bound(grid.begin(), grid.end(), x);
+    const std::size_t idx = static_cast<std::size_t>(it - grid.begin() - 1);
+    const double x0 = grid[idx];
+    const double x1 = grid[idx + 1];
+    const double y0 = vals[idx];
+    const double y1 = vals[idx + 1];
+    const double t = (x - x0) / (x1 - x0);
     return y0 + t * (y1 - y0);
 }
 
@@ -81,6 +87,7 @@ inline double interp_linear(
 
 struct FlowCurve {
     virtual ~FlowCurve() = default;
+    virtual double hit_ratio(double delta, double z) const = 0;
     virtual double arrival_rate(double delta, double z) const = 0;
 };
 
@@ -101,9 +108,9 @@ struct InventoryPenalty {
 struct LogisticFlowCurve final : public FlowCurve {
     double A0{1.0};
     double theta{0.0};
-    double k{2.0};
-    double m0{0.2};
-    double m_alpha{0.0};
+    double shift{0.20};
+    double steepness{10.0};
+    double volume_shift{0.05};
     double z_floor{1e-8};
 
     LogisticFlowCurve() = default;
@@ -111,16 +118,16 @@ struct LogisticFlowCurve final : public FlowCurve {
     LogisticFlowCurve(
         double A0_,
         double theta_,
-        double k_,
-        double m0_,
-        double m_alpha_,
+        double shift_,
+        double steepness_,
+        double volume_shift_,
         double z_floor_ = 1e-8
     )
         : A0(A0_),
           theta(theta_),
-          k(k_),
-          m0(m0_),
-          m_alpha(m_alpha_),
+          shift(shift_),
+          steepness(steepness_),
+          volume_shift(volume_shift_),
           z_floor(z_floor_) {}
 
     double A(double z) const {
@@ -128,29 +135,14 @@ struct LogisticFlowCurve final : public FlowCurve {
         return A0 * std::pow(z, -theta);
     }
 
-    double m(double z) const {
-        z = std::max(z, z_floor);
-        return m0 + m_alpha * z;
+    double hit_ratio(double delta, double z) const override {
+        const double x = -(delta - shift + volume_shift * (z - 1.0)) * steepness;
+        const double ex = std::exp(x);
+        return 1.0 / (1.0 + ex);
     }
 
     double arrival_rate(double delta, double z) const override {
-        double Az = A(z);
-        double mz = m(z);
-
-        if (Az < 0.0) {
-            throw std::invalid_argument("A(z) must be nonnegative.");
-        }
-        if (k <= 0.0) {
-            throw std::invalid_argument("k must be positive.");
-        }
-
-        const double x = k * (delta - mz);
-        if (x >= 0.0) {
-            const double ex = std::exp(-x);
-            return Az * ex / (1.0 + ex);
-        }
-        const double ex = std::exp(x);
-        return Az / (1.0 + ex);
+        return A(z) * hit_ratio(delta, z);
     }
 };
 
@@ -246,10 +238,10 @@ struct QuotePolicy {
     }
 
     double quote(double q, double z, const std::string& side) const {
-        const auto& mat = (side == "bid") ? bid : ask;
         if (side != "bid" && side != "ask") {
             throw std::invalid_argument("Unknown side: " + side);
         }
+        const auto& mat = (side == "bid") ? bid : ask;
 
         std::vector<double> vals_by_z(sizes.size(), 0.0);
         for (std::size_t j = 0; j < sizes.size(); ++j) {
@@ -273,8 +265,8 @@ struct PriceTier {
     std::shared_ptr<FlowCurve> flow_curve;
     std::shared_ptr<MarkoutModel> markout_model;
 
-    double delta_min{-0.5};
-    double delta_max{4.0};
+    double delta_min{-5.0};
+    double delta_max{5.0};
     double golden_tol{1e-4};
     int golden_max_iter{32};
 
@@ -287,8 +279,8 @@ struct PriceTier {
         std::vector<double> sizes_,
         std::shared_ptr<FlowCurve> flow_curve_,
         std::shared_ptr<MarkoutModel> markout_model_,
-        double delta_min_ = -0.5,
-        double delta_max_ = 4.0,
+        double delta_min_ = -5.0,
+        double delta_max_ = 5.0,
         double golden_tol_ = 1e-4,
         int golden_max_iter_ = 32
     )
@@ -343,6 +335,7 @@ struct PriceTier {
     }
 
     double single_size_objective(
+        double spread,
         double delta,
         const std::function<double(double)>& h_fn,
         double q,
@@ -353,7 +346,15 @@ struct PriceTier {
         const double dh = h_fn(q_next) - h_fn(q);
         const double lam = arrival_rate(delta, z);
         const double mu = expected_markout(z);
-        return lam * (z * (delta - mu) + dh);
+
+        // Delta is quote improvement measured as a fraction of the reference spread:
+        // ref_bid = mid - 0.5 * spread
+        // ref_ask = mid + 0.5 * spread
+        // bid_quote = ref_bid + spread * delta
+        // ask_quote = ref_ask - spread * delta
+        //
+        // So immediate edge versus mid on either side is spread * (0.5 - delta).
+        return lam * (z * spread * (0.5 - delta) - z * mu + dh);
     }
 
     double golden_search_max(
@@ -415,24 +416,36 @@ struct PriceTier {
         double lower = delta_min;
         double upper = delta_max;
 
+        // Under the current delta convention, larger delta means more aggressive quote
+        // on both sides. To keep larger sizes less aggressive, we enforce
+        //   delta_j <= delta_{j-1}
+        // and define positive rung gaps as
+        //   gap_j = delta_{j-1} - delta_j >= 0.
         std::vector<double> prev_gaps;
         if (prev_delta != nullptr) {
-            prev_gaps = diff(*prev_delta);
+            prev_gaps.resize(prev_delta->size() > 1 ? prev_delta->size() - 1 : 0);
+            for (std::size_t k = 0; k + 1 < prev_delta->size(); ++k) {
+                prev_gaps[k] = (*prev_delta)[k] - (*prev_delta)[k + 1];
+            }
         }
 
         // Smallest rung
         if (rung_idx == 0) {
             if (!prev_gaps.empty() && is_expand_mode(q, side)) {
                 double required_total_gap = 0.0;
-                for (double g : prev_gaps) required_total_gap += g;
-                upper = std::min(upper, delta_max - required_total_gap);
+                for (double g : prev_gaps) {
+                    required_total_gap += g;
+                }
+                // Need enough room below rung 0 to fit all future mandatory gaps.
+                lower = std::max(lower, delta_min + required_total_gap);
             }
             return {lower, upper};
         }
 
-        // Weak monotonicity in size: d_j >= d_{j-1}
         const double prev_curr = current_delta[rung_idx - 1];
-        lower = std::max(lower, prev_curr);
+
+        // Weak monotonicity in size: delta_j <= delta_{j-1}
+        upper = std::min(upper, prev_curr);
 
         if (prev_gaps.empty()) {
             return {lower, upper};
@@ -441,24 +454,28 @@ struct PriceTier {
         const double prev_gap = prev_gaps[rung_idx - 1];
 
         if (is_shrink_mode(q, side)) {
-            // d_j - d_{j-1} <= prev_gap
-            upper = std::min(upper, prev_curr + prev_gap);
-        } else if (is_expand_mode(q, side)) {
-            // d_j - d_{j-1} >= prev_gap
-            lower = std::max(lower, prev_curr + prev_gap);
+            // gap_j = prev_curr - delta_j <= prev_gap
+            // => delta_j >= prev_curr - prev_gap
+            lower = std::max(lower, prev_curr - prev_gap);
 
-            // Reserve room for future mandatory gaps
+        } else if (is_expand_mode(q, side)) {
+            // gap_j = prev_curr - delta_j >= prev_gap
+            // => delta_j <= prev_curr - prev_gap
+            upper = std::min(upper, prev_curr - prev_gap);
+
+            // Reserve room for future mandatory gaps toward delta_min.
             double remaining_future_gap = 0.0;
             for (std::size_t k = rung_idx; k + 1 < n; ++k) {
                 remaining_future_gap += prev_gaps[k];
             }
-            upper = std::min(upper, delta_max - remaining_future_gap);
+            lower = std::max(lower, delta_min + remaining_future_gap);
         }
 
         return {lower, upper};
     }
 
     std::vector<double> solve_side_ladder(
+        double spread,
         const std::function<double(double)>& h_fn,
         double q,
         const std::string& side,
@@ -483,7 +500,7 @@ struct PriceTier {
 
             const double z = sizes[j];
             auto obj = [&](double d) {
-                return single_size_objective(d, h_fn, q, z, side);
+                return single_size_objective(spread, d, h_fn, q, z, side);
             };
 
             delta[j] = golden_search_max(obj, lower, upper);
@@ -494,6 +511,7 @@ struct PriceTier {
     }
 
     QuotePolicy build_policy(
+        double spread,
         const std::function<double(double)>& h_fn,
         const std::vector<double>& q_grid
     ) {
@@ -514,21 +532,19 @@ struct PriceTier {
         }
 
         const double q0 = q_grid[q0_idx];
-        ask[q0_idx] = solve_side_ladder(h_fn, q0, "ask", nullptr);
-        bid[q0_idx] = solve_side_ladder(h_fn, q0, "bid", nullptr);
+        ask[q0_idx] = solve_side_ladder(spread, h_fn, q0, "ask", nullptr);
+        bid[q0_idx] = solve_side_ladder(spread, h_fn, q0, "bid", nullptr);
 
-        // q > 0 outward
         for (std::size_t i = q0_idx + 1; i < nq; ++i) {
             const double q = q_grid[i];
-            ask[i] = solve_side_ladder(h_fn, q, "ask", &ask[i - 1]);
-            bid[i] = solve_side_ladder(h_fn, q, "bid", &bid[i - 1]);
+            ask[i] = solve_side_ladder(spread, h_fn, q, "ask", &ask[i - 1]);
+            bid[i] = solve_side_ladder(spread, h_fn, q, "bid", &bid[i - 1]);
         }
 
-        // q < 0 outward
         for (std::size_t ii = q0_idx; ii-- > 0;) {
             const double q = q_grid[ii];
-            ask[ii] = solve_side_ladder(h_fn, q, "ask", &ask[ii + 1]);
-            bid[ii] = solve_side_ladder(h_fn, q, "bid", &bid[ii + 1]);
+            ask[ii] = solve_side_ladder(spread, h_fn, q, "ask", &ask[ii + 1]);
+            bid[ii] = solve_side_ladder(spread, h_fn, q, "bid", &bid[ii + 1]);
         }
 
         policy = QuotePolicy(q_grid, sizes, bid, ask);
@@ -554,6 +570,14 @@ struct SolverConfig {
     // In the reduced inventory-only HJB this contributes + spot_drift * q
     double spot_drift{0.0};
 
+    // Reference spread used to define:
+    //   ref_ask = mid + 0.5 * spread
+    //   ref_bid = mid - 0.5 * spread
+    // and quote improvement delta:
+    //   bid_quote = ref_bid + spread * delta
+    //   ask_quote = ref_ask - spread * delta
+    double spread{20.0 / 10000.0};
+
     bool early_stop{true};
     double tol_h{1e-5};
     double tol_rhs{1e-4};
@@ -569,6 +593,9 @@ struct SolverConfig {
         }
         if (n_iter < 1) {
             throw std::invalid_argument("SolverConfig: n_iter must be at least 1.");
+        }
+        if (spread <= 0.0) {
+            throw std::invalid_argument("SolverConfig: spread must be positive.");
         }
         if (tol_h < 0.0 || tol_rhs < 0.0) {
             throw std::invalid_argument("SolverConfig: tolerances must be nonnegative.");
@@ -622,7 +649,7 @@ struct HJBLadderSolver {
     void update_policies(const std::vector<double>& h_vec) {
         auto h_fn = make_h_interp(h_vec);
         for (auto& tier : tiers) {
-            tier->build_policy(h_fn, config.q_grid);
+            tier->build_policy(config.spread, h_fn, config.q_grid);
         }
     }
 
@@ -633,7 +660,6 @@ struct HJBLadderSolver {
         for (std::size_t i = 0; i < config.q_grid.size(); ++i) {
             const double q = config.q_grid[i];
 
-            // Constant spot drift contribution in reduced HJB
             double val = -penalty->value(q) + config.spot_drift * q;
 
             for (const auto& tier : tiers) {
@@ -644,12 +670,12 @@ struct HJBLadderSolver {
                     const double d_b = tier->policy.delta_at_index(i, j, "bid");
                     const double qpb = h_fn(q + z) - h_fn(q);
                     const double lam_b = tier->arrival_rate(d_b, z);
-                    val += lam_b * (z * (d_b - mu) + qpb);
+                    val += lam_b * (config.spread * z * (0.5 - d_b) - z * mu + qpb);
 
                     const double d_a = tier->policy.delta_at_index(i, j, "ask");
                     const double qpa = h_fn(q - z) - h_fn(q);
                     const double lam_a = tier->arrival_rate(d_a, z);
-                    val += lam_a * (z * (d_a - mu) + qpa);
+                    val += lam_a * (config.spread * z * (0.5 - d_a) - z * mu + qpa);
                 }
             }
 
