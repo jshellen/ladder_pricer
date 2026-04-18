@@ -244,7 +244,12 @@ def make_flow_parameter_table(spec: TierSpec, cpp_tier: lp.PriceTier) -> pd.Data
     return pd.DataFrame(rows)
 
 
-def make_quote_inventory_figure(cpp_tier: lp.PriceTier, spec: TierSpec, spread: float) -> go.Figure:
+def make_quote_inventory_figure(
+    cpp_tier: lp.PriceTier,
+    spec: TierSpec,
+    spread: float,
+    mid_price: float,
+) -> go.Figure:
     q_grid = [float(q) for q in cpp_tier.policy.q_grid]
 
     fig = go.Figure()
@@ -252,11 +257,11 @@ def make_quote_inventory_figure(cpp_tier: lp.PriceTier, spec: TierSpec, spread: 
         zf = float(z)
 
         bid_vals = [
-            float(cpp_tier.quote_relative_to_mid_pips(float(q), zf, "bid", float(spread)))
+            float(cpp_tier.quote_summary(float(q), zf, "bid", float(mid_price), float(spread)).quote_relative_to_mid_pips)
             for q in q_grid
         ]
         ask_vals = [
-            float(cpp_tier.quote_relative_to_mid_pips(float(q), zf, "ask", float(spread)))
+            float(cpp_tier.quote_summary(float(q), zf, "ask", float(mid_price), float(spread)).quote_relative_to_mid_pips)
             for q in q_grid
         ]
 
@@ -288,15 +293,21 @@ def make_quote_inventory_figure(cpp_tier: lp.PriceTier, spec: TierSpec, spread: 
     return fig
 
 
-def make_ladder_figure(cpp_tier: lp.PriceTier, spec: TierSpec, q: float, spread: float) -> go.Figure:
+def make_ladder_figure(
+    cpp_tier: lp.PriceTier,
+    spec: TierSpec,
+    q: float,
+    spread: float,
+    mid_price: float,
+) -> go.Figure:
     sizes = [float(z) for z in spec.sizes]
 
     bid_vp = [
-        float(cpp_tier.volume_premium_pips(float(q), z, "bid", float(spread)))
+        float(cpp_tier.quote_summary(float(q), z, "bid", float(mid_price), float(spread)).volume_premium_pips)
         for z in sizes
     ]
     ask_vp = [
-        float(cpp_tier.volume_premium_pips(float(q), z, "ask", float(spread)))
+        float(cpp_tier.quote_summary(float(q), z, "ask", float(mid_price), float(spread)).volume_premium_pips)
         for z in sizes
     ]
 
@@ -365,46 +376,27 @@ def make_q_ladder_table(
 
     for z in spec.sizes:
         zf = float(z)
-
-        bid_delta = float(cpp_tier.quote(float(q), zf, "bid"))
-        ask_delta = float(cpp_tier.quote(float(q), zf, "ask"))
+        bid = cpp_tier.quote_summary(float(q), zf, "bid", float(mid_price), float(spread))
+        ask = cpp_tier.quote_summary(float(q), zf, "ask", float(mid_price), float(spread))
 
         rows.append(
             {
                 "q": float(q),
                 "z": zf,
-                "Bid delta [% of spread]": round(100.0 * bid_delta, 2),
-                "Ask delta [% of spread]": round(100.0 * ask_delta, 2),
-                "Bid improvement [pips]": round(
-                    float(cpp_tier.price_improvement_pips(float(q), zf, "bid", float(spread))), 3
-                ),
-                "Ask improvement [pips]": round(
-                    float(cpp_tier.price_improvement_pips(float(q), zf, "ask", float(spread))), 3
-                ),
-                "Bid vs mid [pips]": round(
-                    float(cpp_tier.quote_relative_to_mid_pips(float(q), zf, "bid", float(spread))), 3
-                ),
-                "Ask vs mid [pips]": round(
-                    float(cpp_tier.quote_relative_to_mid_pips(float(q), zf, "ask", float(spread))), 3
-                ),
-                "Bid dist to mid [pips]": round(
-                    float(cpp_tier.distance_to_mid_pips(float(q), zf, "bid", float(spread))), 3
-                ),
-                "Ask dist to mid [pips]": round(
-                    float(cpp_tier.distance_to_mid_pips(float(q), zf, "ask", float(spread))), 3
-                ),
-                "Bid vol premium [pips]": round(
-                    float(cpp_tier.volume_premium_pips(float(q), zf, "bid", float(spread))), 3
-                ),
-                "Ask vol premium [pips]": round(
-                    float(cpp_tier.volume_premium_pips(float(q), zf, "ask", float(spread))), 3
-                ),
-                "Bid quote": round(
-                    float(cpp_tier.quote_price(float(q), zf, "bid", float(mid_price), float(spread))), 6
-                ),
-                "Ask quote": round(
-                    float(cpp_tier.quote_price(float(q), zf, "ask", float(mid_price), float(spread))), 6
-                ),
+                "Bid delta": round(float(bid.delta), 6),
+                "Ask delta": round(float(ask.delta), 6),
+                "Bid improvement [% of spread]": round(float(bid.price_improvement_pct_of_spread), 2),
+                "Ask improvement [% of spread]": round(float(ask.price_improvement_pct_of_spread), 2),
+                "Bid improvement [pips]": round(float(bid.price_improvement_pips), 3),
+                "Ask improvement [pips]": round(float(ask.price_improvement_pips), 3),
+                "Bid vs mid [pips]": round(float(bid.quote_relative_to_mid_pips), 3),
+                "Ask vs mid [pips]": round(float(ask.quote_relative_to_mid_pips), 3),
+                "Bid dist to mid [pips]": round(float(bid.distance_to_mid_pips), 3),
+                "Ask dist to mid [pips]": round(float(ask.distance_to_mid_pips), 3),
+                "Bid vol premium [pips]": round(float(bid.volume_premium_pips), 3),
+                "Ask vol premium [pips]": round(float(ask.volume_premium_pips), 3),
+                "Bid quote": round(float(bid.quote_price), 6),
+                "Ask quote": round(float(ask.quote_price), 6),
             }
         )
 
@@ -514,7 +506,7 @@ with st.sidebar:
         value=1.000000,
         step=0.000100,
         format="%.6f",
-        help="Used only when displaying absolute bid/ask quotes in the ladder table.",
+        help="Used only when displaying absolute bid/ask quotes in the ladder table and charts.",
     )
 
     st.header("Spot process")
@@ -666,7 +658,7 @@ for tab, spec, cpp_tier in zip(tabs, tier_specs, solution.tiers):
         )
 
         st.plotly_chart(
-            make_quote_inventory_figure(cpp_tier, spec, float(config.spread)),
+            make_quote_inventory_figure(cpp_tier, spec, float(config.spread), float(mid_price)),
             use_container_width=True,
         )
 
@@ -680,7 +672,7 @@ for tab, spec, cpp_tier in zip(tabs, tier_specs, solution.tiers):
         )
 
         st.plotly_chart(
-            make_ladder_figure(cpp_tier, spec, float(q_for_ladder), float(config.spread)),
+            make_ladder_figure(cpp_tier, spec, float(q_for_ladder), float(config.spread), float(mid_price)),
             use_container_width=True,
         )
 
@@ -741,7 +733,7 @@ $$
 |\text{quote} - \text{mid}| = s(0.5 - \delta)
 $$
 
-under the normal regime \(\delta \le 0.5\). In the app, these quantities are shown in pips using the convenience methods exposed by the C++ policy object.
+under the normal regime \(\delta \le 0.5\). In the app, these quantities are shown via the `QuoteSummary` object returned by the C++ layer.
 
 For each inventory point \(q\), the Bellman right-hand side is
 

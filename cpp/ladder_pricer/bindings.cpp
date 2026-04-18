@@ -33,14 +33,11 @@ QuotePolicy build_policy_for_tier(
         );
     }
 
-    LinearInterpolator1D h_view{&config.q_grid, &h_vec};
-    RungBuilder builder(
-        tier,
-        config.spread,
-        config.golden_tol,
-        config.golden_max_iter,
-        h_view
-    );
+    const LinearInterpolator1D h_view{&config.q_grid, &h_vec};
+    const GoldenSectionSearch optimizer(config.golden_tol, config.golden_max_iter);
+    const LadderBoundsPolicy bounds_policy(tier.delta_min, tier.delta_max);
+    TierPolicyBuilder builder(tier, config.spread, optimizer, bounds_policy);
+    builder.set_h_view(config.q_grid, h_vec);
 
     QuotePolicy policy;
     policy.reset_shape(config.q_grid, tier.sizes);
@@ -62,14 +59,11 @@ void build_policy_inplace_for_tier(
         );
     }
 
-    LinearInterpolator1D h_view{&config.q_grid, &h_vec};
-    RungBuilder builder(
-        tier,
-        config.spread,
-        config.golden_tol,
-        config.golden_max_iter,
-        h_view
-    );
+    const LinearInterpolator1D h_view{&config.q_grid, &h_vec};
+    const GoldenSectionSearch optimizer(config.golden_tol, config.golden_max_iter);
+    const LadderBoundsPolicy bounds_policy(tier.delta_min, tier.delta_max);
+    TierPolicyBuilder builder(tier, config.spread, optimizer, bounds_policy);
+    builder.set_h_view(config.q_grid, h_vec);
 
     tier.policy.reset_shape(config.q_grid, tier.sizes);
     builder.build_policy_inplace(tier.policy);
@@ -149,6 +143,20 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("quartic_coeff", &PolynomialInventoryPenalty::quartic_coeff)
         .def("value", &PolynomialInventoryPenalty::value);
 
+    py::class_<QuoteSummary>(m, "QuoteSummary")
+        .def(py::init<>())
+        .def_readwrite("delta", &QuoteSummary::delta)
+        .def_readwrite("price_improvement_frac", &QuoteSummary::price_improvement_frac)
+        .def_readwrite("price_improvement_pct_of_spread", &QuoteSummary::price_improvement_pct_of_spread)
+        .def_readwrite("price_improvement_pips", &QuoteSummary::price_improvement_pips)
+        .def_readwrite("quote_relative_to_mid", &QuoteSummary::quote_relative_to_mid)
+        .def_readwrite("quote_relative_to_mid_pips", &QuoteSummary::quote_relative_to_mid_pips)
+        .def_readwrite("distance_to_mid", &QuoteSummary::distance_to_mid)
+        .def_readwrite("distance_to_mid_pips", &QuoteSummary::distance_to_mid_pips)
+        .def_readwrite("reference_delta", &QuoteSummary::reference_delta)
+        .def_readwrite("volume_premium_pips", &QuoteSummary::volume_premium_pips)
+        .def_readwrite("quote_price", &QuoteSummary::quote_price);
+
     py::class_<QuotePolicy>(m, "QuotePolicy")
         .def(py::init<>())
         .def(
@@ -164,7 +172,6 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("ask", &QuotePolicy::ask)
         .def("validate", &QuotePolicy::validate)
         .def("reset_shape", &QuotePolicy::reset_shape, py::arg("q_grid"), py::arg("sizes"))
-
         .def(
             "delta_at_index",
             [](const QuotePolicy& self, std::size_t i, std::size_t j, Side side) {
@@ -183,40 +190,22 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("j"),
             py::arg("side")
         )
-
         .def(
-            "quote",
+            "delta",
             [](const QuotePolicy& self, double q, double z, Side side) {
-                return self.quote(q, z, side);
+                return self.delta(q, z, side);
             },
             py::arg("q"),
             py::arg("z"),
             py::arg("side")
         )
         .def(
-            "quote",
+            "delta",
             [](const QuotePolicy& self, double q, double z, const std::string& side) {
-                return self.quote(q, z, parse_side(side));
+                return self.delta(q, z, parse_side(side));
             },
             py::arg("q"),
             py::arg("z"),
-            py::arg("side")
-        )
-
-        .def(
-            "reference_delta_at_index",
-            [](const QuotePolicy& self, std::size_t i, Side side) {
-                return self.reference_delta_at_index(i, side);
-            },
-            py::arg("i"),
-            py::arg("side")
-        )
-        .def(
-            "reference_delta_at_index",
-            [](const QuotePolicy& self, std::size_t i, const std::string& side) {
-                return self.reference_delta_at_index(i, parse_side(side));
-            },
-            py::arg("i"),
             py::arg("side")
         )
         .def(
@@ -235,255 +224,10 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("q"),
             py::arg("side")
         )
-
-        .def_static(
-            "price_improvement_pips_from_delta",
-            &QuotePolicy::price_improvement_pips_from_delta,
-            py::arg("delta"),
-            py::arg("spread")
-        )
-        .def_static(
-            "quote_relative_to_mid_pips_from_delta",
-            [](double delta, Side side, double spread) {
-                return QuotePolicy::quote_relative_to_mid_pips_from_delta(delta, side, spread);
-            },
-            py::arg("delta"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-        .def_static(
-            "quote_relative_to_mid_pips_from_delta",
-            [](double delta, const std::string& side, double spread) {
-                return QuotePolicy::quote_relative_to_mid_pips_from_delta(
-                    delta, parse_side(side), spread
-                );
-            },
-            py::arg("delta"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-        .def_static(
-            "distance_to_mid_pips_from_delta",
-            &QuotePolicy::distance_to_mid_pips_from_delta,
-            py::arg("delta"),
-            py::arg("spread")
-        )
-        .def_static(
-            "quote_price_from_delta",
-            [](double mid, double delta, Side side, double spread) {
-                return QuotePolicy::quote_price_from_delta(mid, delta, side, spread);
-            },
-            py::arg("mid"),
-            py::arg("delta"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-        .def_static(
-            "quote_price_from_delta",
-            [](double mid, double delta, const std::string& side, double spread) {
-                return QuotePolicy::quote_price_from_delta(mid, delta, parse_side(side), spread);
-            },
-            py::arg("mid"),
-            py::arg("delta"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-
         .def(
-            "price_improvement_pips_at_index",
-            [](const QuotePolicy& self, std::size_t i, std::size_t j, Side side, double spread) {
-                return self.price_improvement_pips_at_index(i, j, side, spread);
-            },
-            py::arg("i"),
-            py::arg("j"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-        .def(
-            "price_improvement_pips_at_index",
-            [](const QuotePolicy& self, std::size_t i, std::size_t j, const std::string& side, double spread) {
-                return self.price_improvement_pips_at_index(i, j, parse_side(side), spread);
-            },
-            py::arg("i"),
-            py::arg("j"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-
-        .def(
-            "quote_relative_to_mid_pips_at_index",
-            [](const QuotePolicy& self, std::size_t i, std::size_t j, Side side, double spread) {
-                return self.quote_relative_to_mid_pips_at_index(i, j, side, spread);
-            },
-            py::arg("i"),
-            py::arg("j"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-        .def(
-            "quote_relative_to_mid_pips_at_index",
-            [](const QuotePolicy& self, std::size_t i, std::size_t j, const std::string& side, double spread) {
-                return self.quote_relative_to_mid_pips_at_index(i, j, parse_side(side), spread);
-            },
-            py::arg("i"),
-            py::arg("j"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-
-        .def(
-            "distance_to_mid_pips_at_index",
-            [](const QuotePolicy& self, std::size_t i, std::size_t j, Side side, double spread) {
-                return self.distance_to_mid_pips_at_index(i, j, side, spread);
-            },
-            py::arg("i"),
-            py::arg("j"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-        .def(
-            "distance_to_mid_pips_at_index",
-            [](const QuotePolicy& self, std::size_t i, std::size_t j, const std::string& side, double spread) {
-                return self.distance_to_mid_pips_at_index(i, j, parse_side(side), spread);
-            },
-            py::arg("i"),
-            py::arg("j"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-
-        .def(
-            "volume_premium_pips_at_index",
-            [](const QuotePolicy& self, std::size_t i, std::size_t j, Side side, double spread) {
-                return self.volume_premium_pips_at_index(i, j, side, spread);
-            },
-            py::arg("i"),
-            py::arg("j"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-        .def(
-            "volume_premium_pips_at_index",
-            [](const QuotePolicy& self, std::size_t i, std::size_t j, const std::string& side, double spread) {
-                return self.volume_premium_pips_at_index(i, j, parse_side(side), spread);
-            },
-            py::arg("i"),
-            py::arg("j"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-
-        .def(
-            "quote_price_at_index",
-            [](const QuotePolicy& self, std::size_t i, std::size_t j, Side side, double mid, double spread) {
-                return self.quote_price_at_index(i, j, side, mid, spread);
-            },
-            py::arg("i"),
-            py::arg("j"),
-            py::arg("side"),
-            py::arg("mid"),
-            py::arg("spread")
-        )
-        .def(
-            "quote_price_at_index",
-            [](const QuotePolicy& self, std::size_t i, std::size_t j, const std::string& side, double mid, double spread) {
-                return self.quote_price_at_index(i, j, parse_side(side), mid, spread);
-            },
-            py::arg("i"),
-            py::arg("j"),
-            py::arg("side"),
-            py::arg("mid"),
-            py::arg("spread")
-        )
-
-        .def(
-            "price_improvement_pips",
-            [](const QuotePolicy& self, double q, double z, Side side, double spread) {
-                return self.price_improvement_pips(q, z, side, spread);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-        .def(
-            "price_improvement_pips",
-            [](const QuotePolicy& self, double q, double z, const std::string& side, double spread) {
-                return self.price_improvement_pips(q, z, parse_side(side), spread);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-
-        .def(
-            "quote_relative_to_mid_pips",
-            [](const QuotePolicy& self, double q, double z, Side side, double spread) {
-                return self.quote_relative_to_mid_pips(q, z, side, spread);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-        .def(
-            "quote_relative_to_mid_pips",
-            [](const QuotePolicy& self, double q, double z, const std::string& side, double spread) {
-                return self.quote_relative_to_mid_pips(q, z, parse_side(side), spread);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-
-        .def(
-            "distance_to_mid_pips",
-            [](const QuotePolicy& self, double q, double z, Side side, double spread) {
-                return self.distance_to_mid_pips(q, z, side, spread);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-        .def(
-            "distance_to_mid_pips",
-            [](const QuotePolicy& self, double q, double z, const std::string& side, double spread) {
-                return self.distance_to_mid_pips(q, z, parse_side(side), spread);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-
-        .def(
-            "volume_premium_pips",
-            [](const QuotePolicy& self, double q, double z, Side side, double spread) {
-                return self.volume_premium_pips(q, z, side, spread);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-        .def(
-            "volume_premium_pips",
-            [](const QuotePolicy& self, double q, double z, const std::string& side, double spread) {
-                return self.volume_premium_pips(q, z, parse_side(side), spread);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-
-        .def(
-            "quote_price",
+            "quote_summary",
             [](const QuotePolicy& self, double q, double z, Side side, double mid, double spread) {
-                return self.quote_price(q, z, side, mid, spread);
+                return self.quote_summary(q, z, side, mid, spread);
             },
             py::arg("q"),
             py::arg("z"),
@@ -492,9 +236,9 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("spread")
         )
         .def(
-            "quote_price",
+            "quote_summary",
             [](const QuotePolicy& self, double q, double z, const std::string& side, double mid, double spread) {
-                return self.quote_price(q, z, parse_side(side), mid, spread);
+                return self.quote_summary(q, z, parse_side(side), mid, spread);
             },
             py::arg("q"),
             py::arg("z"),
@@ -531,7 +275,6 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def("validate", &PriceTier::validate)
         .def("arrival_rate", &PriceTier::arrival_rate, py::arg("delta"), py::arg("z"))
         .def("expected_markout", &PriceTier::expected_markout, py::arg("z"))
-
         .def(
             "quote",
             [](const PriceTier& self, double q, double z, Side side) {
@@ -550,11 +293,10 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("z"),
             py::arg("side")
         )
-
         .def(
-            "quote_price",
+            "quote_summary",
             [](const PriceTier& self, double q, double z, Side side, double mid, double spread) {
-                return self.quote_price(q, z, side, mid, spread);
+                return self.quote_summary(q, z, side, mid, spread);
             },
             py::arg("q"),
             py::arg("z"),
@@ -563,98 +305,14 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("spread")
         )
         .def(
-            "quote_price",
+            "quote_summary",
             [](const PriceTier& self, double q, double z, const std::string& side, double mid, double spread) {
-                return self.quote_price(q, z, parse_side(side), mid, spread);
+                return self.quote_summary(q, z, parse_side(side), mid, spread);
             },
             py::arg("q"),
             py::arg("z"),
             py::arg("side"),
             py::arg("mid"),
-            py::arg("spread")
-        )
-
-        .def(
-            "price_improvement_pips",
-            [](const PriceTier& self, double q, double z, Side side, double spread) {
-                return self.price_improvement_pips(q, z, side, spread);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-        .def(
-            "price_improvement_pips",
-            [](const PriceTier& self, double q, double z, const std::string& side, double spread) {
-                return self.price_improvement_pips(q, z, parse_side(side), spread);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-
-        .def(
-            "quote_relative_to_mid_pips",
-            [](const PriceTier& self, double q, double z, Side side, double spread) {
-                return self.quote_relative_to_mid_pips(q, z, side, spread);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-        .def(
-            "quote_relative_to_mid_pips",
-            [](const PriceTier& self, double q, double z, const std::string& side, double spread) {
-                return self.quote_relative_to_mid_pips(q, z, parse_side(side), spread);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-
-        .def(
-            "distance_to_mid_pips",
-            [](const PriceTier& self, double q, double z, Side side, double spread) {
-                return self.distance_to_mid_pips(q, z, side, spread);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-        .def(
-            "distance_to_mid_pips",
-            [](const PriceTier& self, double q, double z, const std::string& side, double spread) {
-                return self.distance_to_mid_pips(q, z, parse_side(side), spread);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-
-        .def(
-            "volume_premium_pips",
-            [](const PriceTier& self, double q, double z, Side side, double spread) {
-                return self.volume_premium_pips(q, z, side, spread);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side"),
-            py::arg("spread")
-        )
-        .def(
-            "volume_premium_pips",
-            [](const PriceTier& self, double q, double z, const std::string& side, double spread) {
-                return self.volume_premium_pips(q, z, parse_side(side), spread);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side"),
             py::arg("spread")
         );
 
@@ -673,6 +331,22 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("min_iter", &SolverConfig::min_iter)
         .def_readwrite("consecutive_passes_required", &SolverConfig::consecutive_passes_required)
         .def("validate", &SolverConfig::validate);
+
+    py::class_<GoldenSectionSearch>(m, "GoldenSectionSearch")
+        .def(py::init<>())
+        .def(py::init<double, int>(), py::arg("tol"), py::arg("max_iter"))
+        .def_readwrite("tol", &GoldenSectionSearch::tol)
+        .def_readwrite("max_iter", &GoldenSectionSearch::max_iter)
+        .def("validate", &GoldenSectionSearch::validate);
+
+    py::class_<LadderBoundsPolicy>(m, "LadderBoundsPolicy")
+        .def(py::init<>())
+        .def(py::init<double, double>(), py::arg("delta_min"), py::arg("delta_max"))
+        .def_readwrite("delta_min", &LadderBoundsPolicy::delta_min)
+        .def_readwrite("delta_max", &LadderBoundsPolicy::delta_max)
+        .def("validate", &LadderBoundsPolicy::validate)
+        .def_static("is_shrink_mode", &LadderBoundsPolicy::is_shrink_mode, py::arg("q"), py::arg("side"))
+        .def_static("is_expand_mode", &LadderBoundsPolicy::is_expand_mode, py::arg("q"), py::arg("side"));
 
     py::class_<SolverDiagnostics>(m, "SolverDiagnostics")
         .def(py::init<>())
@@ -721,12 +395,11 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("config", &HJBLadderSolver::config)
         .def_readwrite("penalty", &HJBLadderSolver::penalty)
         .def_readwrite("tiers", &HJBLadderSolver::tiers)
-        .def("update_policies", &HJBLadderSolver::update_policies, py::arg("h_vec"))
         .def(
             "bellman_rhs_from_policies",
             [](const HJBLadderSolver& self, const std::vector<double>& h_vec) {
                 std::vector<double> rhs;
-                self.bellman_rhs_from_policies(h_vec, rhs);
+                self.bellman_rhs_from_policies_unchecked(h_vec, rhs);
                 return rhs;
             },
             py::arg("h_vec")

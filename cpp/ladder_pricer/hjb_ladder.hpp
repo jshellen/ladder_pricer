@@ -232,16 +232,101 @@ struct LinearInterpolator1D {
 };
 
 // ============================================================
+// Quote analytics
+// ============================================================
+
+struct QuoteSummary {
+    double delta{0.0};
+
+    double price_improvement_frac{0.0};
+    double price_improvement_pct_of_spread{0.0};
+    double price_improvement_pips{0.0};
+
+    double quote_relative_to_mid{0.0};
+    double quote_relative_to_mid_pips{0.0};
+
+    double distance_to_mid{0.0};
+    double distance_to_mid_pips{0.0};
+
+    double reference_delta{0.0};
+    double volume_premium_pips{0.0};
+
+    double quote_price{0.0};
+};
+
+struct QuoteMetrics {
+    static constexpr double pips_per_unit = 10000.0;
+
+    static double price_improvement(double delta, double spread) {
+        return spread * delta;
+    }
+
+    static double price_improvement_pct_of_spread(double delta) {
+        return 100.0 * delta;
+    }
+
+    static double price_improvement_pips(double delta, double spread) {
+        return pips_per_unit * price_improvement(delta, spread);
+    }
+
+    static double quote_relative_to_mid(double delta, Side side, double spread) {
+        return side == Side::Bid
+            ? spread * (delta - 0.5)
+            : spread * (0.5 - delta);
+    }
+
+    static double quote_relative_to_mid_pips(double delta, Side side, double spread) {
+        return pips_per_unit * quote_relative_to_mid(delta, side, spread);
+    }
+
+    static double distance_to_mid(double delta, double spread) {
+        return std::abs(spread * (0.5 - delta));
+    }
+
+    static double distance_to_mid_pips(double delta, double spread) {
+        return pips_per_unit * distance_to_mid(delta, spread);
+    }
+
+    static double volume_premium_pips(double delta_ref, double delta_cur, double spread) {
+        return pips_per_unit * spread * (delta_ref - delta_cur);
+    }
+
+    static double quote_price(double mid, double delta, Side side, double spread) {
+        return mid + quote_relative_to_mid(delta, side, spread);
+    }
+
+    static QuoteSummary make_summary(
+        double delta,
+        double delta_ref,
+        Side side,
+        double mid,
+        double spread
+    ) {
+        QuoteSummary out;
+        out.delta = delta;
+        out.price_improvement_frac = price_improvement(delta, spread);
+        out.price_improvement_pct_of_spread = price_improvement_pct_of_spread(delta);
+        out.price_improvement_pips = price_improvement_pips(delta, spread);
+        out.quote_relative_to_mid = quote_relative_to_mid(delta, side, spread);
+        out.quote_relative_to_mid_pips = quote_relative_to_mid_pips(delta, side, spread);
+        out.distance_to_mid = distance_to_mid(delta, spread);
+        out.distance_to_mid_pips = distance_to_mid_pips(delta, spread);
+        out.reference_delta = delta_ref;
+        out.volume_premium_pips = volume_premium_pips(delta_ref, delta, spread);
+        out.quote_price = quote_price(mid, delta, side, spread);
+        return out;
+    }
+};
+
+// ============================================================
 // Quote policy
 // ============================================================
 
 struct QuotePolicy {
-    static constexpr double pips_per_unit = 10000.0;
-
     std::vector<double> q_grid;
     std::vector<double> sizes;
-    Matrix bid;  // nq x nz
-    Matrix ask;  // nq x nz
+    Matrix bid;
+    Matrix ask;
 
     QuotePolicy() = default;
 
@@ -318,7 +403,7 @@ struct QuotePolicy {
         return mat[i][j] + tq * (mat[i + 1][j] - mat[i][j]);
     }
 
-    double quote(double q, double z, Side side) const {
+    double delta(double q, double z, Side side) const {
         const Matrix& mat = matrix(side);
 
         if (sizes.size() == 1) {
@@ -331,158 +416,28 @@ struct QuotePolicy {
         return v0 + tz * (v1 - v0);
     }
 
-    static double price_improvement(double delta, double spread) {
-        return spread * delta;
-    }
-
-    static double price_improvement_pips_from_delta(double delta, double spread) {
-        return pips_per_unit * price_improvement(delta, spread);
-    }
-
-    static double quote_relative_to_mid(double delta, Side side, double spread) {
-        return side == Side::Bid
-            ? spread * (delta - 0.5)
-            : spread * (0.5 - delta);
-    }
-
-    static double quote_relative_to_mid_pips_from_delta(
-        double delta,
-        Side side,
-        double spread
-    ) {
-        return pips_per_unit * quote_relative_to_mid(delta, side, spread);
-    }
-
-    static double distance_to_mid(double delta, double spread) {
-        return std::abs(spread * (0.5 - delta));
-    }
-
-    static double distance_to_mid_pips_from_delta(double delta, double spread) {
-        return pips_per_unit * distance_to_mid(delta, spread);
-    }
-
-    static double quote_price_from_delta(
-        double mid,
-        double delta,
-        Side side,
-        double spread
-    ) {
-        return mid + quote_relative_to_mid(delta, side, spread);
-    }
-
-    double reference_delta_at_index(std::size_t i, Side side) const {
-        if (sizes.empty()) {
-            throw std::runtime_error("QuotePolicy::reference_delta_at_index: no sizes available.");
-        }
-        return delta_at_index(i, 0, side);
-    }
-
     double reference_delta(double q, Side side) const {
         if (sizes.empty()) {
             throw std::runtime_error("QuotePolicy::reference_delta: no sizes available.");
         }
-        return quote(q, sizes.front(), side);
+        return delta(q, sizes.front(), side);
     }
 
-    double price_improvement_pips_at_index(
-        std::size_t i,
-        std::size_t j,
-        Side side,
-        double spread
-    ) const {
-        return price_improvement_pips_from_delta(delta_at_index(i, j, side), spread);
-    }
-
-    double quote_relative_to_mid_pips_at_index(
-        std::size_t i,
-        std::size_t j,
-        Side side,
-        double spread
-    ) const {
-        return quote_relative_to_mid_pips_from_delta(delta_at_index(i, j, side), side, spread);
-    }
-
-    double distance_to_mid_pips_at_index(
-        std::size_t i,
-        std::size_t j,
-        Side side,
-        double spread
-    ) const {
-        return distance_to_mid_pips_from_delta(delta_at_index(i, j, side), spread);
-    }
-
-    double volume_premium_pips_at_index(
-        std::size_t i,
-        std::size_t j,
-        Side side,
-        double spread
-    ) const {
-        const double delta_ref = reference_delta_at_index(i, side);
-        const double delta_cur = delta_at_index(i, j, side);
-        return pips_per_unit * spread * (delta_ref - delta_cur);
-    }
-
-    double quote_price_at_index(
-        std::size_t i,
-        std::size_t j,
-        Side side,
-        double mid,
-        double spread
-    ) const {
-        return quote_price_from_delta(mid, delta_at_index(i, j, side), side, spread);
-    }
-
-    double price_improvement_pips(
-        double q,
-        double z,
-        Side side,
-        double spread
-    ) const {
-        return price_improvement_pips_from_delta(quote(q, z, side), spread);
-    }
-
-    double quote_relative_to_mid_pips(
-        double q,
-        double z,
-        Side side,
-        double spread
-    ) const {
-        return quote_relative_to_mid_pips_from_delta(quote(q, z, side), side, spread);
-    }
-
-    double distance_to_mid_pips(
-        double q,
-        double z,
-        Side side,
-        double spread
-    ) const {
-        return distance_to_mid_pips_from_delta(quote(q, z, side), spread);
-    }
-
-    double volume_premium_pips(
-        double q,
-        double z,
-        Side side,
-        double spread
-    ) const {
-        const double delta_ref = reference_delta(q, side);
-        const double delta_cur = quote(q, z, side);
-        return pips_per_unit * spread * (delta_ref - delta_cur);
-    }
-
-    double quote_price(
+    QuoteSummary quote_summary(
         double q,
         double z,
         Side side,
         double mid,
         double spread
     ) const {
-        return quote_price_from_delta(mid, quote(q, z, side), side, spread);
+        const double d = delta(q, z, side);
+        const double d_ref = reference_delta(q, side);
+        return QuoteMetrics::make_summary(d, d_ref, side, mid, spread);
     }
 };
 
 // ============================================================
-// Price tier: data + policy
+// Price tier
 // ============================================================
 
 struct PriceTier {
@@ -543,27 +498,17 @@ struct PriceTier {
     }
 
     double quote(double q, double z, Side side) const {
-        return policy.quote(q, z, side);
+        return policy.delta(q, z, side);
     }
 
-    double quote_price(double q, double z, Side side, double mid, double spread) const {
-        return policy.quote_price(q, z, side, mid, spread);
-    }
-
-    double price_improvement_pips(double q, double z, Side side, double spread) const {
-        return policy.price_improvement_pips(q, z, side, spread);
-    }
-
-    double quote_relative_to_mid_pips(double q, double z, Side side, double spread) const {
-        return policy.quote_relative_to_mid_pips(q, z, side, spread);
-    }
-
-    double distance_to_mid_pips(double q, double z, Side side, double spread) const {
-        return policy.distance_to_mid_pips(q, z, side, spread);
-    }
-
-    double volume_premium_pips(double q, double z, Side side, double spread) const {
-        return policy.volume_premium_pips(q, z, side, spread);
+    QuoteSummary quote_summary(
+        double q,
+        double z,
+        Side side,
+        double mid,
+        double spread
+    ) const {
+        return policy.quote_summary(q, z, side, mid, spread);
     }
 };
 
@@ -616,31 +561,85 @@ struct SolverConfig {
 };
 
 // ============================================================
-// Rung builder
+// Optimization utilities
 // ============================================================
 
-struct RungBuilder {
-    const PriceTier& tier;
-    double spread;
-    double golden_tol;
-    int golden_max_iter;
-    LinearInterpolator1D h;
+struct GoldenSectionSearch {
+    double tol{1e-4};
+    int max_iter{32};
 
-    RungBuilder(
-        const PriceTier& tier_,
-        double spread_,
-        double golden_tol_,
-        int golden_max_iter_,
-        LinearInterpolator1D h_
-    )
-        : tier(tier_),
-          spread(spread_),
-          golden_tol(golden_tol_),
-          golden_max_iter(golden_max_iter_),
-          h(h_) {}
+    GoldenSectionSearch() = default;
 
-    static double next_inventory(double q, double z, Side side) {
-        return side == Side::Bid ? q + z : q - z;
+    GoldenSectionSearch(double tol_, int max_iter_)
+        : tol(tol_), max_iter(max_iter_) {
+        validate();
+    }
+
+    void validate() const {
+        if (tol <= 0.0) {
+            throw std::invalid_argument("GoldenSectionSearch: tol must be positive.");
+        }
+        if (max_iter < 1) {
+            throw std::invalid_argument("GoldenSectionSearch: max_iter must be at least 1.");
+        }
+    }
+
+    template <class ObjectiveFn>
+    double maximize(ObjectiveFn&& objective_fn, double lower, double upper) const {
+        if (upper < lower) {
+            throw std::invalid_argument("GoldenSectionSearch::maximize: invalid interval.");
+        }
+        if (std::abs(upper - lower) < tol) {
+            return 0.5 * (lower + upper);
+        }
+
+        constexpr double gr = 1.6180339887498948482;
+        double a = lower;
+        double b = upper;
+        double c = b - (b - a) / gr;
+        double d = a + (b - a) / gr;
+        double fc = objective_fn(c);
+        double fd = objective_fn(d);
+
+        for (int it = 0; it < max_iter; ++it) {
+            if (std::abs(b - a) < tol) {
+                break;
+            }
+
+            if (fc > fd) {
+                b = d;
+                d = c;
+                fd = fc;
+                c = b - (b - a) / gr;
+                fc = objective_fn(c);
+            } else {
+                a = c;
+                c = d;
+                fc = fd;
+                d = a + (b - a) / gr;
+                fd = objective_fn(d);
+            }
+        }
+
+        return 0.5 * (a + b);
+    }
+};
+
+struct LadderBoundsPolicy {
+    double delta_min{-5.0};
+    double delta_max{5.0};
+
+    LadderBoundsPolicy() = default;
+
+    LadderBoundsPolicy(double delta_min_, double delta_max_)
+        : delta_min(delta_min_), delta_max(delta_max_) {
+        validate();
+    }
+
+    void validate() const {
+        if (delta_max <= delta_min) {
+            throw std::invalid_argument("LadderBoundsPolicy: delta_max must be > delta_min.");
+        }
     }
 
     static bool is_shrink_mode(double q, Side side) {
@@ -672,73 +671,19 @@ struct RungBuilder {
         return delta[rung_idx] - delta.back();
     }
 
-    double continuation_change(double q, double z, Side side) const {
-        return h(next_inventory(q, z, side)) - h(q);
-    }
-
-    double immediate_edge(double z, double delta, double mu) const {
-        return z * spread * (0.5 - delta) - z * mu;
-    }
-
-    double objective(double q, double z, Side side, double delta) const {
-        const double lam = tier.arrival_rate(delta, z);
-        const double mu = tier.expected_markout(z);
-        return lam * (immediate_edge(z, delta, mu) + continuation_change(q, z, side));
-    }
-
-    template <class ObjectiveFn>
-    double golden_search_max(ObjectiveFn&& objective_fn, double lower, double upper) const {
-        if (upper < lower) {
-            throw std::invalid_argument("golden_search_max: invalid interval.");
-        }
-        if (std::abs(upper - lower) < golden_tol) {
-            return 0.5 * (lower + upper);
-        }
-
-        constexpr double gr = 1.6180339887498948482;
-        double a = lower;
-        double b = upper;
-        double c = b - (b - a) / gr;
-        double d = a + (b - a) / gr;
-        double fc = objective_fn(c);
-        double fd = objective_fn(d);
-
-        for (int it = 0; it < golden_max_iter; ++it) {
-            if (std::abs(b - a) < golden_tol) {
-                break;
-            }
-
-            if (fc > fd) {
-                b = d;
-                d = c;
-                fd = fc;
-                c = b - (b - a) / gr;
-                fc = objective_fn(c);
-            } else {
-                a = c;
-                c = d;
-                fc = fd;
-                d = a + (b - a) / gr;
-                fd = objective_fn(d);
-            }
-        }
-
-        return 0.5 * (a + b);
-    }
-
-    std::pair<double, double> rung_bounds(
+    std::pair<double, double> bounds_for_rung(
         std::size_t rung_idx,
         const std::vector<double>& current_delta,
         double q,
         Side side,
         const std::vector<double>* prev_delta
     ) const {
-        double lower = tier.delta_min;
-        double upper = tier.delta_max;
+        double lower = delta_min;
+        double upper = delta_max;
 
         if (rung_idx == 0) {
             if (prev_delta != nullptr && is_expand_mode(q, side)) {
-                lower = std::max(lower, tier.delta_min + total_gap(*prev_delta));
+                lower = std::max(lower, delta_min + total_gap(*prev_delta));
             }
             return {lower, upper};
         }
@@ -758,11 +703,79 @@ struct RungBuilder {
             upper = std::min(upper, prev_curr - prev_gap);
             lower = std::max(
                 lower,
-                tier.delta_min + remaining_future_gap(*prev_delta, rung_idx)
+                delta_min + remaining_future_gap(*prev_delta, rung_idx)
             );
         }
 
         return {lower, upper};
+    }
+};
+
+// ============================================================
+// Policy builder
+// ============================================================
+
+struct TierPolicyBuilder {
+    const PriceTier* tier{nullptr};
+    double spread{0.0};
+    const GoldenSectionSearch* optimizer{nullptr};
+    const LadderBoundsPolicy* bounds_policy{nullptr};
+    LinearInterpolator1D h;
+
+    TierPolicyBuilder() = default;
+
+    TierPolicyBuilder(
+        const PriceTier& tier_,
+        double spread_,
+        const GoldenSectionSearch& optimizer_,
+        const LadderBoundsPolicy& bounds_policy_
+    )
+        : tier(&tier_),
+          spread(spread_),
+          optimizer(&optimizer_),
+          bounds_policy(&bounds_policy_) {}
+
+    void set_h_view(const std::vector<double>& q_grid, const std::vector<double>& h_vec) {
+        h = LinearInterpolator1D{&q_grid, &h_vec};
+    }
+
+    const PriceTier& price_tier() const {
+        if (tier == nullptr) {
+            throw std::runtime_error("TierPolicyBuilder is not initialized.");
+        }
+        return *tier;
+    }
+
+    const GoldenSectionSearch& searcher() const {
+        if (optimizer == nullptr) {
+            throw std::runtime_error("TierPolicyBuilder optimizer is not initialized.");
+        }
+        return *optimizer;
+    }
+
+    const LadderBoundsPolicy& bounds() const {
+        if (bounds_policy == nullptr) {
+            throw std::runtime_error("TierPolicyBuilder bounds are not initialized.");
+        }
+        return *bounds_policy;
+    }
+
+    static double next_inventory(double q, double z, Side side) {
+        return side == Side::Bid ? q + z : q - z;
+    }
+
+    double continuation_change(double q, double z, Side side) const {
+        return h(next_inventory(q, z, side)) - h(q);
+    }
+
+    double immediate_edge(double z, double delta, double mu) const {
+        return z * spread * (0.5 - delta) - z * mu;
+    }
+
+    double objective(double q, double z, Side side, double delta) const {
+        const double lam = price_tier().arrival_rate(delta, z);
+        const double mu = price_tier().expected_markout(z);
+        return lam * (immediate_edge(z, delta, mu) + continuation_change(q, z, side));
     }
 
     void build_side_ladder(
@@ -771,17 +784,19 @@ struct RungBuilder {
         Side side,
         const std::vector<double>* prev_delta = nullptr
     ) const {
-        const std::size_t n = tier.sizes.size();
+        const std::size_t n = price_tier().sizes.size();
         delta.assign(n, 0.0);
 
         for (std::size_t j = 0; j < n; ++j) {
-            auto [lower, upper] = rung_bounds(j, delta, q, side, prev_delta);
-            lower = std::max(lower, tier.delta_min);
-            upper = std::min(upper, tier.delta_max);
+            auto [lower, upper] =
+                bounds().bounds_for_rung(j, delta, q, side, prev_delta);
+
+            lower = std::max(lower, price_tier().delta_min);
+            upper = std::min(upper, price_tier().delta_max);
 
             if (lower > upper + 1e-12) {
                 throw std::runtime_error(
-                    "Infeasible ladder bounds for tier '" + tier.name +
+                    "Infeasible ladder bounds for tier '" + price_tier().name +
                     "', side '" + std::string(side_name(side)) + "'."
                 );
             }
@@ -789,12 +804,12 @@ struct RungBuilder {
                 upper = lower;
             }
 
-            const double z = tier.sizes[j];
+            const double z = price_tier().sizes[j];
             const auto obj = [&](double d) {
                 return objective(q, z, side, d);
             };
 
-            delta[j] = clamp(golden_search_max(obj, lower, upper), lower, upper);
+            delta[j] = clamp(searcher().maximize(obj, lower, upper), lower, upper);
         }
     }
 
@@ -887,6 +902,10 @@ struct HJBLadderSolver {
     std::shared_ptr<InventoryPenalty> penalty;
     std::vector<std::shared_ptr<PriceTier>> tiers;
 
+    GoldenSectionSearch optimizer;
+    std::vector<LadderBoundsPolicy> tier_bounds_;
+    std::vector<TierPolicyBuilder> tier_policy_builders_;
+
     HJBLadderSolver(
         SolverConfig config_,
         std::shared_ptr<InventoryPenalty> penalty_,
@@ -894,7 +913,8 @@ struct HJBLadderSolver {
     )
         : config(std::move(config_)),
           penalty(std::move(penalty_)),
-          tiers(std::move(tiers_)) {
+          tiers(std::move(tiers_)),
+          optimizer(config.golden_tol, config.golden_max_iter) {
         config.validate();
         if (!penalty) {
             throw std::invalid_argument("HJBLadderSolver: penalty cannot be null.");
@@ -920,33 +940,31 @@ struct HJBLadderSolver {
         }
     }
 
-    void validate_h_vector(const std::vector<double>& h_vec) const {
-        if (h_vec.size() != config.q_grid.size()) {
-            throw std::invalid_argument(
-                "HJBLadderSolver: h vector size must match config.q_grid size."
-            );
-        }
-    }
-
-    void validate_policy_shapes() const {
-        for (const auto& tier : tiers) {
-            tier->policy.validate();
-            if (tier->policy.q_grid != config.q_grid) {
-                throw std::invalid_argument(
-                    "HJBLadderSolver: tier policy q_grid does not match solver q_grid."
-                );
-            }
-            if (tier->policy.sizes != tier->sizes) {
-                throw std::invalid_argument(
-                    "HJBLadderSolver: tier policy sizes do not match tier sizes."
-                );
-            }
-        }
-    }
-
     void initialize_policy_shapes() {
         for (auto& tier : tiers) {
             tier->policy.reset_shape(config.q_grid, tier->sizes);
+        }
+    }
+
+    void prepare_solve_context() {
+        validate_problem_definition();
+        initialize_policy_shapes();
+
+        tier_bounds_.clear();
+        tier_bounds_.reserve(tiers.size());
+        for (const auto& tier : tiers) {
+            tier_bounds_.emplace_back(tier->delta_min, tier->delta_max);
+        }
+
+        tier_policy_builders_.clear();
+        tier_policy_builders_.reserve(tiers.size());
+        for (std::size_t k = 0; k < tiers.size(); ++k) {
+            tier_policy_builders_.emplace_back(
+                *tiers[k],
+                config.spread,
+                optimizer,
+                tier_bounds_[k]
+            );
         }
     }
 
@@ -955,24 +973,10 @@ struct HJBLadderSolver {
     }
 
     void update_policies_unchecked(const std::vector<double>& h_vec) {
-        const LinearInterpolator1D h_view = make_h_view(h_vec);
-        for (auto& tier : tiers) {
-            RungBuilder builder(
-                *tier,
-                config.spread,
-                config.golden_tol,
-                config.golden_max_iter,
-                h_view
-            );
-            builder.build_policy_inplace(tier->policy);
+        for (std::size_t k = 0; k < tiers.size(); ++k) {
+            tier_policy_builders_[k].set_h_view(config.q_grid, h_vec);
+            tier_policy_builders_[k].build_policy_inplace(tiers[k]->policy);
         }
-    }
-
-    void update_policies(const std::vector<double>& h_vec) {
-        validate_problem_definition();
-        validate_h_vector(h_vec);
-        initialize_policy_shapes();
-        update_policies_unchecked(h_vec);
     }
 
     double bellman_rhs_from_policies_unchecked(
@@ -1010,20 +1014,8 @@ struct HJBLadderSolver {
         return max_rhs_abs;
     }
 
-    double bellman_rhs_from_policies(
-        const std::vector<double>& h_vec,
-        std::vector<double>& rhs
-    ) const {
-        validate_problem_definition();
-        validate_h_vector(h_vec);
-        validate_policy_shapes();
-
-        rhs.resize(h_vec.size());
-        return bellman_rhs_from_policies_unchecked(h_vec, rhs);
-    }
-
     HJBSolution solve() {
-        validate_problem_definition();
+        prepare_solve_context();
 
         const std::size_t nq = config.q_grid.size();
         const std::size_t q0_idx = nearest_to_zero_index(config.q_grid);
@@ -1031,8 +1023,6 @@ struct HJBLadderSolver {
         std::vector<double> h(nq, 0.0);
         std::vector<double> h_next(nq, 0.0);
         std::vector<double> rhs(nq, 0.0);
-
-        initialize_policy_shapes();
 
         SolverDiagnostics diagnostics(config.n_iter);
 
