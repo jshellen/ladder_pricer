@@ -790,7 +790,7 @@ struct LadderBoundsPolicy {
 };
 
 // ============================================================
-// Tier hierarchy
+// Tier hierarchy (data + validation only)
 // ============================================================
 
 struct Tier {
@@ -814,6 +814,7 @@ struct Tier {
 
     virtual const char* tier_type_name() const = 0;
     virtual const std::vector<double>& sizes() const = 0;
+    virtual bool is_admissible(double q, double z, Side side) const = 0;
 
     virtual void validate() const {
         if (!flow_curve) {
@@ -828,9 +829,7 @@ struct Tier {
         }
     }
 
-    virtual bool is_admissible(double q, double z, Side side) const = 0;
-
-    virtual void reset_policy_shape(const std::vector<double>& q_grid) {
+    void reset_policy_shape(const std::vector<double>& q_grid) {
         policy.reset_shape(q_grid, sizes());
     }
 
@@ -855,26 +854,7 @@ struct Tier {
     ) const {
         return policy.quote_summary(q, z, side, mid, spread);
     }
-
-    virtual void update_policy(
-        const std::vector<double>& q_grid,
-        std::size_t q0_idx,
-        double spread,
-        const GoldenSectionSearch& optimizer,
-        const LinearInterpolator1D& h
-    ) = 0;
-
-    virtual double bellman_contribution(
-        double q,
-        std::size_t q_index,
-        const LinearInterpolator1D& h,
-        double spread
-    ) const = 0;
 };
-
-// ============================================================
-// MDP/customer tier
-// ============================================================
 
 struct MDPTier final : public Tier {
     std::vector<double> sizes_;
@@ -921,133 +901,7 @@ struct MDPTier final : public Tier {
     bool is_admissible(double, double, Side) const override {
         return true;
     }
-
-    double objective(
-        const LinearInterpolator1D& h,
-        double spread,
-        double q,
-        double z,
-        Side side,
-        double delta
-    ) const {
-        return trade_contribution(
-            *flow_curve,
-            *markout_model,
-            h,
-            spread,
-            q,
-            z,
-            side,
-            delta
-        );
-    }
-
-    void build_side_ladder(
-        std::vector<double>& delta_row,
-        double q,
-        Side side,
-        const std::vector<double>* prev_delta,
-        const LadderBoundsPolicy& bounds,
-        double spread,
-        const GoldenSectionSearch& optimizer,
-        const LinearInterpolator1D& h
-    ) const {
-        const std::size_t nz = sizes_.size();
-        delta_row.assign(nz, delta_min);
-
-        for (std::size_t j = 0; j < nz; ++j) {
-            const double z = sizes_[j];
-
-            auto [lower, upper] =
-                bounds.bounds_for_rung(j, delta_row, q, side, prev_delta);
-
-            lower = std::max(lower, delta_min);
-            upper = std::min(upper, delta_max);
-
-            if (lower > upper + 1e-12) {
-                throw std::runtime_error(
-                    "Infeasible ladder bounds for MDP tier '" + name +
-                    "', side '" + std::string(side_name(side)) + "'."
-                );
-            }
-            if (upper < lower) {
-                upper = lower;
-            }
-
-            const auto obj = [&](double d) {
-                return objective(h, spread, q, z, side, d);
-            };
-
-            delta_row[j] = clamp(optimizer.maximize(obj, lower, upper), lower, upper);
-        }
-    }
-
-    void build_side_policy(
-        Matrix& side_matrix,
-        const std::vector<double>& q_grid,
-        std::size_t q0_idx,
-        Side side,
-        double spread,
-        const GoldenSectionSearch& optimizer,
-        const LinearInterpolator1D& h
-    ) const {
-        const std::size_t nq = q_grid.size();
-        const LadderBoundsPolicy bounds(delta_min, delta_max);
-
-        build_side_ladder(side_matrix[q0_idx], q_grid[q0_idx], side, nullptr, bounds, spread, optimizer, h);
-
-        for (std::size_t i = q0_idx + 1; i < nq; ++i) {
-            build_side_ladder(side_matrix[i], q_grid[i], side, &side_matrix[i - 1], bounds, spread, optimizer, h);
-        }
-
-        for (std::size_t i = q0_idx; i-- > 0;) {
-            build_side_ladder(side_matrix[i], q_grid[i], side, &side_matrix[i + 1], bounds, spread, optimizer, h);
-        }
-    }
-
-    void update_policy(
-        const std::vector<double>& q_grid,
-        std::size_t q0_idx,
-        double spread,
-        const GoldenSectionSearch& optimizer,
-        const LinearInterpolator1D& h
-    ) override {
-        build_side_policy(policy.bid, q_grid, q0_idx, Side::Bid, spread, optimizer, h);
-        build_side_policy(policy.ask, q_grid, q0_idx, Side::Ask, spread, optimizer, h);
-    }
-
-    double bellman_contribution(
-        double q,
-        std::size_t q_index,
-        const LinearInterpolator1D& h,
-        double spread
-    ) const override {
-        double total = 0.0;
-
-        for (Side side : kAllSides) {
-            for (std::size_t j = 0; j < sizes_.size(); ++j) {
-                const double z = sizes_[j];
-                const double delta = policy.delta_at_index(q_index, j, side);
-                total += trade_contribution(
-                    *flow_curve,
-                    *markout_model,
-                    h,
-                    spread,
-                    q,
-                    z,
-                    side,
-                    delta
-                );
-            }
-        }
-
-        return total;
-    }
 };
-
-// ============================================================
-// ECN tier
-// ============================================================
 
 struct ECNTier final : public Tier {
     double delta_min{-5.0};
@@ -1120,125 +974,6 @@ struct ECNTier final : public Tier {
 
     double active_delta_with_decay(double q, double decay) const {
         return ecn_policy.delta_at_abs_inventory_with_decay(std::abs(q), decay);
-    }
-
-    double local_objective(
-        const LinearInterpolator1D& h,
-        double spread,
-        double q,
-        double decay
-    ) const {
-        if (q > 0.0) {
-            return trade_contribution(
-                *flow_curve,
-                *markout_model,
-                h,
-                spread,
-                q,
-                1.0,
-                Side::Ask,
-                active_delta_with_decay(q, decay)
-            );
-        }
-        if (q < 0.0) {
-            return trade_contribution(
-                *flow_curve,
-                *markout_model,
-                h,
-                spread,
-                q,
-                1.0,
-                Side::Bid,
-                active_delta_with_decay(q, decay)
-            );
-        }
-        return 0.0;
-    }
-
-    double optimize_decay(
-        const std::vector<double>& q_grid,
-        const LinearInterpolator1D& h,
-        double spread,
-        const GoldenSectionSearch& optimizer
-    ) const {
-        const auto objective = [&](double decay) {
-            double total = 0.0;
-            for (double q : q_grid) {
-                total += local_objective(h, spread, q, decay);
-            }
-            return total;
-        };
-
-        return clamp(
-            optimizer.maximize(
-                objective,
-                ecn_policy.decay_min,
-                ecn_policy.decay_max
-            ),
-            ecn_policy.decay_min,
-            ecn_policy.decay_max
-        );
-    }
-
-    void build_policy_from_current_decay(const std::vector<double>& q_grid) {
-        const double parked_delta = ecn_policy.delta_target;
-
-        for (std::size_t i = 0; i < q_grid.size(); ++i) {
-            const double q = q_grid[i];
-
-            policy.delta_ref(i, 0, Side::Bid) = parked_delta;
-            policy.delta_ref(i, 0, Side::Ask) = parked_delta;
-
-            if (q > 0.0) {
-                policy.delta_ref(i, 0, Side::Ask) = active_delta(q);
-            } else if (q < 0.0) {
-                policy.delta_ref(i, 0, Side::Bid) = active_delta(q);
-            }
-        }
-    }
-
-    void update_policy(
-        const std::vector<double>& q_grid,
-        std::size_t,
-        double spread,
-        const GoldenSectionSearch& optimizer,
-        const LinearInterpolator1D& h
-    ) override {
-        ecn_policy.decay = optimize_decay(q_grid, h, spread, optimizer);
-        build_policy_from_current_decay(q_grid);
-    }
-
-    double bellman_contribution(
-        double q,
-        std::size_t q_index,
-        const LinearInterpolator1D& h,
-        double spread
-    ) const override {
-        if (q > 0.0) {
-            return trade_contribution(
-                *flow_curve,
-                *markout_model,
-                h,
-                spread,
-                q,
-                1.0,
-                Side::Ask,
-                policy.delta_at_index(q_index, 0, Side::Ask)
-            );
-        }
-        if (q < 0.0) {
-            return trade_contribution(
-                *flow_curve,
-                *markout_model,
-                h,
-                spread,
-                q,
-                1.0,
-                Side::Bid,
-                policy.delta_at_index(q_index, 0, Side::Bid)
-            );
-        }
-        return 0.0;
     }
 };
 
@@ -1365,16 +1100,315 @@ struct HJBLadderSolver {
         return LinearInterpolator1D{&config.q_grid, &h_vec};
     }
 
+    // --------------------------------------------------------
+    // MDP policy construction
+    // --------------------------------------------------------
+
+    double mdp_objective(
+        const MDPTier& tier,
+        const LinearInterpolator1D& h,
+        double q,
+        double z,
+        Side side,
+        double delta
+    ) const {
+        return trade_contribution(
+            *tier.flow_curve,
+            *tier.markout_model,
+            h,
+            config.spread,
+            q,
+            z,
+            side,
+            delta
+        );
+    }
+
+    void build_mdp_side_ladder(
+        const MDPTier& tier,
+        const LinearInterpolator1D& h,
+        std::vector<double>& delta_row,
+        double q,
+        Side side,
+        const std::vector<double>* prev_delta
+    ) const {
+        const std::size_t nz = tier.sizes_.size();
+        const LadderBoundsPolicy bounds(tier.delta_min, tier.delta_max);
+
+        delta_row.assign(nz, tier.delta_min);
+
+        for (std::size_t j = 0; j < nz; ++j) {
+            const double z = tier.sizes_[j];
+
+            auto [lower, upper] =
+                bounds.bounds_for_rung(j, delta_row, q, side, prev_delta);
+
+            lower = std::max(lower, tier.delta_min);
+            upper = std::min(upper, tier.delta_max);
+
+            if (lower > upper + 1e-12) {
+                throw std::runtime_error(
+                    "Infeasible ladder bounds for MDP tier '" + tier.name +
+                    "', side '" + std::string(side_name(side)) + "'."
+                );
+            }
+            if (upper < lower) {
+                upper = lower;
+            }
+
+            const auto obj = [&](double d) {
+                return mdp_objective(tier, h, q, z, side, d);
+            };
+
+            delta_row[j] = clamp(optimizer.maximize(obj, lower, upper), lower, upper);
+        }
+    }
+
+    void build_mdp_side_policy(
+        const MDPTier& tier,
+        const LinearInterpolator1D& h,
+        Matrix& side_matrix,
+        Side side
+    ) const {
+        const auto& q_grid = config.q_grid;
+        const std::size_t nq = grid_meta_.nq;
+        const std::size_t q0_idx = grid_meta_.q0_idx;
+
+        build_mdp_side_ladder(
+            tier,
+            h,
+            side_matrix[q0_idx],
+            q_grid[q0_idx],
+            side,
+            nullptr
+        );
+
+        for (std::size_t i = q0_idx + 1; i < nq; ++i) {
+            build_mdp_side_ladder(
+                tier,
+                h,
+                side_matrix[i],
+                q_grid[i],
+                side,
+                &side_matrix[i - 1]
+            );
+        }
+
+        for (std::size_t i = q0_idx; i-- > 0;) {
+            build_mdp_side_ladder(
+                tier,
+                h,
+                side_matrix[i],
+                q_grid[i],
+                side,
+                &side_matrix[i + 1]
+            );
+        }
+    }
+
+    void update_mdp_policy(
+        MDPTier& tier,
+        const LinearInterpolator1D& h
+    ) const {
+        build_mdp_side_policy(tier, h, tier.policy.bid, Side::Bid);
+        build_mdp_side_policy(tier, h, tier.policy.ask, Side::Ask);
+    }
+
+    // --------------------------------------------------------
+    // ECN policy construction
+    // --------------------------------------------------------
+
+    double ecn_local_objective(
+        const ECNTier& tier,
+        const LinearInterpolator1D& h,
+        double q,
+        double decay
+    ) const {
+        if (q > 0.0) {
+            return trade_contribution(
+                *tier.flow_curve,
+                *tier.markout_model,
+                h,
+                config.spread,
+                q,
+                1.0,
+                Side::Ask,
+                tier.active_delta_with_decay(q, decay)
+            );
+        }
+        if (q < 0.0) {
+            return trade_contribution(
+                *tier.flow_curve,
+                *tier.markout_model,
+                h,
+                config.spread,
+                q,
+                1.0,
+                Side::Bid,
+                tier.active_delta_with_decay(q, decay)
+            );
+        }
+        return 0.0;
+    }
+
+    double optimize_ecn_decay(
+        const ECNTier& tier,
+        const LinearInterpolator1D& h
+    ) const {
+        const auto objective = [&](double decay) {
+            double total = 0.0;
+            for (double q : config.q_grid) {
+                total += ecn_local_objective(tier, h, q, decay);
+            }
+            return total;
+        };
+
+        return clamp(
+            optimizer.maximize(
+                objective,
+                tier.ecn_policy.decay_min,
+                tier.ecn_policy.decay_max
+            ),
+            tier.ecn_policy.decay_min,
+            tier.ecn_policy.decay_max
+        );
+    }
+
+    void build_ecn_policy_from_decay(
+        ECNTier& tier,
+        double decay
+    ) const {
+        const double parked_delta = tier.ecn_policy.delta_target;
+
+        for (std::size_t i = 0; i < grid_meta_.nq; ++i) {
+            const double q = config.q_grid[i];
+
+            tier.policy.delta_ref(i, 0, Side::Bid) = parked_delta;
+            tier.policy.delta_ref(i, 0, Side::Ask) = parked_delta;
+
+            if (q > 0.0) {
+                tier.policy.delta_ref(i, 0, Side::Ask) =
+                    tier.active_delta_with_decay(q, decay);
+            } else if (q < 0.0) {
+                tier.policy.delta_ref(i, 0, Side::Bid) =
+                    tier.active_delta_with_decay(q, decay);
+            }
+        }
+    }
+
+    void update_ecn_policy(
+        ECNTier& tier,
+        const LinearInterpolator1D& h
+    ) const {
+        const double decay_star = optimize_ecn_decay(tier, h);
+        tier.ecn_policy.decay = decay_star;
+        build_ecn_policy_from_decay(tier, decay_star);
+    }
+
+    // --------------------------------------------------------
+    // Tier dispatch
+    // --------------------------------------------------------
+
+    void update_tier_policy(
+        Tier& tier,
+        const LinearInterpolator1D& h
+    ) const {
+        if (auto* mdp = dynamic_cast<MDPTier*>(&tier)) {
+            update_mdp_policy(*mdp, h);
+            return;
+        }
+        if (auto* ecn = dynamic_cast<ECNTier*>(&tier)) {
+            update_ecn_policy(*ecn, h);
+            return;
+        }
+        throw std::runtime_error("Unknown tier type in update_tier_policy.");
+    }
+
+    double mdp_bellman_contribution(
+        const MDPTier& tier,
+        double q,
+        std::size_t q_index,
+        const LinearInterpolator1D& h
+    ) const {
+        double total = 0.0;
+
+        for (Side side : kAllSides) {
+            for (std::size_t j = 0; j < tier.sizes_.size(); ++j) {
+                const double z = tier.sizes_[j];
+                const double delta = tier.policy.delta_at_index(q_index, j, side);
+
+                total += trade_contribution(
+                    *tier.flow_curve,
+                    *tier.markout_model,
+                    h,
+                    config.spread,
+                    q,
+                    z,
+                    side,
+                    delta
+                );
+            }
+        }
+
+        return total;
+    }
+
+    double ecn_bellman_contribution(
+        const ECNTier& tier,
+        double q,
+        std::size_t q_index,
+        const LinearInterpolator1D& h
+    ) const {
+        if (q > 0.0) {
+            return trade_contribution(
+                *tier.flow_curve,
+                *tier.markout_model,
+                h,
+                config.spread,
+                q,
+                1.0,
+                Side::Ask,
+                tier.policy.delta_at_index(q_index, 0, Side::Ask)
+            );
+        }
+        if (q < 0.0) {
+            return trade_contribution(
+                *tier.flow_curve,
+                *tier.markout_model,
+                h,
+                config.spread,
+                q,
+                1.0,
+                Side::Bid,
+                tier.policy.delta_at_index(q_index, 0, Side::Bid)
+            );
+        }
+        return 0.0;
+    }
+
+    double tier_bellman_contribution(
+        const Tier& tier,
+        double q,
+        std::size_t q_index,
+        const LinearInterpolator1D& h
+    ) const {
+        if (const auto* mdp = dynamic_cast<const MDPTier*>(&tier)) {
+            return mdp_bellman_contribution(*mdp, q, q_index, h);
+        }
+        if (const auto* ecn = dynamic_cast<const ECNTier*>(&tier)) {
+            return ecn_bellman_contribution(*ecn, q, q_index, h);
+        }
+        throw std::runtime_error("Unknown tier type in tier_bellman_contribution.");
+    }
+
+    // --------------------------------------------------------
+    // Public-ish internal solver steps
+    // --------------------------------------------------------
+
     void update_policies_unchecked(const std::vector<double>& h_vec) {
         const LinearInterpolator1D h_view = make_h_view(h_vec);
         for (auto& tier : tiers) {
-            tier->update_policy(
-                config.q_grid,
-                grid_meta_.q0_idx,
-                config.spread,
-                optimizer,
-                h_view
-            );
+            update_tier_policy(*tier, h_view);
         }
     }
 
@@ -1390,7 +1424,7 @@ struct HJBLadderSolver {
             double val = -penalty->value(q) + config.spot_drift * q;
 
             for (const auto& tier : tiers) {
-                val += tier->bellman_contribution(q, i, h_view, config.spread);
+                val += tier_bellman_contribution(*tier, q, i, h_view);
             }
 
             rhs[i] = val;

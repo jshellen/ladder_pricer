@@ -160,10 +160,6 @@ class ECNTierSpec(CommonTierSpec):
 TierSpec = MDPTierSpec | ECNTierSpec
 
 
-def tier_kind(spec: TierSpec) -> str:
-    return "ecn" if isinstance(spec, ECNTierSpec) else "mdp"
-
-
 def tier_kind_label(spec: TierSpec) -> str:
     return "ECN" if isinstance(spec, ECNTierSpec) else "MDP"
 
@@ -467,6 +463,10 @@ def masked_quote_summary(
     return cpp_tier.quote_summary(float(q), float(z), side, float(mid_price), float(spread))
 
 
+def has_ecn_features(cpp_tier: lp.Tier) -> bool:
+    return hasattr(cpp_tier, "ecn_policy") and hasattr(cpp_tier, "active_delta")
+
+
 # ============================================================
 # Plots and tables
 # ============================================================
@@ -483,7 +483,7 @@ def make_flow_parameter_table(spec: TierSpec, cpp_tier: lp.Tier) -> pd.DataFrame
             "steepness": spec.flow_steepness,
             "mu(z)": cpp_tier.expected_markout(zf),
         }
-        if isinstance(spec, ECNTierSpec):
+        if isinstance(spec, ECNTierSpec) and has_ecn_features(cpp_tier):
             row["ecn_delta_start"] = float(cpp_tier.ecn_policy.delta_start)
             row["ecn_delta_target"] = float(cpp_tier.ecn_policy.delta_target)
             row["ecn_decay_opt"] = float(cpp_tier.ecn_policy.decay)
@@ -595,7 +595,10 @@ def make_flow_curve_figure(cpp_tier: lp.Tier, spec: TierSpec) -> go.Figure:
     return fig
 
 
-def make_ecn_decay_figure(cpp_tier: lp.ECNTier, spread: float) -> go.Figure:
+def make_ecn_decay_figure(cpp_tier: lp.Tier, spread: float) -> go.Figure:
+    if not has_ecn_features(cpp_tier):
+        raise ValueError("make_ecn_decay_figure requires an ECN tier.")
+
     q_grid = [float(q) for q in cpp_tier.policy.q_grid]
     q_pos = [q for q in q_grid if q > 0.0]
     q_neg = [q for q in q_grid if q < 0.0]
@@ -916,7 +919,7 @@ for tab, spec, cpp_tier in zip(tabs, tier_specs, solution.tiers):
         st.subheader(f"Tier: {spec.name}")
         st.caption(f"Type: {tier_kind_label(spec)}")
 
-        if isinstance(spec, ECNTierSpec):
+        if isinstance(spec, ECNTierSpec) and has_ecn_features(cpp_tier):
             c1, c2, c3 = st.columns(3)
             c1.metric("quoted size", "1.0")
             c2.metric("delta_start", f"{float(cpp_tier.ecn_policy.delta_start):.4f}")
@@ -937,7 +940,7 @@ for tab, spec, cpp_tier in zip(tabs, tier_specs, solution.tiers):
 
         st.plotly_chart(make_flow_curve_figure(cpp_tier, spec), use_container_width=True)
 
-        if isinstance(spec, ECNTierSpec):
+        if isinstance(spec, ECNTierSpec) and has_ecn_features(cpp_tier):
             st.plotly_chart(
                 make_ecn_decay_figure(cpp_tier, float(config.spread)),
                 use_container_width=True,

@@ -226,9 +226,9 @@ PYBIND11_MODULE(ladder_pricer, m) {
         );
 
     py::class_<Tier, std::shared_ptr<Tier>>(m, "Tier")
-        .def_property_readonly("name", [](const Tier& self) { return self.name; })
-        .def_property_readonly("flow_curve", [](const Tier& self) { return self.flow_curve; })
-        .def_property_readonly("markout_model", [](const Tier& self) { return self.markout_model; })
+        .def_readwrite("name", &Tier::name)
+        .def_readwrite("flow_curve", &Tier::flow_curve)
+        .def_readwrite("markout_model", &Tier::markout_model)
         .def_readwrite("policy", &Tier::policy)
         .def("validate", &Tier::validate)
         .def("tier_type_name", &Tier::tier_type_name)
@@ -315,10 +315,6 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("delta_min") = -5.0,
             py::arg("delta_max") = 5.0
         )
-        .def_readwrite("name", &MDPTier::name)
-        .def_readwrite("flow_curve", &MDPTier::flow_curve)
-        .def_readwrite("markout_model", &MDPTier::markout_model)
-        .def_readwrite("policy", &MDPTier::policy)
         .def_readwrite("sizes_", &MDPTier::sizes_)
         .def_readwrite("delta_min", &MDPTier::delta_min)
         .def_readwrite("delta_max", &MDPTier::delta_max)
@@ -364,10 +360,6 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("delta_max") = 5.0,
             py::arg("ecn_policy") = ExponentialECNPolicy{}
         )
-        .def_readwrite("name", &ECNTier::name)
-        .def_readwrite("flow_curve", &ECNTier::flow_curve)
-        .def_readwrite("markout_model", &ECNTier::markout_model)
-        .def_readwrite("policy", &ECNTier::policy)
         .def_readwrite("delta_min", &ECNTier::delta_min)
         .def_readwrite("delta_max", &ECNTier::delta_max)
         .def_readwrite("ecn_policy", &ECNTier::ecn_policy)
