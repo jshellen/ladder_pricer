@@ -79,6 +79,7 @@ def build_piecewise_centered_q_grid(
 @dataclass
 class TierSpec:
     name: str
+    role: str
     sizes: list[float]
     flow_A0: float
     flow_theta: float
@@ -89,6 +90,14 @@ class TierSpec:
     markout_coeff: float
     delta_min: float
     delta_max: float
+    ecn_delta_start: float
+    ecn_delta_target: float
+    ecn_decay: float
+    ecn_decay_min: float
+    ecn_decay_max: float
+
+    def is_ecn(self) -> bool:
+        return self.role.lower() == "ecn"
 
     def build_cpp_tier(self) -> lp.PriceTier:
         flow = lp.LogisticFlowCurve(
@@ -102,6 +111,26 @@ class TierSpec:
             base=float(self.markout_base),
             coeff=float(self.markout_coeff),
         )
+
+        if self.is_ecn():
+            ecn_policy = lp.ExponentialECNPolicy(
+                delta_start=float(self.ecn_delta_start),
+                delta_target=float(self.ecn_delta_target),
+                decay=float(self.ecn_decay),
+                decay_min=float(self.ecn_decay_min),
+                decay_max=float(self.ecn_decay_max),
+            )
+            return lp.PriceTier(
+                name=self.name,
+                sizes=[1.0],
+                flow_curve=flow,
+                markout_model=markout,
+                delta_min=float(self.delta_min),
+                delta_max=float(self.delta_max),
+                role=lp.TierRole.ECN,
+                ecn_policy=ecn_policy,
+            )
+
         return lp.PriceTier(
             name=self.name,
             sizes=[float(z) for z in self.sizes],
@@ -109,6 +138,8 @@ class TierSpec:
             markout_model=markout,
             delta_min=float(self.delta_min),
             delta_max=float(self.delta_max),
+            role=lp.TierRole.Customer,
+            ecn_policy=lp.ExponentialECNPolicy(),
         )
 
 
@@ -128,6 +159,7 @@ def default_tier_values(i: int) -> dict:
     presets = [
         {
             "name": "core_clients",
+            "role": "customer",
             "sizes": "1, 2, 3, 5, 10, 20",
             "flow_A0": 1.00,
             "flow_theta": 0.0,
@@ -138,9 +170,15 @@ def default_tier_values(i: int) -> dict:
             "markout_coeff": 0.000,
             "delta_min": -100.0,
             "delta_max": 100.0,
+            "ecn_delta_start": 0.10,
+            "ecn_delta_target": 0.50,
+            "ecn_decay": 2.0,
+            "ecn_decay_min": 0.25,
+            "ecn_decay_max": 10.0,
         },
         {
             "name": "aggressive_clients",
+            "role": "customer",
             "sizes": "1, 2, 3, 5, 10, 20",
             "flow_A0": 1.0,
             "flow_theta": 0.0,
@@ -151,10 +189,16 @@ def default_tier_values(i: int) -> dict:
             "markout_coeff": 0.000,
             "delta_min": -100.0,
             "delta_max": 100.0,
+            "ecn_delta_start": 0.10,
+            "ecn_delta_target": 0.50,
+            "ecn_decay": 2.0,
+            "ecn_decay_min": 0.25,
+            "ecn_decay_max": 10.0,
         },
         {
             "name": "ecn",
-            "sizes": "1, 2, 3, 5, 10",
+            "role": "ecn",
+            "sizes": "1",
             "flow_A0": 0.70,
             "flow_theta": 0.10,
             "flow_steepness": 8.0,
@@ -164,9 +208,15 @@ def default_tier_values(i: int) -> dict:
             "markout_coeff": 0.000,
             "delta_min": -2.0,
             "delta_max": 2.0,
+            "ecn_delta_start": 0.10,
+            "ecn_delta_target": 0.50,
+            "ecn_decay": 2.0,
+            "ecn_decay_min": 0.25,
+            "ecn_decay_max": 10.0,
         },
         {
             "name": "sticky_clients",
+            "role": "customer",
             "sizes": "1, 2, 3, 5, 10, 15, 20",
             "flow_A0": 0.85,
             "flow_theta": 0.15,
@@ -177,6 +227,11 @@ def default_tier_values(i: int) -> dict:
             "markout_coeff": 0.000,
             "delta_min": -100.0,
             "delta_max": 100.0,
+            "ecn_delta_start": 0.10,
+            "ecn_delta_target": 0.50,
+            "ecn_decay": 2.0,
+            "ecn_decay_min": 0.25,
+            "ecn_decay_max": 10.0,
         },
     ]
     return presets[min(i, len(presets) - 1)]
@@ -187,7 +242,25 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
 
     with st.sidebar.expander(f"Tier {i + 1}", expanded=(i == 0)):
         name = st.text_input(f"Tier name {i + 1}", value=defaults["name"], key=f"name_{i}")
-        sizes_raw = st.text_input(f"Sizes {i + 1}", value=defaults["sizes"], key=f"sizes_{i}")
+        role = st.selectbox(
+            f"Tier role {i + 1}",
+            options=["customer", "ecn"],
+            index=0 if defaults["role"] == "customer" else 1,
+            key=f"role_{i}",
+        )
+
+        if role == "ecn":
+            st.text_input(
+                f"Sizes {i + 1}",
+                value="1",
+                key=f"sizes_{i}",
+                disabled=True,
+            )
+            st.caption("ECN quoted size is fixed to z = 1.")
+            sizes = [1.0]
+        else:
+            sizes_raw = st.text_input(f"Sizes {i + 1}", value=defaults["sizes"], key=f"sizes_{i}")
+            sizes = parse_float_list(sizes_raw, f"sizes for tier {i + 1}")
 
         st.markdown("**Flow curve parameters**")
         c1, c2 = st.columns(2)
@@ -264,7 +337,58 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
             key=f"tier_delta_max_{i}",
         )
 
-    sizes = parse_float_list(sizes_raw, f"sizes for tier {i + 1}")
+        if role == "ecn":
+            st.markdown("**ECN exponential policy**")
+            c9, c10 = st.columns(2)
+            ecn_delta_start = c9.number_input(
+                f"ECN delta_start {i + 1}",
+                value=float(defaults["ecn_delta_start"]),
+                step=0.01,
+                format="%.4f",
+                key=f"ecn_delta_start_{i}",
+            )
+            ecn_delta_target = c10.number_input(
+                f"ECN delta_target {i + 1}",
+                value=float(defaults["ecn_delta_target"]),
+                step=0.01,
+                format="%.4f",
+                key=f"ecn_delta_target_{i}",
+            )
+
+            c11, c12, c13 = st.columns(3)
+            ecn_decay = c11.number_input(
+                f"ECN decay init {i + 1}",
+                value=float(defaults["ecn_decay"]),
+                step=0.05,
+                format="%.4f",
+                key=f"ecn_decay_{i}",
+            )
+            ecn_decay_min = c12.number_input(
+                f"ECN decay min {i + 1}",
+                value=float(defaults["ecn_decay_min"]),
+                step=0.05,
+                format="%.4f",
+                key=f"ecn_decay_min_{i}",
+            )
+            ecn_decay_max = c13.number_input(
+                f"ECN decay max {i + 1}",
+                value=float(defaults["ecn_decay_max"]),
+                step=0.05,
+                format="%.4f",
+                key=f"ecn_decay_max_{i}",
+            )
+
+            st.caption(
+                "The ECN tier quotes only the inventory-reducing side. "
+                "Its active-side quote follows a smooth exponential approach toward delta_target, "
+                "and the decay parameter is optimized in C++."
+            )
+        else:
+            ecn_delta_start = float(defaults["ecn_delta_start"])
+            ecn_delta_target = float(defaults["ecn_delta_target"])
+            ecn_decay = float(defaults["ecn_decay"])
+            ecn_decay_min = float(defaults["ecn_decay_min"])
+            ecn_decay_max = float(defaults["ecn_decay_max"])
 
     if flow_A0 < 0.0:
         raise ValueError(f"A0 for tier {i + 1} must be nonnegative.")
@@ -277,8 +401,25 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
     if any(sizes[k] >= sizes[k + 1] for k in range(len(sizes) - 1)):
         raise ValueError(f"Tier {i + 1}: sizes must be strictly increasing.")
 
+    if role == "ecn":
+        if sizes != [1.0]:
+            raise ValueError(f"Tier {i + 1}: ECN tiers must have size exactly [1.0].")
+        if ecn_decay_min <= 0.0:
+            raise ValueError(f"Tier {i + 1}: ECN decay_min must be positive.")
+        if ecn_decay_max <= ecn_decay_min:
+            raise ValueError(f"Tier {i + 1}: ECN decay_max must be greater than decay_min.")
+        if ecn_decay <= 0.0:
+            raise ValueError(f"Tier {i + 1}: ECN decay init must be positive.")
+        if ecn_delta_target < ecn_delta_start:
+            raise ValueError(f"Tier {i + 1}: ECN delta_target must be >= delta_start.")
+        if not (tier_delta_min <= ecn_delta_start <= tier_delta_max):
+            raise ValueError(f"Tier {i + 1}: ECN delta_start must lie inside [delta_min, delta_max].")
+        if not (tier_delta_min <= ecn_delta_target <= tier_delta_max):
+            raise ValueError(f"Tier {i + 1}: ECN delta_target must lie inside [delta_min, delta_max].")
+
     return TierSpec(
         name=name,
+        role=role,
         sizes=sizes,
         flow_A0=float(flow_A0),
         flow_theta=float(flow_theta),
@@ -289,7 +430,33 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
         markout_coeff=float(markout_coeff),
         delta_min=float(tier_delta_min),
         delta_max=float(tier_delta_max),
+        ecn_delta_start=float(ecn_delta_start),
+        ecn_delta_target=float(ecn_delta_target),
+        ecn_decay=float(ecn_decay),
+        ecn_decay_min=float(ecn_decay_min),
+        ecn_decay_max=float(ecn_decay_max),
     )
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def is_admissible(cpp_tier: lp.PriceTier, q: float, z: float, side: str) -> bool:
+    return bool(cpp_tier.is_admissible(float(q), float(z), side))
+
+
+def masked_quote_summary(
+    cpp_tier: lp.PriceTier,
+    q: float,
+    z: float,
+    side: str,
+    mid_price: float,
+    spread: float,
+):
+    if not is_admissible(cpp_tier, q, z, side):
+        return None
+    return cpp_tier.quote_summary(float(q), float(z), side, float(mid_price), float(spread))
 
 
 # ============================================================
@@ -300,15 +467,21 @@ def make_flow_parameter_table(spec: TierSpec, cpp_tier: lp.PriceTier) -> pd.Data
     rows = []
     for z in spec.sizes:
         zf = float(z)
-        rows.append(
-            {
-                "z": zf,
-                "A(z)": spec.flow_A0 * zf ** (-spec.flow_theta),
-                "delta_50(z)": spec.flow_shift - spec.flow_volume_shift * (zf - 1.0),
-                "steepness": spec.flow_steepness,
-                "mu(z)": cpp_tier.expected_markout(zf),
-            }
-        )
+        row = {
+            "role": spec.role,
+            "z": zf,
+            "A(z)": spec.flow_A0 * zf ** (-spec.flow_theta),
+            "delta_50(z)": spec.flow_shift - spec.flow_volume_shift * (zf - 1.0),
+            "steepness": spec.flow_steepness,
+            "mu(z)": cpp_tier.expected_markout(zf),
+        }
+        if spec.role == "ecn":
+            row["ecn_delta_start"] = float(cpp_tier.ecn_policy.delta_start)
+            row["ecn_delta_target"] = float(cpp_tier.ecn_policy.delta_target)
+            row["ecn_decay_opt"] = float(cpp_tier.ecn_policy.decay)
+            row["ecn_decay_min"] = float(cpp_tier.ecn_policy.decay_min)
+            row["ecn_decay_max"] = float(cpp_tier.ecn_policy.decay_max)
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -324,14 +497,15 @@ def make_quote_inventory_figure(
     for z in spec.sizes:
         zf = float(z)
 
-        bid_vals = [
-            float(cpp_tier.quote_summary(float(q), zf, "bid", float(mid_price), float(spread)).quote_relative_to_mid_pips)
-            for q in q_grid
-        ]
-        ask_vals = [
-            float(cpp_tier.quote_summary(float(q), zf, "ask", float(mid_price), float(spread)).quote_relative_to_mid_pips)
-            for q in q_grid
-        ]
+        bid_vals = []
+        ask_vals = []
+
+        for q in q_grid:
+            bid = masked_quote_summary(cpp_tier, q, zf, "bid", mid_price, spread)
+            ask = masked_quote_summary(cpp_tier, q, zf, "ask", mid_price, spread)
+
+            bid_vals.append(np.nan if bid is None else float(bid.quote_relative_to_mid_pips))
+            ask_vals.append(np.nan if ask is None else float(ask.quote_relative_to_mid_pips))
 
         fig.add_trace(go.Scatter(x=q_grid, y=bid_vals, mode="lines", name=f"{zf:g} bid"))
         fig.add_trace(
@@ -346,7 +520,7 @@ def make_quote_inventory_figure(
 
     fig.add_hline(y=0.0)
     fig.update_layout(
-        title=f"Quotes vs inventory — {spec.name}",
+        title=f"Quotes vs inventory — {spec.name} ({spec.role})",
         xaxis_title="Inventory q",
         yaxis_title="Quote relative to mid (pips)",
         height=520,
@@ -363,14 +537,15 @@ def make_ladder_figure(
 ) -> go.Figure:
     sizes = [float(z) for z in spec.sizes]
 
-    bid_vp = [
-        float(cpp_tier.quote_summary(float(q), z, "bid", float(mid_price), float(spread)).volume_premium_pips)
-        for z in sizes
-    ]
-    ask_vp = [
-        float(cpp_tier.quote_summary(float(q), z, "ask", float(mid_price), float(spread)).volume_premium_pips)
-        for z in sizes
-    ]
+    bid_vp = []
+    ask_vp = []
+
+    for z in sizes:
+        bid = masked_quote_summary(cpp_tier, q, z, "bid", mid_price, spread)
+        ask = masked_quote_summary(cpp_tier, q, z, "ask", mid_price, spread)
+
+        bid_vp.append(np.nan if bid is None else float(bid.volume_premium_pips))
+        ask_vp.append(np.nan if ask is None else float(ask.volume_premium_pips))
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=sizes, y=bid_vp, mode="lines+markers", name=f"Bid q={q:g}"))
@@ -386,7 +561,7 @@ def make_ladder_figure(
 
     fig.add_hline(y=0.0)
     fig.update_layout(
-        title=f"Volume premium — {spec.name} at q = {q:g}",
+        title=f"Volume premium — {spec.name} ({spec.role}) at q = {q:g}",
         xaxis_title="Trade size z",
         yaxis_title="Premium vs 1M quote (pips)",
         height=520,
@@ -404,10 +579,48 @@ def make_flow_curve_figure(cpp_tier: lp.PriceTier, spec: TierSpec) -> go.Figure:
         fig.add_trace(go.Scatter(x=grid, y=vals, mode="lines", name=f"{zf:g}"))
 
     fig.update_layout(
-        title=f"Flow curves λ(δ, z) — {spec.name}",
-        xaxis_title="delta (fraction of spread improvement)",
+        title=f"Flow curves λ(δ, z) — {spec.name} ({spec.role})",
+        xaxis_title="delta",
         yaxis_title="arrival rate",
         height=520,
+    )
+    return fig
+
+
+def make_ecn_decay_figure(cpp_tier: lp.PriceTier, spread: float) -> go.Figure:
+    q_grid = [float(q) for q in cpp_tier.policy.q_grid]
+    q_pos = [q for q in q_grid if q > 0.0]
+    q_neg = [q for q in q_grid if q < 0.0]
+
+    ask_vals = [
+        10000.0 * spread * (0.5 - float(cpp_tier.ecn_active_delta(q)))
+        for q in q_pos
+    ]
+    bid_vals = [
+        10000.0 * spread * (float(cpp_tier.ecn_active_delta(q)) - 0.5)
+        for q in q_neg
+    ]
+
+    fig = go.Figure()
+    if q_neg:
+        fig.add_trace(go.Scatter(x=q_neg, y=bid_vals, mode="lines", name="bid active side"))
+    if q_pos:
+        fig.add_trace(
+            go.Scatter(
+                x=q_pos,
+                y=ask_vals,
+                mode="lines",
+                line=dict(dash="dash"),
+                name="ask active side",
+            )
+        )
+
+    fig.add_hline(y=0.0)
+    fig.update_layout(
+        title="ECN active-side exponential quote vs inventory",
+        xaxis_title="Inventory q",
+        yaxis_title="Quote relative to mid (pips)",
+        height=420,
     )
     return fig
 
@@ -423,27 +636,33 @@ def make_q_ladder_table(
 
     for z in spec.sizes:
         zf = float(z)
-        bid = cpp_tier.quote_summary(float(q), zf, "bid", float(mid_price), float(spread))
-        ask = cpp_tier.quote_summary(float(q), zf, "ask", float(mid_price), float(spread))
+        bid_adm = is_admissible(cpp_tier, q, zf, "bid")
+        ask_adm = is_admissible(cpp_tier, q, zf, "ask")
+
+        bid = masked_quote_summary(cpp_tier, q, zf, "bid", mid_price, spread)
+        ask = masked_quote_summary(cpp_tier, q, zf, "ask", mid_price, spread)
 
         rows.append(
             {
+                "role": spec.role,
                 "q": float(q),
                 "z": zf,
-                "Bid delta": round(float(bid.delta), 6),
-                "Ask delta": round(float(ask.delta), 6),
-                "Bid improvement [% of spread]": round(float(bid.price_improvement_pct_of_spread), 2),
-                "Ask improvement [% of spread]": round(float(ask.price_improvement_pct_of_spread), 2),
-                "Bid improvement [pips]": round(float(bid.price_improvement_pips), 3),
-                "Ask improvement [pips]": round(float(ask.price_improvement_pips), 3),
-                "Bid vs mid [pips]": round(float(bid.quote_relative_to_mid_pips), 3),
-                "Ask vs mid [pips]": round(float(ask.quote_relative_to_mid_pips), 3),
-                "Bid dist to mid [pips]": round(float(bid.distance_to_mid_pips), 3),
-                "Ask dist to mid [pips]": round(float(ask.distance_to_mid_pips), 3),
-                "Bid vol premium [pips]": round(float(bid.volume_premium_pips), 3),
-                "Ask vol premium [pips]": round(float(ask.volume_premium_pips), 3),
-                "Bid quote": round(float(bid.quote_price), 6),
-                "Ask quote": round(float(ask.quote_price), 6),
+                "Bid admissible": bid_adm,
+                "Ask admissible": ask_adm,
+                "Bid delta": np.nan if bid is None else round(float(bid.delta), 6),
+                "Ask delta": np.nan if ask is None else round(float(ask.delta), 6),
+                "Bid improvement [% of spread]": np.nan if bid is None else round(float(bid.price_improvement_pct_of_spread), 2),
+                "Ask improvement [% of spread]": np.nan if ask is None else round(float(ask.price_improvement_pct_of_spread), 2),
+                "Bid improvement [pips]": np.nan if bid is None else round(float(bid.price_improvement_pips), 3),
+                "Ask improvement [pips]": np.nan if ask is None else round(float(ask.price_improvement_pips), 3),
+                "Bid vs mid [pips]": np.nan if bid is None else round(float(bid.quote_relative_to_mid_pips), 3),
+                "Ask vs mid [pips]": np.nan if ask is None else round(float(ask.quote_relative_to_mid_pips), 3),
+                "Bid dist to mid [pips]": np.nan if bid is None else round(float(bid.distance_to_mid_pips), 3),
+                "Ask dist to mid [pips]": np.nan if ask is None else round(float(ask.distance_to_mid_pips), 3),
+                "Bid vol premium [pips]": np.nan if bid is None else round(float(bid.volume_premium_pips), 3),
+                "Ask vol premium [pips]": np.nan if ask is None else round(float(ask.volume_premium_pips), 3),
+                "Bid quote": np.nan if bid is None else round(float(bid.quote_price), 6),
+                "Ask quote": np.nan if ask is None else round(float(ask.quote_price), 6),
             }
         )
 
@@ -503,8 +722,9 @@ def make_convergence_rhs_figure(solution: lp.HJBSolution) -> go.Figure:
 st.set_page_config(page_title="Trinity 2.0 Pricer", layout="wide")
 st.title("Trinity 2.0 Pricer")
 st.markdown(
-    "Clean baseline version. ECN is priced exactly like any other tier. "
-    "Different tiers only differ through flow curve, markout, sizes, and bounds."
+    "Customer tiers remain rung-by-rung ladder controls. "
+    "ECN tiers are low-dimensional hedge channels: they always quote size z = 1, "
+    "only the inventory-reducing side is active, and the active quote follows an exponential policy whose decay is optimized in C++."
 )
 
 with st.sidebar:
@@ -681,7 +901,7 @@ with st.expander("Solver diagnostics", expanded=False):
     st.plotly_chart(make_convergence_h_figure(solution), use_container_width=True)
     st.plotly_chart(make_convergence_rhs_figure(solution), use_container_width=True)
 
-tab_names = [spec.name for spec in tier_specs]
+tab_names = [f"{spec.name} [{spec.role}]" for spec in tier_specs]
 tabs = st.tabs(tab_names)
 
 available_q = [float(q) for q in solution.q_grid]
@@ -689,12 +909,39 @@ available_q = [float(q) for q in solution.q_grid]
 for tab, spec, cpp_tier in zip(tabs, tier_specs, solution.tiers):
     with tab:
         st.subheader(f"Tier: {spec.name}")
+        st.caption(f"Role: {spec.role}")
+
+        if spec.role == "ecn":
+            c1, c2, c3 = st.columns(3)
+            c1.metric("quoted size", "1.0")
+            c2.metric("delta_start", f"{float(cpp_tier.ecn_policy.delta_start):.4f}")
+            c3.metric("optimized decay", f"{float(cpp_tier.ecn_policy.decay):.4f}")
+
+            c4, c5, c6 = st.columns(3)
+            c4.metric("delta_target", f"{float(cpp_tier.ecn_policy.delta_target):.4f}")
+            c5.metric("decay min", f"{float(cpp_tier.ecn_policy.decay_min):.4f}")
+            c6.metric("decay max", f"{float(cpp_tier.ecn_policy.decay_max):.4f}")
+
+            st.info(
+                "This ECN tier is a one-size hedge channel. "
+                "Only the inventory-reducing side is active, and its quote follows a smooth exponential function of |q|."
+            )
 
         with st.expander("Tier parameters", expanded=False):
             st.dataframe(make_flow_parameter_table(spec, cpp_tier), use_container_width=True)
 
         st.plotly_chart(make_flow_curve_figure(cpp_tier, spec), use_container_width=True)
-        st.plotly_chart(make_quote_inventory_figure(cpp_tier, spec, float(config.spread), float(mid_price)), use_container_width=True)
+
+        if spec.role == "ecn":
+            st.plotly_chart(
+                make_ecn_decay_figure(cpp_tier, float(config.spread)),
+                use_container_width=True,
+            )
+
+        st.plotly_chart(
+            make_quote_inventory_figure(cpp_tier, spec, float(config.spread), float(mid_price)),
+            use_container_width=True,
+        )
 
         default_q_single = 0.0 if 0.0 in available_q else available_q[len(available_q) // 2]
 
@@ -725,16 +972,16 @@ for tab, spec, cpp_tier in zip(tabs, tier_specs, solution.tiers):
 with st.expander("What this app is solving"):
     st.markdown(
         r"""
-All tiers, including ECN, use the same two-sided structure:
+Customer tiers use the usual rung-by-rung two-sided ladder optimization.
 
-$$
--\phi(q) + \mu_{\text{spot}} q
-+ \sum_{\text{tier}} \sum_z \Big[
-\lambda(\delta^b, z)\big(z\,s(0.5-\delta^b) - z\mu(z) + h(q+z)-h(q)\big)
-+
-\lambda(\delta^a, z)\big(z\,s(0.5-\delta^a) - z\mu(z) + h(q-z)-h(q)\big)
-\Big].
-$$
+ECN tiers are different:
+
+- the quoted size is fixed to \(z = 1\)
+- only the inventory-reducing side is admissible
+- the active ECN quote is parameterized as an exponential function of \(|q|\)
+- the decay parameter is optimized in C++ against the current value function \(h(q)\)
+
+So ECN is treated as a smooth hedge channel rather than a full ladder optimization problem.
 
 The inventory grid must be:
 

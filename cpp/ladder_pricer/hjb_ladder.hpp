@@ -126,6 +126,12 @@ inline const char* side_name(Side side) {
     return side == Side::Bid ? "bid" : "ask";
 }
 
+enum class TierRole : unsigned char { Customer, ECN };
+
+inline const char* tier_role_name(TierRole role) {
+    return role == TierRole::Customer ? "customer" : "ecn";
+}
+
 // ============================================================
 // Abstract model components
 // ============================================================
@@ -251,6 +257,58 @@ struct LinearInterpolator1D {
             throw std::runtime_error("LinearInterpolator1D is not initialized.");
         }
         return interp_linear(*grid, *vals, x);
+    }
+};
+
+// ============================================================
+// ECN parametric policy
+// ============================================================
+
+struct ExponentialECNPolicy {
+    double delta_start{0.10};   // quote at |q| = 1
+    double delta_target{0.50};  // mid in current convention
+    double decay{2.0};          // optimized parameter
+    double decay_min{0.25};
+    double decay_max{10.0};
+
+    ExponentialECNPolicy() = default;
+
+    ExponentialECNPolicy(
+        double delta_start_,
+        double delta_target_,
+        double decay_,
+        double decay_min_,
+        double decay_max_
+    )
+        : delta_start(delta_start_),
+          delta_target(delta_target_),
+          decay(decay_),
+          decay_min(decay_min_),
+          decay_max(decay_max_) {
+        validate();
+    }
+
+    void validate() const {
+        if (decay_min <= 0.0) {
+            throw std::invalid_argument("ExponentialECNPolicy: decay_min must be positive.");
+        }
+        if (decay_max <= decay_min) {
+            throw std::invalid_argument("ExponentialECNPolicy: decay_max must be > decay_min.");
+        }
+        if (decay <= 0.0) {
+            throw std::invalid_argument("ExponentialECNPolicy: decay must be positive.");
+        }
+        if (delta_target < delta_start) {
+            throw std::invalid_argument(
+                "ExponentialECNPolicy: delta_target must be >= delta_start."
+            );
+        }
+    }
+
+    double delta_at_abs_inventory(double q_abs, double decay_override = -1.0) const {
+        const double tau = decay_override > 0.0 ? decay_override : decay;
+        const double x = std::max(q_abs - 1.0, 0.0);
+        return delta_target - (delta_target - delta_start) * std::exp(-x / tau);
     }
 };
 
@@ -465,6 +523,7 @@ struct QuotePolicy {
 
 struct PriceTier {
     std::string name;
+    TierRole role{TierRole::Customer};
     std::vector<double> sizes;
     std::shared_ptr<FlowCurve> flow_curve;
     std::shared_ptr<MarkoutModel> markout_model;
@@ -472,6 +531,7 @@ struct PriceTier {
     double delta_min{-5.0};
     double delta_max{5.0};
 
+    ExponentialECNPolicy ecn_policy{};
     QuotePolicy policy;
 
     PriceTier() = default;
@@ -482,14 +542,18 @@ struct PriceTier {
         std::shared_ptr<FlowCurve> flow_curve_,
         std::shared_ptr<MarkoutModel> markout_model_,
         double delta_min_ = -5.0,
-        double delta_max_ = 5.0
+        double delta_max_ = 5.0,
+        TierRole role_ = TierRole::Customer,
+        ExponentialECNPolicy ecn_policy_ = ExponentialECNPolicy{}
     )
         : name(std::move(name_)),
+          role(role_),
           sizes(std::move(sizes_)),
           flow_curve(std::move(flow_curve_)),
           markout_model(std::move(markout_model_)),
           delta_min(delta_min_),
-          delta_max(delta_max_) {
+          delta_max(delta_max_),
+          ecn_policy(std::move(ecn_policy_)) {
         validate();
     }
 
@@ -510,10 +574,55 @@ struct PriceTier {
                 throw std::invalid_argument("PriceTier: sizes must be positive.");
             }
         }
+
+        if (is_ecn()) {
+            constexpr double tol = 1e-12;
+            ecn_policy.validate();
+
+            if (sizes.size() != 1 || std::abs(sizes.front() - 1.0) > tol) {
+                throw std::invalid_argument(
+                    "PriceTier: ECN tiers must quote exactly one size, z = 1."
+                );
+            }
+            if (ecn_policy.delta_start < delta_min || ecn_policy.delta_start > delta_max) {
+                throw std::invalid_argument(
+                    "PriceTier: ECN delta_start must lie inside [delta_min, delta_max]."
+                );
+            }
+            if (ecn_policy.delta_target < delta_min || ecn_policy.delta_target > delta_max) {
+                throw std::invalid_argument(
+                    "PriceTier: ECN delta_target must lie inside [delta_min, delta_max]."
+                );
+            }
+        }
+    }
+
+    bool is_customer() const {
+        return role == TierRole::Customer;
+    }
+
+    bool is_ecn() const {
+        return role == TierRole::ECN;
     }
 
     static double next_inventory(double q, double z, Side side) {
         return side == Side::Bid ? q + z : q - z;
+    }
+
+    static bool is_inventory_reducing_side(double q, Side side, double tol = 1e-12) {
+        return (q > tol && side == Side::Ask) || (q < -tol && side == Side::Bid);
+    }
+
+    static bool size_does_not_cross_flat(double q, double z, double tol = 1e-12) {
+        return z <= std::abs(q) + tol;
+    }
+
+    bool is_admissible(double q, double z, Side side, double tol = 1e-12) const {
+        if (is_customer()) {
+            return true;
+        }
+        return is_inventory_reducing_side(q, side, tol) &&
+               size_does_not_cross_flat(q, z, tol);
     }
 
     double arrival_rate(double delta, double z) const {
@@ -522,6 +631,13 @@ struct PriceTier {
 
     double expected_markout(double z) const {
         return markout_model->expected_markout(z);
+    }
+
+    double ecn_active_delta(double q, double decay_override = -1.0) const {
+        if (!is_ecn()) {
+            throw std::runtime_error("ecn_active_delta called on non-ECN tier.");
+        }
+        return ecn_policy.delta_at_abs_inventory(std::abs(q), decay_override);
     }
 
     double quote(double q, double z, Side side) const {
@@ -739,7 +855,7 @@ struct LadderBoundsPolicy {
 };
 
 // ============================================================
-// Policy builder
+// Customer-tier policy builder
 // ============================================================
 
 struct TierPolicyBuilder {
@@ -787,6 +903,23 @@ struct TierPolicyBuilder {
         return *bounds_policy;
     }
 
+    double inactive_delta() const {
+        return price_tier().delta_min;
+    }
+
+    bool is_admissible(double q, double z, Side side) const {
+        return price_tier().is_admissible(q, z, side);
+    }
+
+    bool row_has_any_admissible_quotes(double q, Side side) const {
+        for (double z : price_tier().sizes) {
+            if (is_admissible(q, z, side)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     double continuation_change(double q, double z, Side side) const {
         return h(PriceTier::next_inventory(q, z, side)) - h(q);
     }
@@ -808,9 +941,15 @@ struct TierPolicyBuilder {
         const std::vector<double>* prev_delta = nullptr
     ) const {
         const std::size_t n = price_tier().sizes.size();
-        delta.assign(n, 0.0);
+        delta.assign(n, inactive_delta());
 
         for (std::size_t j = 0; j < n; ++j) {
+            const double z = price_tier().sizes[j];
+            if (!is_admissible(q, z, side)) {
+                delta[j] = inactive_delta();
+                continue;
+            }
+
             auto [lower, upper] =
                 bounds().bounds_for_rung(j, delta, q, side, prev_delta);
 
@@ -827,7 +966,6 @@ struct TierPolicyBuilder {
                 upper = lower;
             }
 
-            const double z = price_tier().sizes[j];
             const auto obj = [&](double d) {
                 return objective(q, z, side, d);
             };
@@ -845,13 +983,33 @@ struct TierPolicyBuilder {
         build_side_ladder(policy.bid[q0_idx], q_grid[q0_idx], Side::Bid, nullptr);
 
         for (std::size_t i = q0_idx + 1; i < nq; ++i) {
-            build_side_ladder(policy.ask[i], q_grid[i], Side::Ask, &policy.ask[i - 1]);
-            build_side_ladder(policy.bid[i], q_grid[i], Side::Bid, &policy.bid[i - 1]);
+            const bool curr_ask_active = row_has_any_admissible_quotes(q_grid[i], Side::Ask);
+            const bool prev_ask_active = row_has_any_admissible_quotes(q_grid[i - 1], Side::Ask);
+            const std::vector<double>* prev_ask =
+                (curr_ask_active && prev_ask_active) ? &policy.ask[i - 1] : nullptr;
+
+            const bool curr_bid_active = row_has_any_admissible_quotes(q_grid[i], Side::Bid);
+            const bool prev_bid_active = row_has_any_admissible_quotes(q_grid[i - 1], Side::Bid);
+            const std::vector<double>* prev_bid =
+                (curr_bid_active && prev_bid_active) ? &policy.bid[i - 1] : nullptr;
+
+            build_side_ladder(policy.ask[i], q_grid[i], Side::Ask, prev_ask);
+            build_side_ladder(policy.bid[i], q_grid[i], Side::Bid, prev_bid);
         }
 
         for (std::size_t i = q0_idx; i-- > 0;) {
-            build_side_ladder(policy.ask[i], q_grid[i], Side::Ask, &policy.ask[i + 1]);
-            build_side_ladder(policy.bid[i], q_grid[i], Side::Bid, &policy.bid[i + 1]);
+            const bool curr_ask_active = row_has_any_admissible_quotes(q_grid[i], Side::Ask);
+            const bool next_ask_active = row_has_any_admissible_quotes(q_grid[i + 1], Side::Ask);
+            const std::vector<double>* next_ask =
+                (curr_ask_active && next_ask_active) ? &policy.ask[i + 1] : nullptr;
+
+            const bool curr_bid_active = row_has_any_admissible_quotes(q_grid[i], Side::Bid);
+            const bool next_bid_active = row_has_any_admissible_quotes(q_grid[i + 1], Side::Bid);
+            const std::vector<double>* next_bid =
+                (curr_bid_active && next_bid_active) ? &policy.bid[i + 1] : nullptr;
+
+            build_side_ladder(policy.ask[i], q_grid[i], Side::Ask, next_ask);
+            build_side_ladder(policy.bid[i], q_grid[i], Side::Bid, next_bid);
         }
     }
 };
@@ -995,10 +1153,101 @@ struct HJBLadderSolver {
         return LinearInterpolator1D{&config.q_grid, &h_vec};
     }
 
+    double ecn_local_objective(
+        const PriceTier& tier,
+        const LinearInterpolator1D& h_view,
+        double q,
+        double decay
+    ) const {
+        const double z = 1.0;
+        const Side side = q > 0.0 ? Side::Ask : Side::Bid;
+        const double delta = tier.ecn_active_delta(q, decay);
+        const double mu = tier.expected_markout(z);
+        const double lam = tier.arrival_rate(delta, z);
+        const double dq = h_view(PriceTier::next_inventory(q, z, side)) - h_view(q);
+        return lam * (config.spread * z * (0.5 - delta) - z * mu + dq);
+    }
+
+    double optimize_ecn_decay_unchecked(
+        PriceTier& tier,
+        const std::vector<double>& h_vec
+    ) const {
+        if (!tier.is_ecn()) {
+            return tier.ecn_policy.decay;
+        }
+
+        const LinearInterpolator1D h_view = make_h_view(h_vec);
+        bool has_any_active_state = false;
+        for (double q : config.q_grid) {
+            if (tier.is_admissible(q, 1.0, q > 0.0 ? Side::Ask : Side::Bid)) {
+                has_any_active_state = true;
+                break;
+            }
+        }
+        if (!has_any_active_state) {
+            return tier.ecn_policy.decay;
+        }
+
+        const auto objective = [&](double decay) {
+            double total = 0.0;
+            for (double q : config.q_grid) {
+                if (q > 0.0 && tier.is_admissible(q, 1.0, Side::Ask)) {
+                    total += ecn_local_objective(tier, h_view, q, decay);
+                } else if (q < 0.0 && tier.is_admissible(q, 1.0, Side::Bid)) {
+                    total += ecn_local_objective(tier, h_view, q, decay);
+                }
+            }
+            return total;
+        };
+
+        return clamp(
+            optimizer.maximize(
+                objective,
+                tier.ecn_policy.decay_min,
+                tier.ecn_policy.decay_max
+            ),
+            tier.ecn_policy.decay_min,
+            tier.ecn_policy.decay_max
+        );
+    }
+
+    void build_ecn_policy_from_decay_unchecked(PriceTier& tier) const {
+        if (!tier.is_ecn()) {
+            return;
+        }
+
+        const double z = 1.0;
+        const double parked_delta = tier.ecn_policy.delta_target;
+
+        for (std::size_t i = 0; i < config.q_grid.size(); ++i) {
+            const double q = config.q_grid[i];
+
+            tier.policy.bid[i][0] = parked_delta;
+            tier.policy.ask[i][0] = parked_delta;
+
+            if (tier.is_admissible(q, z, Side::Ask)) {
+                tier.policy.ask[i][0] = tier.ecn_active_delta(q);
+            }
+            if (tier.is_admissible(q, z, Side::Bid)) {
+                tier.policy.bid[i][0] = tier.ecn_active_delta(q);
+            }
+        }
+    }
+
     void update_policies_unchecked(const std::vector<double>& h_vec) {
         for (std::size_t k = 0; k < tiers.size(); ++k) {
-            tier_policy_builders_[k].set_h_view(config.q_grid, h_vec);
-            tier_policy_builders_[k].build_policy_inplace(tiers[k]->policy);
+            if (tiers[k]->is_customer()) {
+                tier_policy_builders_[k].set_h_view(config.q_grid, h_vec);
+                tier_policy_builders_[k].build_policy_inplace(tiers[k]->policy);
+            }
+        }
+
+        for (auto& tier_ptr : tiers) {
+            if (!tier_ptr->is_ecn()) {
+                continue;
+            }
+            tier_ptr->ecn_policy.decay = optimize_ecn_decay_unchecked(*tier_ptr, h_vec);
+            build_ecn_policy_from_decay_unchecked(*tier_ptr);
         }
     }
 
@@ -1018,15 +1267,21 @@ struct HJBLadderSolver {
                     const double z = tier->sizes[j];
                     const double mu = tier->expected_markout(z);
 
-                    const double d_b = tier->policy.delta_at_index(i, j, Side::Bid);
-                    const double dq_b = h_view(PriceTier::next_inventory(q, z, Side::Bid)) - h_view(q);
-                    const double lam_b = tier->arrival_rate(d_b, z);
-                    val += lam_b * (config.spread * z * (0.5 - d_b) - z * mu + dq_b);
+                    if (tier->is_admissible(q, z, Side::Bid)) {
+                        const double d_b = tier->policy.delta_at_index(i, j, Side::Bid);
+                        const double dq_b =
+                            h_view(PriceTier::next_inventory(q, z, Side::Bid)) - h_view(q);
+                        const double lam_b = tier->arrival_rate(d_b, z);
+                        val += lam_b * (config.spread * z * (0.5 - d_b) - z * mu + dq_b);
+                    }
 
-                    const double d_a = tier->policy.delta_at_index(i, j, Side::Ask);
-                    const double dq_a = h_view(PriceTier::next_inventory(q, z, Side::Ask)) - h_view(q);
-                    const double lam_a = tier->arrival_rate(d_a, z);
-                    val += lam_a * (config.spread * z * (0.5 - d_a) - z * mu + dq_a);
+                    if (tier->is_admissible(q, z, Side::Ask)) {
+                        const double d_a = tier->policy.delta_at_index(i, j, Side::Ask);
+                        const double dq_a =
+                            h_view(PriceTier::next_inventory(q, z, Side::Ask)) - h_view(q);
+                        const double lam_a = tier->arrival_rate(d_a, z);
+                        val += lam_a * (config.spread * z * (0.5 - d_a) - z * mu + dq_a);
+                    }
                 }
             }
 
