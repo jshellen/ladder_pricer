@@ -1,10 +1,10 @@
-#include <memory>
-#include <stdexcept>
-#include <string>
-#include <vector>
-
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "hjb_ladder.hpp"
 
@@ -13,42 +13,64 @@ using namespace hjb;
 
 namespace {
 
-Side parse_side(const std::string& side) {
-    if (side == "bid" || side == "Bid") return Side::Bid;
-    if (side == "ask" || side == "Ask") return Side::Ask;
-    throw std::invalid_argument("Unknown side: " + side);
+Side parse_side_string(const std::string& side) {
+    if (side == "bid" || side == "Bid" || side == "BID") {
+        return Side::Bid;
+    }
+    if (side == "ask" || side == "Ask" || side == "ASK") {
+        return Side::Ask;
+    }
+    throw std::invalid_argument("side must be 'bid' or 'ask'.");
+}
+
+Side parse_side_object(const py::object& side_obj) {
+    if (py::isinstance<py::str>(side_obj)) {
+        return parse_side_string(side_obj.cast<std::string>());
+    }
+    return side_obj.cast<Side>();
+}
+
+inline void validate_h_vec_against_solver(
+    const HJBLadderSolver& solver,
+    const std::vector<double>& h_vec,
+    const char* caller_name
+) {
+    if (h_vec.size() != solver.config.q_grid.size()) {
+        throw std::invalid_argument(
+            std::string(caller_name) +
+            ": h_vec size must match solver.config.q_grid size."
+        );
+    }
+}
+
+inline OptionalDeltaRow make_optional_delta_row(
+    const std::optional<std::vector<double>>& prev_delta
+) {
+    if (prev_delta) {
+        return std::cref(*prev_delta);
+    }
+    return std::nullopt;
 }
 
 } // namespace
 
 PYBIND11_MODULE(ladder_pricer, m) {
-    m.doc() = "Inventory-based HJB ladder pricer";
+    m.doc() = "Pybind11 bindings for hjb ladder solver";
 
     py::enum_<Side>(m, "Side")
         .value("Bid", Side::Bid)
         .value("Ask", Side::Ask)
         .export_values();
 
-    py::class_<FlowCurve, std::shared_ptr<FlowCurve>>(m, "FlowCurve")
-        .def("hit_ratio", &FlowCurve::hit_ratio)
-        .def("arrival_rate", &FlowCurve::arrival_rate);
-
-    py::class_<MarkoutModel, std::shared_ptr<MarkoutModel>>(m, "MarkoutModel")
-        .def("expected_markout", &MarkoutModel::expected_markout);
-
-    py::class_<InventoryPenalty, std::shared_ptr<InventoryPenalty>>(m, "InventoryPenalty")
-        .def("value", &InventoryPenalty::value);
-
-    py::class_<LogisticFlowCurve, FlowCurve, std::shared_ptr<LogisticFlowCurve>>(
-        m, "LogisticFlowCurve"
-    )
+    py::class_<LogisticFlowCurve>(m, "LogisticFlowCurve")
+        .def(py::init<>())
         .def(
             py::init<double, double, double, double, double, double>(),
-            py::arg("A0") = 1.0,
-            py::arg("theta") = 0.0,
-            py::arg("shift") = 0.20,
-            py::arg("steepness") = 10.0,
-            py::arg("volume_shift") = 0.05,
+            py::arg("A0"),
+            py::arg("theta"),
+            py::arg("shift"),
+            py::arg("steepness"),
+            py::arg("volume_shift"),
             py::arg("z_floor") = 1e-8
         )
         .def_readwrite("A0", &LogisticFlowCurve::A0)
@@ -57,41 +79,33 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("steepness", &LogisticFlowCurve::steepness)
         .def_readwrite("volume_shift", &LogisticFlowCurve::volume_shift)
         .def_readwrite("z_floor", &LogisticFlowCurve::z_floor)
-        .def("A", &LogisticFlowCurve::A)
-        .def("hit_ratio", &LogisticFlowCurve::hit_ratio)
-        .def("arrival_rate", &LogisticFlowCurve::arrival_rate);
+        .def("A", &LogisticFlowCurve::A, py::arg("z"))
+        .def("hit_ratio", &LogisticFlowCurve::hit_ratio, py::arg("delta"), py::arg("z"))
+        .def("arrival_rate", &LogisticFlowCurve::arrival_rate, py::arg("delta"), py::arg("z"));
 
-    py::class_<SqrtMarkoutModel, MarkoutModel, std::shared_ptr<SqrtMarkoutModel>>(
-        m, "SqrtMarkoutModel"
-    )
-        .def(
-            py::init<double, double>(),
-            py::arg("base") = 0.005,
-            py::arg("coeff") = 0.003
-        )
+    py::class_<SqrtMarkoutModel>(m, "SqrtMarkoutModel")
+        .def(py::init<>())
+        .def(py::init<double, double>(), py::arg("base"), py::arg("coeff"))
         .def_readwrite("base", &SqrtMarkoutModel::base)
         .def_readwrite("coeff", &SqrtMarkoutModel::coeff)
-        .def("expected_markout", &SqrtMarkoutModel::expected_markout);
+        .def("expected_markout", &SqrtMarkoutModel::expected_markout, py::arg("z"));
 
-    py::class_<
-        PolynomialInventoryPenalty,
-        InventoryPenalty,
-        std::shared_ptr<PolynomialInventoryPenalty>
-    >(m, "PolynomialInventoryPenalty")
+    py::class_<PolynomialInventoryPenalty>(m, "PolynomialInventoryPenalty")
+        .def(py::init<>())
         .def(
             py::init<double, double, double, double, double>(),
-            py::arg("risk_aversion") = 2.0,
-            py::arg("sigma") = 0.25,
-            py::arg("tau0") = 2.0,
-            py::arg("cubic_coeff") = 0.1,
-            py::arg("quartic_coeff") = 0.0015
+            py::arg("risk_aversion"),
+            py::arg("sigma"),
+            py::arg("tau0"),
+            py::arg("tau1"),
+            py::arg("tau2")
         )
         .def_readwrite("risk_aversion", &PolynomialInventoryPenalty::risk_aversion)
         .def_readwrite("sigma", &PolynomialInventoryPenalty::sigma)
         .def_readwrite("tau0", &PolynomialInventoryPenalty::tau0)
-        .def_readwrite("cubic_coeff", &PolynomialInventoryPenalty::cubic_coeff)
-        .def_readwrite("quartic_coeff", &PolynomialInventoryPenalty::quartic_coeff)
-        .def("value", &PolynomialInventoryPenalty::value);
+        .def_readwrite("tau1", &PolynomialInventoryPenalty::tau1)
+        .def_readwrite("tau2", &PolynomialInventoryPenalty::tau2)
+        .def("value", &PolynomialInventoryPenalty::value, py::arg("q"));
 
     py::class_<ExponentialECNPolicy>(m, "ExponentialECNPolicy")
         .def(py::init<>())
@@ -110,11 +124,6 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("decay_max", &ExponentialECNPolicy::decay_max)
         .def("validate", &ExponentialECNPolicy::validate)
         .def(
-            "delta_at_abs_inventory",
-            &ExponentialECNPolicy::delta_at_abs_inventory,
-            py::arg("q_abs")
-        )
-        .def(
             "delta_at_abs_inventory_with_decay",
             &ExponentialECNPolicy::delta_at_abs_inventory_with_decay,
             py::arg("q_abs"),
@@ -125,7 +134,10 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def(py::init<>())
         .def_readwrite("delta", &QuoteSummary::delta)
         .def_readwrite("price_improvement_frac", &QuoteSummary::price_improvement_frac)
-        .def_readwrite("price_improvement_pct_of_spread", &QuoteSummary::price_improvement_pct_of_spread)
+        .def_readwrite(
+            "price_improvement_pct_of_spread",
+            &QuoteSummary::price_improvement_pct_of_spread
+        )
         .def_readwrite("price_improvement_pips", &QuoteSummary::price_improvement_pips)
         .def_readwrite("quote_relative_to_mid", &QuoteSummary::quote_relative_to_mid)
         .def_readwrite("quote_relative_to_mid_pips", &QuoteSummary::quote_relative_to_mid_pips)
@@ -134,6 +146,77 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("reference_delta", &QuoteSummary::reference_delta)
         .def_readwrite("volume_premium_pips", &QuoteSummary::volume_premium_pips)
         .def_readwrite("quote_price", &QuoteSummary::quote_price);
+
+    py::class_<QuoteMetrics>(m, "QuoteMetrics")
+        .def(py::init<>())
+        .def_readonly_static("pips_per_unit", &QuoteMetrics::pips_per_unit)
+        .def_static(
+            "price_improvement",
+            &QuoteMetrics::price_improvement,
+            py::arg("delta"),
+            py::arg("spread")
+        )
+        .def_static(
+            "price_improvement_pct_of_spread",
+            &QuoteMetrics::price_improvement_pct_of_spread,
+            py::arg("delta")
+        )
+        .def_static(
+            "price_improvement_pips",
+            &QuoteMetrics::price_improvement_pips,
+            py::arg("delta"),
+            py::arg("spread")
+        )
+        .def_static(
+            "quote_relative_to_mid",
+            &QuoteMetrics::quote_relative_to_mid,
+            py::arg("delta"),
+            py::arg("side"),
+            py::arg("spread")
+        )
+        .def_static(
+            "quote_relative_to_mid_pips",
+            &QuoteMetrics::quote_relative_to_mid_pips,
+            py::arg("delta"),
+            py::arg("side"),
+            py::arg("spread")
+        )
+        .def_static(
+            "distance_to_mid",
+            &QuoteMetrics::distance_to_mid,
+            py::arg("delta"),
+            py::arg("spread")
+        )
+        .def_static(
+            "distance_to_mid_pips",
+            &QuoteMetrics::distance_to_mid_pips,
+            py::arg("delta"),
+            py::arg("spread")
+        )
+        .def_static(
+            "volume_premium_pips",
+            &QuoteMetrics::volume_premium_pips,
+            py::arg("delta_ref"),
+            py::arg("delta_cur"),
+            py::arg("spread")
+        )
+        .def_static(
+            "quote_price",
+            &QuoteMetrics::quote_price,
+            py::arg("mid"),
+            py::arg("delta"),
+            py::arg("side"),
+            py::arg("spread")
+        )
+        .def_static(
+            "make_summary",
+            &QuoteMetrics::make_summary,
+            py::arg("delta"),
+            py::arg("delta_ref"),
+            py::arg("side"),
+            py::arg("mid"),
+            py::arg("spread")
+        );
 
     py::class_<QuotePolicy>(m, "QuotePolicy")
         .def(py::init<>())
@@ -148,266 +231,28 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("sizes", &QuotePolicy::sizes)
         .def_readwrite("bid", &QuotePolicy::bid)
         .def_readwrite("ask", &QuotePolicy::ask)
-        .def("validate", &QuotePolicy::validate)
+        .def_static(
+            "resize_matrix",
+            [](Matrix mat, std::size_t rows, std::size_t cols) {
+                QuotePolicy::resize_matrix(mat, rows, cols);
+                return mat;
+            },
+            py::arg("mat"),
+            py::arg("rows"),
+            py::arg("cols")
+        )
         .def("reset_shape", &QuotePolicy::reset_shape, py::arg("q_grid"), py::arg("sizes"))
-        .def(
-            "delta_at_index",
-            [](const QuotePolicy& self, std::size_t i, std::size_t j, Side side) {
-                return self.delta_at_index(i, j, side);
-            },
-            py::arg("i"),
-            py::arg("j"),
-            py::arg("side")
-        )
-        .def(
-            "delta_at_index",
-            [](const QuotePolicy& self, std::size_t i, std::size_t j, const std::string& side) {
-                return self.delta_at_index(i, j, parse_side(side));
-            },
-            py::arg("i"),
-            py::arg("j"),
-            py::arg("side")
-        )
-        .def(
-            "delta",
-            [](const QuotePolicy& self, double q, double z, Side side) {
-                return self.delta(q, z, side);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side")
-        )
-        .def(
-            "delta",
-            [](const QuotePolicy& self, double q, double z, const std::string& side) {
-                return self.delta(q, z, parse_side(side));
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side")
-        )
-        .def(
-            "reference_delta",
-            [](const QuotePolicy& self, double q, Side side) {
-                return self.reference_delta(q, side);
-            },
-            py::arg("q"),
-            py::arg("side")
-        )
-        .def(
-            "reference_delta",
-            [](const QuotePolicy& self, double q, const std::string& side) {
-                return self.reference_delta(q, parse_side(side));
-            },
-            py::arg("q"),
-            py::arg("side")
-        )
+        .def("validate", &QuotePolicy::validate)
+        .def("delta", &QuotePolicy::delta, py::arg("q"), py::arg("z"), py::arg("side"))
+        .def("reference_delta", &QuotePolicy::reference_delta, py::arg("q"), py::arg("side"))
         .def(
             "quote_summary",
-            [](const QuotePolicy& self, double q, double z, Side side, double mid, double spread) {
-                return self.quote_summary(q, z, side, mid, spread);
-            },
+            &QuotePolicy::quote_summary,
             py::arg("q"),
             py::arg("z"),
             py::arg("side"),
             py::arg("mid"),
             py::arg("spread")
-        )
-        .def(
-            "quote_summary",
-            [](const QuotePolicy& self, double q, double z, const std::string& side, double mid, double spread) {
-                return self.quote_summary(q, z, parse_side(side), mid, spread);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side"),
-            py::arg("mid"),
-            py::arg("spread")
-        );
-
-    py::class_<Tier, std::shared_ptr<Tier>>(m, "Tier")
-        .def_readwrite("name", &Tier::name)
-        .def_readwrite("flow_curve", &Tier::flow_curve)
-        .def_readwrite("markout_model", &Tier::markout_model)
-        .def_readwrite("policy", &Tier::policy)
-        .def("validate", &Tier::validate)
-        .def("tier_type_name", &Tier::tier_type_name)
-        .def(
-            "sizes",
-            [](const Tier& self) { return self.sizes(); }
-        )
-        .def("arrival_rate", &Tier::arrival_rate, py::arg("delta"), py::arg("z"))
-        .def("expected_markout", &Tier::expected_markout, py::arg("z"))
-        .def(
-            "is_admissible",
-            [](const Tier& self, double q, double z, Side side) {
-                return self.is_admissible(q, z, side);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side")
-        )
-        .def(
-            "is_admissible",
-            [](const Tier& self, double q, double z, const std::string& side) {
-                return self.is_admissible(q, z, parse_side(side));
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side")
-        )
-        .def(
-            "quote",
-            [](const Tier& self, double q, double z, Side side) {
-                return self.quote(q, z, side);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side")
-        )
-        .def(
-            "quote",
-            [](const Tier& self, double q, double z, const std::string& side) {
-                return self.quote(q, z, parse_side(side));
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side")
-        )
-        .def(
-            "quote_summary",
-            [](const Tier& self, double q, double z, Side side, double mid, double spread) {
-                return self.quote_summary(q, z, side, mid, spread);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side"),
-            py::arg("mid"),
-            py::arg("spread")
-        )
-        .def(
-            "quote_summary",
-            [](const Tier& self, double q, double z, const std::string& side, double mid, double spread) {
-                return self.quote_summary(q, z, parse_side(side), mid, spread);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side"),
-            py::arg("mid"),
-            py::arg("spread")
-        );
-
-    py::class_<MDPTier, Tier, std::shared_ptr<MDPTier>>(m, "MDPTier")
-        .def(py::init<>())
-        .def(
-            py::init<
-                std::string,
-                std::vector<double>,
-                std::shared_ptr<FlowCurve>,
-                std::shared_ptr<MarkoutModel>,
-                double,
-                double
-            >(),
-            py::arg("name"),
-            py::arg("sizes"),
-            py::arg("flow_curve"),
-            py::arg("markout_model"),
-            py::arg("delta_min") = -5.0,
-            py::arg("delta_max") = 5.0
-        )
-        .def_readwrite("sizes_", &MDPTier::sizes_)
-        .def_readwrite("delta_min", &MDPTier::delta_min)
-        .def_readwrite("delta_max", &MDPTier::delta_max)
-        .def("validate", &MDPTier::validate)
-        .def(
-            "sizes",
-            [](const MDPTier& self) { return self.sizes(); }
-        )
-        .def(
-            "is_admissible",
-            [](const MDPTier& self, double q, double z, Side side) {
-                return self.is_admissible(q, z, side);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side")
-        )
-        .def(
-            "is_admissible",
-            [](const MDPTier& self, double q, double z, const std::string& side) {
-                return self.is_admissible(q, z, parse_side(side));
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side")
-        );
-
-    py::class_<ECNTier, Tier, std::shared_ptr<ECNTier>>(m, "ECNTier")
-        .def(py::init<>())
-        .def(
-            py::init<
-                std::string,
-                std::shared_ptr<FlowCurve>,
-                std::shared_ptr<MarkoutModel>,
-                double,
-                double,
-                ExponentialECNPolicy
-            >(),
-            py::arg("name"),
-            py::arg("flow_curve"),
-            py::arg("markout_model"),
-            py::arg("delta_min") = -5.0,
-            py::arg("delta_max") = 5.0,
-            py::arg("ecn_policy") = ExponentialECNPolicy{}
-        )
-        .def_readwrite("delta_min", &ECNTier::delta_min)
-        .def_readwrite("delta_max", &ECNTier::delta_max)
-        .def_readwrite("ecn_policy", &ECNTier::ecn_policy)
-        .def("validate", &ECNTier::validate)
-        .def(
-            "sizes",
-            [](const ECNTier& self) { return self.sizes(); }
-        )
-        .def_static(
-            "is_active_side",
-            &ECNTier::is_active_side,
-            py::arg("q"),
-            py::arg("side"),
-            py::arg("tol") = 1e-12
-        )
-        .def_static(
-            "is_active_side",
-            [](double q, const std::string& side, double tol) {
-                return ECNTier::is_active_side(q, parse_side(side), tol);
-            },
-            py::arg("q"),
-            py::arg("side"),
-            py::arg("tol") = 1e-12
-        )
-        .def(
-            "is_admissible",
-            [](const ECNTier& self, double q, double z, Side side) {
-                return self.is_admissible(q, z, side);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side")
-        )
-        .def(
-            "is_admissible",
-            [](const ECNTier& self, double q, double z, const std::string& side) {
-                return self.is_admissible(q, z, parse_side(side));
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side")
-        )
-        .def("active_delta", &ECNTier::active_delta, py::arg("q"))
-        .def(
-            "active_delta_with_decay",
-            &ECNTier::active_delta_with_decay,
-            py::arg("q"),
-            py::arg("decay")
         );
 
     py::class_<SolverConfig>(m, "SolverConfig")
@@ -423,8 +268,20 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("tol_h", &SolverConfig::tol_h)
         .def_readwrite("tol_rhs", &SolverConfig::tol_rhs)
         .def_readwrite("min_iter", &SolverConfig::min_iter)
-        .def_readwrite("consecutive_passes_required", &SolverConfig::consecutive_passes_required)
+        .def_readwrite(
+            "consecutive_passes_required",
+            &SolverConfig::consecutive_passes_required
+        )
         .def("validate", &SolverConfig::validate);
+
+    py::class_<SolverGridMeta>(m, "SolverGridMeta")
+        .def(py::init<>())
+        .def_readwrite("nq", &SolverGridMeta::nq)
+        .def_readwrite("q0_idx", &SolverGridMeta::q0_idx)
+        .def_readwrite("q_min", &SolverGridMeta::q_min)
+        .def_readwrite("q_max", &SolverGridMeta::q_max);
+
+    m.def("build_solver_grid_meta", &build_solver_grid_meta, py::arg("q_grid"));
 
     py::class_<GoldenSectionSearch>(m, "GoldenSectionSearch")
         .def(py::init<>())
@@ -433,39 +290,146 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("max_iter", &GoldenSectionSearch::max_iter)
         .def("validate", &GoldenSectionSearch::validate);
 
-    py::class_<LadderBoundsPolicy>(m, "LadderBoundsPolicy")
+    py::class_<Tier>(m, "Tier")
+        .def_readwrite("name", &Tier::name)
+        .def_readwrite("flow_curve", &Tier::flow_curve)
+        .def_readwrite("markout_model", &Tier::markout_model)
+        .def_readwrite("policy", &Tier::policy)
+        .def("tier_type_name", &Tier::tier_type_name)
+        .def("sizes", &Tier::sizes, py::return_value_policy::reference_internal)
+
+        .def(
+            "A",
+            [](const Tier& self, double z) {
+                return self.flow_curve.A(z);
+            },
+            py::arg("z")
+        )
+        .def(
+            "hit_ratio",
+            [](const Tier& self, double delta, double z) {
+                return self.flow_curve.hit_ratio(delta, z);
+            },
+            py::arg("delta"),
+            py::arg("z")
+        )
+        .def(
+            "arrival_rate",
+            [](const Tier& self, double delta, double z) {
+                return self.flow_curve.arrival_rate(delta, z);
+            },
+            py::arg("delta"),
+            py::arg("z")
+        )
+        .def(
+            "expected_markout",
+            [](const Tier& self, double z) {
+                return self.markout_model.expected_markout(z);
+            },
+            py::arg("z")
+        )
+
+        .def(
+            "is_admissible",
+            [](const Tier& self, double q, double z, const py::object& side) {
+                return self.is_admissible(q, z, parse_side_object(side));
+            },
+            py::arg("q"),
+            py::arg("z"),
+            py::arg("side")
+        )
+        .def("validate", &Tier::validate)
+        .def("reset_policy_shape", &Tier::reset_policy_shape, py::arg("q_grid"))
+        .def(
+            "quote",
+            [](const Tier& self, double q, double z, const py::object& side) {
+                return self.quote(q, z, parse_side_object(side));
+            },
+            py::arg("q"),
+            py::arg("z"),
+            py::arg("side")
+        )
+        .def(
+            "quote_summary",
+            [](const Tier& self,
+               double q,
+               double z,
+               const py::object& side,
+               double mid,
+               double spread) {
+                return self.quote_summary(q, z, parse_side_object(side), mid, spread);
+            },
+            py::arg("q"),
+            py::arg("z"),
+            py::arg("side"),
+            py::arg("mid"),
+            py::arg("spread")
+        );
+
+    py::class_<MDPTier, Tier>(m, "MDPTier")
         .def(py::init<>())
-        .def(py::init<double, double>(), py::arg("delta_min"), py::arg("delta_max"))
-        .def_readwrite("delta_min", &LadderBoundsPolicy::delta_min)
-        .def_readwrite("delta_max", &LadderBoundsPolicy::delta_max)
-        .def("validate", &LadderBoundsPolicy::validate)
-        .def_static(
-            "is_shrink_mode",
-            &LadderBoundsPolicy::is_shrink_mode,
-            py::arg("q"),
-            py::arg("side")
+        .def(
+            py::init<
+                std::string,
+                std::vector<double>,
+                LogisticFlowCurve,
+                SqrtMarkoutModel,
+                double,
+                double
+            >(),
+            py::arg("name"),
+            py::arg("sizes"),
+            py::arg("flow_curve"),
+            py::arg("markout_model"),
+            py::arg("delta_min") = -5.0,
+            py::arg("delta_max") = 5.0
         )
-        .def_static(
-            "is_expand_mode",
-            &LadderBoundsPolicy::is_expand_mode,
-            py::arg("q"),
-            py::arg("side")
+        .def_readwrite("sizes_", &MDPTier::sizes_)
+        .def_readwrite("delta_min", &MDPTier::delta_min)
+        .def_readwrite("delta_max", &MDPTier::delta_max);
+
+    py::class_<ECNTier, Tier>(m, "ECNTier")
+        .def(py::init<>())
+        .def(
+            py::init<
+                std::string,
+                LogisticFlowCurve,
+                SqrtMarkoutModel,
+                double,
+                double,
+                ExponentialECNPolicy
+            >(),
+            py::arg("name"),
+            py::arg("flow_curve"),
+            py::arg("markout_model"),
+            py::arg("delta_min") = -5.0,
+            py::arg("delta_max") = 5.0,
+            py::arg("ecn_policy") = ExponentialECNPolicy{}
         )
+        .def_readwrite("delta_min", &ECNTier::delta_min)
+        .def_readwrite("delta_max", &ECNTier::delta_max)
+        .def_readwrite("ecn_policy", &ECNTier::ecn_policy)
         .def_static(
-            "is_shrink_mode",
-            [](double q, const std::string& side) {
-                return LadderBoundsPolicy::is_shrink_mode(q, parse_side(side));
+            "is_active_side",
+            [](double q, const py::object& side, double tol) {
+                return ECNTier::is_active_side(q, parse_side_object(side), tol);
             },
             py::arg("q"),
-            py::arg("side")
+            py::arg("side"),
+            py::arg("tol") = 1e-12
         )
-        .def_static(
-            "is_expand_mode",
-            [](double q, const std::string& side) {
-                return LadderBoundsPolicy::is_expand_mode(q, parse_side(side));
-            },
+        .def(
+            "active_delta_with_decay",
+            &ECNTier::active_delta_with_decay,
             py::arg("q"),
-            py::arg("side")
+            py::arg("decay")
+        )
+        .def(
+            "active_delta",
+            [](const ECNTier& self, double q) {
+                return self.active_delta_with_decay(q, self.ecn_policy.decay);
+            },
+            py::arg("q")
         );
 
     py::class_<SolverDiagnostics>(m, "SolverDiagnostics")
@@ -477,59 +441,210 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("final_max_rhs", &SolverDiagnostics::final_max_rhs)
         .def_readwrite("consecutive_passes", &SolverDiagnostics::consecutive_passes)
         .def_readwrite("history_max_h_change", &SolverDiagnostics::history_max_h_change)
-        .def_readwrite("history_max_rhs", &SolverDiagnostics::history_max_rhs);
+        .def_readwrite("history_max_rhs", &SolverDiagnostics::history_max_rhs)
+        .def("reserve", &SolverDiagnostics::reserve, py::arg("n_iter"))
+        .def(
+            "record_iteration",
+            &SolverDiagnostics::record_iteration,
+            py::arg("iteration"),
+            py::arg("max_h_change"),
+            py::arg("max_rhs")
+        )
+        .def(
+            "update_stopping_state",
+            &SolverDiagnostics::update_stopping_state,
+            py::arg("passes_now"),
+            py::arg("early_stop"),
+            py::arg("consecutive_passes_required")
+        );
 
     py::class_<HJBSolution>(m, "HJBSolution")
         .def(py::init<>())
         .def_readwrite("h", &HJBSolution::h)
         .def_readwrite("q_grid", &HJBSolution::q_grid)
-        .def_readwrite("tiers", &HJBSolution::tiers)
+        .def_readwrite("mdp_tiers", &HJBSolution::mdp_tiers)
+        .def_readwrite("ecn_tiers", &HJBSolution::ecn_tiers)
         .def_readwrite("diagnostics", &HJBSolution::diagnostics);
 
     py::class_<HJBLadderSolver>(m, "HJBLadderSolver")
         .def(
             py::init<
                 SolverConfig,
-                std::shared_ptr<InventoryPenalty>,
-                std::vector<std::shared_ptr<Tier>>
+                PolynomialInventoryPenalty,
+                std::vector<MDPTier>,
+                std::vector<ECNTier>
             >(),
             py::arg("config"),
             py::arg("penalty"),
-            py::arg("tiers")
+            py::arg("mdp_tiers") = std::vector<MDPTier>{},
+            py::arg("ecn_tiers") = std::vector<ECNTier>{}
         )
         .def_readwrite("config", &HJBLadderSolver::config)
         .def_readwrite("penalty", &HJBLadderSolver::penalty)
-        .def_readwrite("tiers", &HJBLadderSolver::tiers)
+        .def_readwrite("mdp_tiers", &HJBLadderSolver::mdp_tiers)
+        .def_readwrite("ecn_tiers", &HJBLadderSolver::ecn_tiers)
+        .def_readwrite("optimizer", &HJBLadderSolver::optimizer)
+        .def_readwrite("grid_meta_", &HJBLadderSolver::grid_meta_)
+
+        .def_static(
+            "validate_mdp_bounds_request",
+            [](std::size_t rung_idx,
+               const std::vector<double>& current_delta,
+               const std::optional<std::vector<double>>& prev_delta) {
+                HJBLadderSolver::validate_mdp_bounds_request(
+                    rung_idx,
+                    current_delta,
+                    make_optional_delta_row(prev_delta)
+                );
+            },
+            py::arg("rung_idx"),
+            py::arg("current_delta"),
+            py::arg("prev_delta") = std::nullopt
+        )
+        .def_static(
+            "repair_or_throw_bounds",
+            [](double lower,
+               double upper,
+               const std::string& tier_name,
+               const char* side_name) {
+                HJBLadderSolver::repair_or_throw_bounds(lower, upper, tier_name, side_name);
+                return std::make_pair(lower, upper);
+            },
+            py::arg("lower"),
+            py::arg("upper"),
+            py::arg("tier_name"),
+            py::arg("side_name")
+        )
+
+        .def("validate_problem_definition", &HJBLadderSolver::validate_problem_definition)
+        .def("initialize_policy_shapes", &HJBLadderSolver::initialize_policy_shapes)
+        .def("prepare_solve_context", &HJBLadderSolver::prepare_solve_context)
+
         .def(
-            "bellman_rhs_from_policies",
-            [](const HJBLadderSolver& self, const std::vector<double>& h_vec) {
-                if (h_vec.size() != self.config.q_grid.size()) {
-                    throw std::invalid_argument(
-                        "bellman_rhs_from_policies: h_vec size must match config.q_grid size."
-                    );
-                }
-                std::vector<double> rhs(self.config.q_grid.size(), 0.0);
-                self.bellman_rhs_from_policies_unchecked(h_vec, rhs);
-                return rhs;
+            "mdp_bid_bounds_for_rung",
+            [](const HJBLadderSolver& self,
+               const MDPTier& tier,
+               std::size_t rung_idx,
+               const std::vector<double>& current_delta,
+               double q,
+               const std::optional<std::vector<double>>& prev_delta) {
+                return self.mdp_bid_bounds_for_rung(
+                    tier,
+                    rung_idx,
+                    current_delta,
+                    q,
+                    make_optional_delta_row(prev_delta)
+                );
+            },
+            py::arg("tier"),
+            py::arg("rung_idx"),
+            py::arg("current_delta"),
+            py::arg("q"),
+            py::arg("prev_delta") = std::nullopt
+        )
+        .def(
+            "mdp_ask_bounds_for_rung",
+            [](const HJBLadderSolver& self,
+               const MDPTier& tier,
+               std::size_t rung_idx,
+               const std::vector<double>& current_delta,
+               double q,
+               const std::optional<std::vector<double>>& prev_delta) {
+                return self.mdp_ask_bounds_for_rung(
+                    tier,
+                    rung_idx,
+                    current_delta,
+                    q,
+                    make_optional_delta_row(prev_delta)
+                );
+            },
+            py::arg("tier"),
+            py::arg("rung_idx"),
+            py::arg("current_delta"),
+            py::arg("q"),
+            py::arg("prev_delta") = std::nullopt
+        )
+
+        .def(
+            "build_ecn_policy_from_decay",
+            &HJBLadderSolver::build_ecn_policy_from_decay,
+            py::arg("tier"),
+            py::arg("decay")
+        )
+
+        .def(
+            "optimize_ecn_decay",
+            [](const HJBLadderSolver& self,
+               const ECNTier& tier,
+               const std::vector<double>& h_vec) {
+                validate_h_vec_against_solver(self, h_vec, "optimize_ecn_decay");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+                return self.optimize_ecn_decay(tier, h);
+            },
+            py::arg("tier"),
+            py::arg("h_vec")
+        )
+        .def(
+            "mdp_bid_bellman_contribution",
+            [](const HJBLadderSolver& self,
+               const MDPTier& tier,
+               double q,
+               std::size_t q_index,
+               const std::vector<double>& h_vec) {
+                validate_h_vec_against_solver(self, h_vec, "mdp_bid_bellman_contribution");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+                return self.mdp_bid_bellman_contribution(tier, q, q_index, h);
+            },
+            py::arg("tier"),
+            py::arg("q"),
+            py::arg("q_index"),
+            py::arg("h_vec")
+        )
+        .def(
+            "mdp_ask_bellman_contribution",
+            [](const HJBLadderSolver& self,
+               const MDPTier& tier,
+               double q,
+               std::size_t q_index,
+               const std::vector<double>& h_vec) {
+                validate_h_vec_against_solver(self, h_vec, "mdp_ask_bellman_contribution");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+                return self.mdp_ask_bellman_contribution(tier, q, q_index, h);
+            },
+            py::arg("tier"),
+            py::arg("q"),
+            py::arg("q_index"),
+            py::arg("h_vec")
+        )
+        .def(
+            "ecn_bellman_contribution",
+            [](const HJBLadderSolver& self,
+               const ECNTier& tier,
+               double q,
+               std::size_t q_index,
+               const std::vector<double>& h_vec) {
+                validate_h_vec_against_solver(self, h_vec, "ecn_bellman_contribution");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+                return self.ecn_bellman_contribution(tier, q, q_index, h);
+            },
+            py::arg("tier"),
+            py::arg("q"),
+            py::arg("q_index"),
+            py::arg("h_vec")
+        )
+        .def(
+            "update_policies",
+            [](HJBLadderSolver& self, const std::vector<double>& h_vec) {
+                validate_h_vec_against_solver(self, h_vec, "update_policies");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+                self.update_policies(h);
             },
             py::arg("h_vec")
         )
+        .def(
+            "bellman_rhs_from_policies",
+            &HJBLadderSolver::bellman_rhs_from_policies,
+            py::arg("h_vec")
+        )
         .def("solve", &HJBLadderSolver::solve);
-
-    m.def(
-        "next_inventory",
-        &next_inventory,
-        py::arg("q"),
-        py::arg("z"),
-        py::arg("side")
-    );
-    m.def(
-        "next_inventory",
-        [](double q, double z, const std::string& side) {
-            return next_inventory(q, z, parse_side(side));
-        },
-        py::arg("q"),
-        py::arg("z"),
-        py::arg("side")
-    );
 }

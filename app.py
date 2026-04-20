@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from itertools import chain
 
 import numpy as np
 import pandas as pd
@@ -70,6 +70,28 @@ def build_piecewise_centered_q_grid(
         pos = np.append(pos, q_abs_max)
 
     return np.concatenate((-pos[:0:-1], pos))
+
+
+def validate_centered_q_grid(q_grid: np.ndarray) -> list[str]:
+    errors: list[str] = []
+
+    if len(q_grid) < 3:
+        errors.append("q_grid must contain at least 3 points.")
+        return errors
+
+    if len(q_grid) % 2 == 0:
+        errors.append("q_grid must have odd length.")
+
+    mid_idx = len(q_grid) // 2
+    if not np.isclose(q_grid[mid_idx], 0.0, atol=1e-10):
+        errors.append("q_grid must contain 0 exactly at the middle index.")
+
+    for i in range(mid_idx):
+        if not np.isclose(q_grid[i] + q_grid[-1 - i], 0.0, atol=1e-10):
+            errors.append("q_grid must be symmetric around 0.")
+            break
+
+    return errors
 
 
 # ============================================================
@@ -158,6 +180,7 @@ class ECNTierSpec(CommonTierSpec):
 
 
 TierSpec = MDPTierSpec | ECNTierSpec
+CppTier = lp.MDPTier | lp.ECNTier
 
 
 def tier_kind_label(spec: TierSpec) -> str:
@@ -168,7 +191,7 @@ def tier_sizes(spec: TierSpec) -> list[float]:
     return [1.0] if isinstance(spec, ECNTierSpec) else spec.sizes
 
 
-def parse_float_list(raw: str, field_name: str) -> List[float]:
+def parse_float_list(raw: str, field_name: str) -> list[float]:
     try:
         vals = [float(x.strip()) for x in raw.split(",") if x.strip()]
     except ValueError as exc:
@@ -176,7 +199,6 @@ def parse_float_list(raw: str, field_name: str) -> List[float]:
 
     if not vals:
         raise ValueError(f"{field_name} cannot be empty.")
-
     return vals
 
 
@@ -254,9 +276,13 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
             key=f"kind_{i}",
         )
 
+        sizes: list[float] | None = None
         if kind == "mdp":
-            sizes_default = defaults.get("sizes", DEFAULT_MDP_SIZES)
-            sizes_raw = st.text_input(f"Sizes {i + 1}", value=sizes_default, key=f"sizes_{i}")
+            sizes_raw = st.text_input(
+                f"Sizes {i + 1}",
+                value=defaults.get("sizes", DEFAULT_MDP_SIZES),
+                key=f"sizes_{i}",
+            )
             sizes = parse_float_list(sizes_raw, f"sizes for tier {i + 1}")
         else:
             st.text_input(f"Sizes {i + 1}", value="1", key=f"sizes_{i}", disabled=True)
@@ -337,6 +363,7 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
             key=f"tier_delta_max_{i}",
         )
 
+        ecn_delta_start = ecn_delta_target = ecn_decay = ecn_decay_min = ecn_decay_max = None
         if kind == "ecn":
             ecn_defaults = {
                 key: float(defaults.get(key, DEFAULT_ECN_POLICY[key]))
@@ -396,7 +423,7 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
     if tier_delta_max <= tier_delta_min:
         raise ValueError(f"Tier {i + 1}: delta_max must be greater than delta_min.")
 
-    common_kwargs = dict(
+    common = dict(
         name=name,
         flow_A0=float(flow_A0),
         flow_theta=float(flow_theta),
@@ -410,14 +437,14 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
     )
 
     if kind == "mdp":
+        assert sizes is not None
         if any(z <= 0.0 for z in sizes):
             raise ValueError(f"Tier {i + 1}: all sizes must be positive.")
         if any(sizes[k] >= sizes[k + 1] for k in range(len(sizes) - 1)):
             raise ValueError(f"Tier {i + 1}: sizes must be strictly increasing.")
-        return MDPTierSpec(
-            sizes=sizes,
-            **common_kwargs,
-        )
+        return MDPTierSpec(sizes=sizes, **common)
+
+    assert None not in (ecn_delta_start, ecn_delta_target, ecn_decay, ecn_decay_min, ecn_decay_max)
 
     if ecn_decay_min <= 0.0:
         raise ValueError(f"Tier {i + 1}: ECN decay_min must be positive.")
@@ -438,20 +465,78 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
         ecn_decay=float(ecn_decay),
         ecn_decay_min=float(ecn_decay_min),
         ecn_decay_max=float(ecn_decay_max),
-        **common_kwargs,
+        **common,
     )
 
 
 # ============================================================
-# Helpers
+# Solver / tier conversion helpers
 # ============================================================
 
-def is_admissible(cpp_tier: lp.Tier, q: float, z: float, side: str) -> bool:
+def build_solver_config(
+    q_grid: np.ndarray,
+    dt: float,
+    n_iter: int,
+    spread: float,
+    spot_drift: float,
+    golden_tol: float,
+    golden_max_iter: int,
+    early_stop: bool,
+    tol_h: float,
+    tol_rhs: float,
+    min_iter: int,
+    consecutive_passes_required: int,
+) -> lp.SolverConfig:
+    config = lp.SolverConfig()
+    config.q_grid = [float(q) for q in q_grid]
+    config.dt = float(dt)
+    config.n_iter = int(n_iter)
+    config.spread = float(spread)
+    config.spot_drift = float(spot_drift)
+    config.golden_tol = float(golden_tol)
+    config.golden_max_iter = int(golden_max_iter)
+    config.early_stop = bool(early_stop)
+    config.tol_h = float(tol_h)
+    config.tol_rhs = float(tol_rhs)
+    config.min_iter = int(min_iter)
+    config.consecutive_passes_required = int(consecutive_passes_required)
+    return config
+
+
+def build_cpp_tiers(specs: list[TierSpec]) -> tuple[list[lp.MDPTier], list[lp.ECNTier]]:
+    mdp_tiers: list[lp.MDPTier] = []
+    ecn_tiers: list[lp.ECNTier] = []
+
+    for spec in specs:
+        cpp_tier = spec.build_cpp_tier()
+        if isinstance(spec, MDPTierSpec):
+            mdp_tiers.append(cpp_tier)
+        else:
+            ecn_tiers.append(cpp_tier)
+
+    return mdp_tiers, ecn_tiers
+
+
+def ordered_solution_tiers(specs: list[TierSpec], solution: lp.HJBSolution) -> list[CppTier]:
+    mdp_iter = iter(solution.mdp_tiers)
+    ecn_iter = iter(solution.ecn_tiers)
+
+    out: list[CppTier] = []
+    for spec in specs:
+        out.append(next(ecn_iter) if isinstance(spec, ECNTierSpec) else next(mdp_iter))
+    return out
+
+
+def total_tier_count(solution: lp.HJBSolution) -> int:
+    return len(solution.mdp_tiers) + len(solution.ecn_tiers)
+
+
+def is_admissible(cpp_tier: CppTier, q: float, z: float, side: str) -> bool:
     return bool(cpp_tier.is_admissible(float(q), float(z), side))
 
 
 def masked_quote_summary(
-    cpp_tier: lp.Tier,
+    cpp_tier: CppTier,
     q: float,
     z: float,
     side: str,
@@ -463,15 +548,15 @@ def masked_quote_summary(
     return cpp_tier.quote_summary(float(q), float(z), side, float(mid_price), float(spread))
 
 
-def has_ecn_features(cpp_tier: lp.Tier) -> bool:
-    return hasattr(cpp_tier, "ecn_policy") and hasattr(cpp_tier, "active_delta")
+def is_ecn_tier(cpp_tier: CppTier) -> bool:
+    return isinstance(cpp_tier, lp.ECNTier)
 
 
 # ============================================================
 # Plots and tables
 # ============================================================
 
-def make_flow_parameter_table(spec: TierSpec, cpp_tier: lp.Tier) -> pd.DataFrame:
+def make_flow_parameter_table(spec: TierSpec, cpp_tier: CppTier) -> pd.DataFrame:
     rows = []
     for z in tier_sizes(spec):
         zf = float(z)
@@ -483,35 +568,53 @@ def make_flow_parameter_table(spec: TierSpec, cpp_tier: lp.Tier) -> pd.DataFrame
             "steepness": spec.flow_steepness,
             "mu(z)": cpp_tier.expected_markout(zf),
         }
-        if isinstance(spec, ECNTierSpec) and has_ecn_features(cpp_tier):
-            row["ecn_delta_start"] = float(cpp_tier.ecn_policy.delta_start)
-            row["ecn_delta_target"] = float(cpp_tier.ecn_policy.delta_target)
-            row["ecn_decay_opt"] = float(cpp_tier.ecn_policy.decay)
-            row["ecn_decay_min"] = float(cpp_tier.ecn_policy.decay_min)
-            row["ecn_decay_max"] = float(cpp_tier.ecn_policy.decay_max)
+        if isinstance(spec, ECNTierSpec) and is_ecn_tier(cpp_tier):
+            row |= {
+                "ecn_delta_start": float(cpp_tier.ecn_policy.delta_start),
+                "ecn_delta_target": float(cpp_tier.ecn_policy.delta_target),
+                "ecn_decay_opt": float(cpp_tier.ecn_policy.decay),
+                "ecn_decay_min": float(cpp_tier.ecn_policy.decay_min),
+                "ecn_decay_max": float(cpp_tier.ecn_policy.decay_max),
+            }
         rows.append(row)
     return pd.DataFrame(rows)
 
 
+def make_flow_curve_figure(cpp_tier: CppTier, spec: TierSpec) -> go.Figure:
+    grid = np.linspace(-1.0, 1.0, 100)
+    fig = go.Figure()
+
+    for z in tier_sizes(spec):
+        zf = float(z)
+        vals = [cpp_tier.arrival_rate(float(d), zf) for d in grid]
+        fig.add_trace(go.Scatter(x=grid, y=vals, mode="lines", name=f"{zf:g}"))
+
+    fig.update_layout(
+        title=f"Flow curves λ(δ, z) — {spec.name} ({tier_kind_label(spec)})",
+        xaxis_title="delta",
+        yaxis_title="arrival rate",
+        height=520,
+    )
+    return fig
+
+
 def make_quote_inventory_figure(
-    cpp_tier: lp.Tier,
+    cpp_tier: CppTier,
     spec: TierSpec,
     spread: float,
     mid_price: float,
 ) -> go.Figure:
     q_grid = [float(q) for q in cpp_tier.policy.q_grid]
-
     fig = go.Figure()
+
     for z in tier_sizes(spec):
         zf = float(z)
-
-        bid_vals = []
-        ask_vals = []
+        bid_vals: list[float] = []
+        ask_vals: list[float] = []
 
         for q in q_grid:
             bid = masked_quote_summary(cpp_tier, q, zf, "bid", mid_price, spread)
             ask = masked_quote_summary(cpp_tier, q, zf, "ask", mid_price, spread)
-
             bid_vals.append(np.nan if bid is None else float(bid.quote_relative_to_mid_pips))
             ask_vals.append(np.nan if ask is None else float(ask.quote_relative_to_mid_pips))
 
@@ -537,21 +640,18 @@ def make_quote_inventory_figure(
 
 
 def make_ladder_figure(
-    cpp_tier: lp.Tier,
+    cpp_tier: CppTier,
     spec: TierSpec,
     q: float,
     spread: float,
     mid_price: float,
 ) -> go.Figure:
     sizes = [float(z) for z in tier_sizes(spec)]
-
-    bid_vp = []
-    ask_vp = []
+    bid_vp, ask_vp = [], []
 
     for z in sizes:
         bid = masked_quote_summary(cpp_tier, q, z, "bid", mid_price, spread)
         ask = masked_quote_summary(cpp_tier, q, z, "ask", mid_price, spread)
-
         bid_vp.append(np.nan if bid is None else float(bid.volume_premium_pips))
         ask_vp.append(np.nan if ask is None else float(ask.volume_premium_pips))
 
@@ -566,7 +666,6 @@ def make_ladder_figure(
             name=f"Ask q={q:g}",
         )
     )
-
     fig.add_hline(y=0.0)
     fig.update_layout(
         title=f"Volume premium — {spec.name} ({tier_kind_label(spec)}) at q = {q:g}",
@@ -577,40 +676,13 @@ def make_ladder_figure(
     return fig
 
 
-def make_flow_curve_figure(cpp_tier: lp.Tier, spec: TierSpec) -> go.Figure:
-    grid = np.linspace(-1.0, +1.0, 100)
-    fig = go.Figure()
-
-    for z in tier_sizes(spec):
-        zf = float(z)
-        vals = [cpp_tier.arrival_rate(float(d), zf) for d in grid]
-        fig.add_trace(go.Scatter(x=grid, y=vals, mode="lines", name=f"{zf:g}"))
-
-    fig.update_layout(
-        title=f"Flow curves λ(δ, z) — {spec.name} ({tier_kind_label(spec)})",
-        xaxis_title="delta",
-        yaxis_title="arrival rate",
-        height=520,
-    )
-    return fig
-
-
-def make_ecn_decay_figure(cpp_tier: lp.Tier, spread: float) -> go.Figure:
-    if not has_ecn_features(cpp_tier):
-        raise ValueError("make_ecn_decay_figure requires an ECN tier.")
-
+def make_ecn_decay_figure(cpp_tier: lp.ECNTier, spread: float) -> go.Figure:
     q_grid = [float(q) for q in cpp_tier.policy.q_grid]
-    q_pos = [q for q in q_grid if q > 0.0]
     q_neg = [q for q in q_grid if q < 0.0]
+    q_pos = [q for q in q_grid if q > 0.0]
 
-    ask_vals = [
-        10000.0 * spread * (0.5 - float(cpp_tier.active_delta(q)))
-        for q in q_pos
-    ]
-    bid_vals = [
-        10000.0 * spread * (float(cpp_tier.active_delta(q)) - 0.5)
-        for q in q_neg
-    ]
+    bid_vals = [10000.0 * spread * (float(cpp_tier.active_delta(q)) - 0.5) for q in q_neg]
+    ask_vals = [10000.0 * spread * (0.5 - float(cpp_tier.active_delta(q))) for q in q_pos]
 
     fig = go.Figure()
     if q_neg:
@@ -637,7 +709,7 @@ def make_ecn_decay_figure(cpp_tier: lp.Tier, spread: float) -> go.Figure:
 
 
 def make_q_ladder_table(
-    cpp_tier: lp.Tier,
+    cpp_tier: CppTier,
     spec: TierSpec,
     q: float,
     spread: float,
@@ -683,43 +755,18 @@ def make_q_ladder_table(
 def make_h_figure(solution: lp.HJBSolution) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=list(solution.q_grid), y=list(solution.h), mode="lines+markers", name="h(q)"))
-    fig.update_layout(
-        title="Value function h(q)",
-        xaxis_title="Inventory q",
-        yaxis_title="h(q)",
-        height=480,
-    )
+    fig.update_layout(title="Value function h(q)", xaxis_title="Inventory q", yaxis_title="h(q)", height=480)
     return fig
 
 
-def make_convergence_h_figure(solution: lp.HJBSolution) -> go.Figure:
+def make_convergence_figure(values: list[float], title: str, yaxis_title: str) -> go.Figure:
     fig = go.Figure()
-    hist_h = list(solution.diagnostics.history_max_h_change)
-
-    if hist_h:
-        fig.add_trace(go.Scatter(x=list(range(1, len(hist_h) + 1)), y=hist_h, mode="lines+markers", name="max |Δh|"))
-
+    if values:
+        fig.add_trace(go.Scatter(x=list(range(1, len(values) + 1)), y=values, mode="lines+markers"))
     fig.update_layout(
-        title="Convergence: max |Δh|",
+        title=title,
         xaxis_title="Iteration",
-        yaxis_title="max |Δh|",
-        yaxis_type="log",
-        height=420,
-    )
-    return fig
-
-
-def make_convergence_rhs_figure(solution: lp.HJBSolution) -> go.Figure:
-    fig = go.Figure()
-    hist_rhs = list(solution.diagnostics.history_max_rhs)
-
-    if hist_rhs:
-        fig.add_trace(go.Scatter(x=list(range(1, len(hist_rhs) + 1)), y=hist_rhs, mode="lines+markers", name="max |rhs|"))
-
-    fig.update_layout(
-        title="Convergence: max |rhs|",
-        xaxis_title="Iteration",
-        yaxis_title="max |rhs|",
+        yaxis_title=yaxis_title,
         yaxis_type="log",
         height=420,
     )
@@ -740,36 +787,23 @@ st.markdown(
 
 with st.sidebar:
     st.header("Global parameters")
-    q_grid_mode = st.selectbox(
-        "Inventory grid mode",
-        options=["uniform", "piecewise"],
-        index=1,
-    )
 
+    q_grid_mode = st.selectbox("Inventory grid mode", options=["uniform", "piecewise"], index=1)
     q_abs_max = st.number_input("max |q|", value=20.0, min_value=0.5, step=0.5, format="%.4f")
 
+    q_step = fine_half_width = fine_step = coarse_step = None
     if q_grid_mode == "uniform":
         q_step = st.number_input("q step", value=1.0, min_value=0.01, step=0.1, format="%.4f")
-        fine_half_width = None
-        fine_step = None
-        coarse_step = None
     else:
         fine_half_width = st.number_input("fine half-width", value=3.0, min_value=0.0, step=0.5, format="%.4f")
         c_grid1, c_grid2 = st.columns(2)
         fine_step = c_grid1.number_input("fine step", value=0.25, min_value=0.01, step=0.05, format="%.4f")
         coarse_step = c_grid2.number_input("coarse step", value=1.0, min_value=0.01, step=0.1, format="%.4f")
-        q_step = None
 
     dt = st.number_input("dt", value=0.002, step=0.001, format="%.4f")
     n_iter = st.number_input("n_iter", value=140, step=10, min_value=1)
 
-    spread = st.number_input(
-        "reference spread",
-        value=20.0 / 10000.0,
-        step=1.0 / 10000.0,
-        format="%.6f",
-    )
-
+    spread = st.number_input("reference spread", value=20.0 / 10000.0, step=1.0 / 10000.0, format="%.6f")
     mid_price = st.number_input("display mid price", value=1.000000, step=0.000100, format="%.6f")
 
     st.header("Spot process")
@@ -788,14 +822,15 @@ with st.sidebar:
     sigma = st.number_input("Volatility [pips / 1min]", value=20.0, step=1.0, format="%.2f") / 10_000.0
     risk_aversion = st.number_input("risk_aversion", value=10.0, step=1.0, format="%.2f")
     tau0 = st.number_input("tau0", value=5.0, step=1.0, format="%.4f")
-    cubic_coeff = st.number_input("cubic coeff", value=0.1, step=0.01, format="%.4f")
-    quartic_coeff = st.number_input("quartic coeff", value=0.0015, step=0.0005, format="%.5f")
+    tau1 = st.number_input("cubic coeff", value=0.1, step=0.01, format="%.4f")
+    tau2 = st.number_input("quartic coeff", value=0.0015, step=0.0005, format="%.5f")
 
     st.header("Pricing tiers")
     num_tiers = st.slider("Number of tiers", min_value=1, max_value=4, value=3)
 
-errors: List[str] = []
-tier_specs: List[TierSpec] = []
+errors: list[str] = []
+tier_specs: list[TierSpec] = []
+
 for i in range(num_tiers):
     try:
         tier_specs.append(build_tier_spec_from_ui(i))
@@ -808,66 +843,63 @@ if golden_tol <= 0.0:
     errors.append("golden_tol must be positive.")
 
 try:
-    if q_grid_mode == "uniform":
-        q_grid = build_uniform_centered_q_grid(float(q_abs_max), float(q_step))
-    else:
-        q_grid = build_piecewise_centered_q_grid(
+    q_grid = (
+        build_uniform_centered_q_grid(float(q_abs_max), float(q_step))
+        if q_grid_mode == "uniform"
+        else build_piecewise_centered_q_grid(
             q_abs_max=float(q_abs_max),
             fine_half_width=float(fine_half_width),
             fine_step=float(fine_step),
             coarse_step=float(coarse_step),
         )
+    )
 except ValueError as exc:
     errors.append(str(exc))
     q_grid = np.array([], dtype=float)
 
-if len(q_grid) < 3:
-    errors.append("q_grid must contain at least 3 points.")
-if len(q_grid) > 0 and len(q_grid) % 2 == 0:
-    errors.append("q_grid must have odd length.")
-if len(q_grid) > 0 and not np.isclose(q_grid[len(q_grid) // 2], 0.0, atol=1e-10):
-    errors.append("q_grid must contain 0 exactly at the middle index.")
-if len(q_grid) > 0:
-    mid_idx = len(q_grid) // 2
-    for i in range(mid_idx):
-        if not np.isclose(q_grid[i] + q_grid[-1 - i], 0.0, atol=1e-10):
-            errors.append("q_grid must be symmetric around 0.")
-            break
+errors.extend(validate_centered_q_grid(q_grid))
 
 if errors:
-    for e in errors:
-        st.error(e)
+    for error in errors:
+        st.error(error)
     st.stop()
 
-cpp_tiers: list[lp.Tier] = [spec.build_cpp_tier() for spec in tier_specs]
+mdp_cpp_tiers, ecn_cpp_tiers = build_cpp_tiers(tier_specs)
 
 penalty = lp.PolynomialInventoryPenalty(
     risk_aversion=float(risk_aversion),
     sigma=float(sigma),
     tau0=float(tau0),
-    cubic_coeff=float(cubic_coeff),
-    quartic_coeff=float(quartic_coeff),
+    tau1=float(tau1),
+    tau2=float(tau2),
 )
 
-config = lp.SolverConfig()
-config.q_grid = [float(q) for q in q_grid]
-config.dt = float(dt)
-config.n_iter = int(n_iter)
-config.spread = float(spread)
-config.spot_drift = float(spot_drift)
-config.golden_tol = float(golden_tol)
-config.golden_max_iter = int(golden_max_iter)
-config.early_stop = bool(early_stop)
-config.tol_h = float(tol_h)
-config.tol_rhs = float(tol_rhs)
-config.min_iter = int(min_iter)
-config.consecutive_passes_required = int(consecutive_passes_required)
+config = build_solver_config(
+    q_grid=q_grid,
+    dt=float(dt),
+    n_iter=int(n_iter),
+    spread=float(spread),
+    spot_drift=float(spot_drift),
+    golden_tol=float(golden_tol),
+    golden_max_iter=int(golden_max_iter),
+    early_stop=bool(early_stop),
+    tol_h=float(tol_h),
+    tol_rhs=float(tol_rhs),
+    min_iter=int(min_iter),
+    consecutive_passes_required=int(consecutive_passes_required),
+)
 
 with st.spinner("Solving HJB in C++ and building policies..."):
-    solver = lp.HJBLadderSolver(config=config, penalty=penalty, tiers=cpp_tiers)
+    solver = lp.HJBLadderSolver(
+        config=config,
+        penalty=penalty,
+        mdp_tiers=mdp_cpp_tiers,
+        ecn_tiers=ecn_cpp_tiers,
+    )
     solution: lp.HJBSolution = solver.solve()
 
 diag = solution.diagnostics
+solution_tiers = ordered_solution_tiers(tier_specs, solution)
 
 st.success("Solver run complete.")
 
@@ -887,7 +919,7 @@ else:
 with st.expander("Solver diagnostics", expanded=False):
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("q points", len(config.q_grid))
-    c2.metric("tiers", len(solution.tiers))
+    c2.metric("tiers", total_tier_count(solution))
     c3.metric("iterations used", diag.iterations_used)
     c4.metric("converged", "yes" if diag.converged else "no")
     c5.metric("spot drift", f"{config.spot_drift:.5f}")
@@ -901,25 +933,38 @@ with st.expander("Solver diagnostics", expanded=False):
 
     st.caption(
         f"Inventory grid: {len(config.q_grid)} points, "
-        f"center index = {len(config.q_grid)//2}, "
-        f"center q = {config.q_grid[len(config.q_grid)//2]:.6f}"
+        f"center index = {len(config.q_grid) // 2}, "
+        f"center q = {config.q_grid[len(config.q_grid) // 2]:.6f}"
     )
 
     st.plotly_chart(make_h_figure(solution), use_container_width=True)
-    st.plotly_chart(make_convergence_h_figure(solution), use_container_width=True)
-    st.plotly_chart(make_convergence_rhs_figure(solution), use_container_width=True)
+    st.plotly_chart(
+        make_convergence_figure(
+            list(solution.diagnostics.history_max_h_change),
+            "Convergence: max |Δh|",
+            "max |Δh|",
+        ),
+        use_container_width=True,
+    )
+    st.plotly_chart(
+        make_convergence_figure(
+            list(solution.diagnostics.history_max_rhs),
+            "Convergence: max |rhs|",
+            "max |rhs|",
+        ),
+        use_container_width=True,
+    )
 
-tab_names = [f"{spec.name} [{tier_kind_label(spec)}]" for spec in tier_specs]
-tabs = st.tabs(tab_names)
-
+tabs = st.tabs([f"{spec.name} [{tier_kind_label(spec)}]" for spec in tier_specs])
 available_q = [float(q) for q in solution.q_grid]
+default_q = 0.0 if 0.0 in available_q else available_q[len(available_q) // 2]
 
-for tab, spec, cpp_tier in zip(tabs, tier_specs, solution.tiers):
+for idx, (tab, spec, cpp_tier) in enumerate(zip(tabs, tier_specs, solution_tiers)):
     with tab:
         st.subheader(f"Tier: {spec.name}")
         st.caption(f"Type: {tier_kind_label(spec)}")
 
-        if isinstance(spec, ECNTierSpec) and has_ecn_features(cpp_tier):
+        if isinstance(spec, ECNTierSpec) and is_ecn_tier(cpp_tier):
             c1, c2, c3 = st.columns(3)
             c1.metric("quoted size", "1.0")
             c2.metric("delta_start", f"{float(cpp_tier.ecn_policy.delta_start):.4f}")
@@ -940,24 +985,19 @@ for tab, spec, cpp_tier in zip(tabs, tier_specs, solution.tiers):
 
         st.plotly_chart(make_flow_curve_figure(cpp_tier, spec), use_container_width=True)
 
-        if isinstance(spec, ECNTierSpec) and has_ecn_features(cpp_tier):
-            st.plotly_chart(
-                make_ecn_decay_figure(cpp_tier, float(config.spread)),
-                use_container_width=True,
-            )
+        if isinstance(spec, ECNTierSpec) and is_ecn_tier(cpp_tier):
+            st.plotly_chart(make_ecn_decay_figure(cpp_tier, float(config.spread)), use_container_width=True)
 
         st.plotly_chart(
             make_quote_inventory_figure(cpp_tier, spec, float(config.spread), float(mid_price)),
             use_container_width=True,
         )
 
-        default_q_single = 0.0 if 0.0 in available_q else available_q[len(available_q) // 2]
-
         q_for_ladder = st.select_slider(
             f"Inventory level for ladder — {spec.name}",
             options=available_q,
-            value=default_q_single,
-            key=f"qslider_{spec.name}",
+            value=default_q,
+            key=f"qslider_{idx}",
         )
 
         st.plotly_chart(
@@ -968,8 +1008,8 @@ for tab, spec, cpp_tier in zip(tabs, tier_specs, solution.tiers):
         q_for_table = st.selectbox(
             f"q for ladder table — {spec.name}",
             options=available_q,
-            index=available_q.index(0.0) if 0.0 in available_q else len(available_q) // 2,
-            key=f"qtable_{spec.name}",
+            index=available_q.index(default_q),
+            key=f"qtable_{idx}",
         )
 
         st.dataframe(
@@ -987,7 +1027,7 @@ ECN tiers are different:
 - the quoted size is fixed to \(z = 1\)
 - only the inventory-reducing side is admissible
 - the active ECN quote is parameterized as an exponential function of \(|q|\)
-- the decay parameter is optimized in C++ against the current value function \(h(q)\)
+- the decay parameter is optimized in C++ using the current value function \(h(q)\)
 
 So ECN is treated as a smooth hedge channel rather than a full ladder optimization problem.
 
