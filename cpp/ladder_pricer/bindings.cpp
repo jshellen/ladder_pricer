@@ -19,56 +19,6 @@ Side parse_side(const std::string& side) {
     throw std::invalid_argument("Unknown side: " + side);
 }
 
-QuotePolicy build_policy_for_tier(
-    const PriceTier& tier,
-    const SolverConfig& config,
-    const std::vector<double>& h_vec
-) {
-    tier.validate();
-    config.validate();
-
-    if (h_vec.size() != config.q_grid.size()) {
-        throw std::invalid_argument(
-            "build_policy_for_tier: h_vec size must match config.q_grid size."
-        );
-    }
-
-    const LinearInterpolator1D h_view{&config.q_grid, &h_vec};
-    const GoldenSectionSearch optimizer(config.golden_tol, config.golden_max_iter);
-    const LadderBoundsPolicy bounds_policy(tier.delta_min, tier.delta_max);
-    TierPolicyBuilder builder(tier, config.spread, optimizer, bounds_policy);
-    builder.set_h_view(config.q_grid, h_vec);
-
-    QuotePolicy policy;
-    policy.reset_shape(config.q_grid, tier.sizes);
-    builder.build_policy_inplace(policy);
-    return policy;
-}
-
-void build_policy_inplace_for_tier(
-    PriceTier& tier,
-    const SolverConfig& config,
-    const std::vector<double>& h_vec
-) {
-    tier.validate();
-    config.validate();
-
-    if (h_vec.size() != config.q_grid.size()) {
-        throw std::invalid_argument(
-            "build_policy_inplace_for_tier: h_vec size must match config.q_grid size."
-        );
-    }
-
-    const LinearInterpolator1D h_view{&config.q_grid, &h_vec};
-    const GoldenSectionSearch optimizer(config.golden_tol, config.golden_max_iter);
-    const LadderBoundsPolicy bounds_policy(tier.delta_min, tier.delta_max);
-    TierPolicyBuilder builder(tier, config.spread, optimizer, bounds_policy);
-    builder.set_h_view(config.q_grid, h_vec);
-
-    tier.policy.reset_shape(config.q_grid, tier.sizes);
-    builder.build_policy_inplace(tier.policy);
-}
-
 } // namespace
 
 PYBIND11_MODULE(ladder_pricer, m) {
@@ -357,22 +307,7 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("final_max_rhs", &SolverDiagnostics::final_max_rhs)
         .def_readwrite("consecutive_passes", &SolverDiagnostics::consecutive_passes)
         .def_readwrite("history_max_h_change", &SolverDiagnostics::history_max_h_change)
-        .def_readwrite("history_max_rhs", &SolverDiagnostics::history_max_rhs)
-        .def("reserve", &SolverDiagnostics::reserve, py::arg("n_iter"))
-        .def(
-            "record_iteration",
-            &SolverDiagnostics::record_iteration,
-            py::arg("iteration"),
-            py::arg("max_h_change"),
-            py::arg("max_rhs")
-        )
-        .def(
-            "update_stopping_state",
-            &SolverDiagnostics::update_stopping_state,
-            py::arg("passes_now"),
-            py::arg("early_stop"),
-            py::arg("consecutive_passes_required")
-        );
+        .def_readwrite("history_max_rhs", &SolverDiagnostics::history_max_rhs);
 
     py::class_<HJBSolution>(m, "HJBSolution")
         .def(py::init<>())
@@ -398,27 +333,16 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def(
             "bellman_rhs_from_policies",
             [](const HJBLadderSolver& self, const std::vector<double>& h_vec) {
-                std::vector<double> rhs;
+                if (h_vec.size() != self.config.q_grid.size()) {
+                    throw std::invalid_argument(
+                        "bellman_rhs_from_policies: h_vec size must match config.q_grid size."
+                    );
+                }
+                std::vector<double> rhs(self.config.q_grid.size(), 0.0);
                 self.bellman_rhs_from_policies_unchecked(h_vec, rhs);
                 return rhs;
             },
             py::arg("h_vec")
         )
         .def("solve", &HJBLadderSolver::solve);
-
-    m.def(
-        "build_policy_for_tier",
-        &build_policy_for_tier,
-        py::arg("tier"),
-        py::arg("config"),
-        py::arg("h_vec")
-    );
-
-    m.def(
-        "build_policy_inplace_for_tier",
-        &build_policy_inplace_for_tier,
-        py::arg("tier"),
-        py::arg("config"),
-        py::arg("h_vec")
-    );
 }

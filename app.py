@@ -18,7 +18,62 @@ except ImportError as exc:
 
 
 # ============================================================
-# Python-side UI spec
+# Inventory-grid helpers
+# ============================================================
+
+def build_uniform_centered_q_grid(q_abs_max: float, q_step: float) -> np.ndarray:
+    if q_abs_max <= 0.0:
+        raise ValueError("q_abs_max must be positive.")
+    if q_step <= 0.0:
+        raise ValueError("q_step must be positive.")
+
+    pos = np.arange(0.0, q_abs_max + 0.5 * q_step, q_step, dtype=float)
+    pos = pos[pos <= q_abs_max + 1e-12]
+
+    if len(pos) == 0 or not np.isclose(pos[-1], q_abs_max, atol=1e-10, rtol=0.0):
+        pos = np.append(pos, q_abs_max)
+
+    pos = np.unique(np.round(pos, 12))
+    return np.concatenate((-pos[:0:-1], pos))
+
+
+def build_piecewise_centered_q_grid(
+    q_abs_max: float,
+    fine_half_width: float,
+    fine_step: float,
+    coarse_step: float,
+) -> np.ndarray:
+    if q_abs_max <= 0.0:
+        raise ValueError("q_abs_max must be positive.")
+    if fine_half_width < 0.0:
+        raise ValueError("fine_half_width must be nonnegative.")
+    if fine_half_width > q_abs_max:
+        raise ValueError("fine_half_width cannot exceed q_abs_max.")
+    if fine_step <= 0.0 or coarse_step <= 0.0:
+        raise ValueError("fine_step and coarse_step must be positive.")
+
+    inner_end = min(fine_half_width, q_abs_max)
+
+    inner = np.arange(0.0, inner_end + 0.5 * fine_step, fine_step, dtype=float)
+    inner = inner[inner <= inner_end + 1e-12]
+
+    outer = np.array([], dtype=float)
+    if q_abs_max > inner_end + 1e-12:
+        start = inner_end + coarse_step
+        outer = np.arange(start, q_abs_max + 0.5 * coarse_step, coarse_step, dtype=float)
+        outer = outer[outer <= q_abs_max + 1e-12]
+
+    pos = np.concatenate((inner, outer))
+    pos = np.unique(np.round(pos, 12))
+
+    if len(pos) == 0 or not np.isclose(pos[-1], q_abs_max, atol=1e-10, rtol=0.0):
+        pos = np.append(pos, q_abs_max)
+
+    return np.concatenate((-pos[:0:-1], pos))
+
+
+# ============================================================
+# Tier specification
 # ============================================================
 
 @dataclass
@@ -57,13 +112,9 @@ class TierSpec:
         )
 
 
-# ============================================================
-# UI helpers
-# ============================================================
-
 def parse_float_list(raw: str, field_name: str) -> List[float]:
     try:
-        vals = [float(x.strip()) for x in raw.split(",") if x.strip() != ""]
+        vals = [float(x.strip()) for x in raw.split(",") if x.strip()]
     except ValueError as exc:
         raise ValueError(f"Could not parse {field_name}. Use comma-separated numbers.") from exc
 
@@ -100,6 +151,19 @@ def default_tier_values(i: int) -> dict:
             "markout_coeff": 0.000,
             "delta_min": -100.0,
             "delta_max": 100.0,
+        },
+        {
+            "name": "ecn",
+            "sizes": "1, 2, 3, 5, 10",
+            "flow_A0": 0.70,
+            "flow_theta": 0.10,
+            "flow_steepness": 8.0,
+            "flow_shift": 0.18,
+            "flow_volume_shift": 0.020,
+            "markout_base": 0.000,
+            "markout_coeff": 0.000,
+            "delta_min": -2.0,
+            "delta_max": 2.0,
         },
         {
             "name": "sticky_clients",
@@ -228,6 +292,10 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
     )
 
 
+# ============================================================
+# Plots and tables
+# ============================================================
+
 def make_flow_parameter_table(spec: TierSpec, cpp_tier: lp.PriceTier) -> pd.DataFrame:
     rows = []
     for z in spec.sizes:
@@ -265,14 +333,7 @@ def make_quote_inventory_figure(
             for q in q_grid
         ]
 
-        fig.add_trace(
-            go.Scatter(
-                x=q_grid,
-                y=bid_vals,
-                mode="lines",
-                name=f"{zf:g} bid",
-            )
-        )
+        fig.add_trace(go.Scatter(x=q_grid, y=bid_vals, mode="lines", name=f"{zf:g} bid"))
         fig.add_trace(
             go.Scatter(
                 x=q_grid,
@@ -312,14 +373,7 @@ def make_ladder_figure(
     ]
 
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=sizes,
-            y=bid_vp,
-            mode="lines+markers",
-            name=f"Bid q={q:g}",
-        )
-    )
+    fig.add_trace(go.Scatter(x=sizes, y=bid_vp, mode="lines+markers", name=f"Bid q={q:g}"))
     fig.add_trace(
         go.Scatter(
             x=sizes,
@@ -347,14 +401,7 @@ def make_flow_curve_figure(cpp_tier: lp.PriceTier, spec: TierSpec) -> go.Figure:
     for z in spec.sizes:
         zf = float(z)
         vals = [cpp_tier.arrival_rate(float(d), zf) for d in grid]
-        fig.add_trace(
-            go.Scatter(
-                x=grid,
-                y=vals,
-                mode="lines",
-                name=f"{zf:g}",
-            )
-        )
+        fig.add_trace(go.Scatter(x=grid, y=vals, mode="lines", name=f"{zf:g}"))
 
     fig.update_layout(
         title=f"Flow curves λ(δ, z) — {spec.name}",
@@ -405,14 +452,7 @@ def make_q_ladder_table(
 
 def make_h_figure(solution: lp.HJBSolution) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=list(solution.q_grid),
-            y=list(solution.h),
-            mode="lines+markers",
-            name="h(q)",
-        )
-    )
+    fig.add_trace(go.Scatter(x=list(solution.q_grid), y=list(solution.h), mode="lines+markers", name="h(q)"))
     fig.update_layout(
         title="Value function h(q)",
         xaxis_title="Inventory q",
@@ -427,14 +467,7 @@ def make_convergence_h_figure(solution: lp.HJBSolution) -> go.Figure:
     hist_h = list(solution.diagnostics.history_max_h_change)
 
     if hist_h:
-        fig.add_trace(
-            go.Scatter(
-                x=list(range(1, len(hist_h) + 1)),
-                y=hist_h,
-                mode="lines+markers",
-                name="max |Δh|",
-            )
-        )
+        fig.add_trace(go.Scatter(x=list(range(1, len(hist_h) + 1)), y=hist_h, mode="lines+markers", name="max |Δh|"))
 
     fig.update_layout(
         title="Convergence: max |Δh|",
@@ -451,14 +484,7 @@ def make_convergence_rhs_figure(solution: lp.HJBSolution) -> go.Figure:
     hist_rhs = list(solution.diagnostics.history_max_rhs)
 
     if hist_rhs:
-        fig.add_trace(
-            go.Scatter(
-                x=list(range(1, len(hist_rhs) + 1)),
-                y=hist_rhs,
-                mode="lines+markers",
-                name="max |rhs|",
-            )
-        )
+        fig.add_trace(go.Scatter(x=list(range(1, len(hist_rhs) + 1)), y=hist_rhs, mode="lines+markers", name="max |rhs|"))
 
     fig.update_layout(
         title="Convergence: max |rhs|",
@@ -477,15 +503,31 @@ def make_convergence_rhs_figure(solution: lp.HJBSolution) -> go.Figure:
 st.set_page_config(page_title="Trinity 2.0 Pricer", layout="wide")
 st.title("Trinity 2.0 Pricer")
 st.markdown(
-    "This version uses the `ladder_pricer` C++ package via pybind11. "
-    "The app recomputes automatically whenever parameters change."
+    "Clean baseline version. ECN is priced exactly like any other tier. "
+    "Different tiers only differ through flow curve, markout, sizes, and bounds."
 )
 
 with st.sidebar:
     st.header("Global parameters")
-    q_min = st.number_input("q min", value=-20, step=1)
-    q_max = st.number_input("q max", value=20, step=1)
-    q_step = st.number_input("q step", value=1, step=1, min_value=1)
+    q_grid_mode = st.selectbox(
+        "Inventory grid mode",
+        options=["uniform", "piecewise"],
+        index=1,
+    )
+
+    q_abs_max = st.number_input("max |q|", value=20.0, min_value=0.5, step=0.5, format="%.4f")
+
+    if q_grid_mode == "uniform":
+        q_step = st.number_input("q step", value=1.0, min_value=0.01, step=0.1, format="%.4f")
+        fine_half_width = None
+        fine_step = None
+        coarse_step = None
+    else:
+        fine_half_width = st.number_input("fine half-width", value=3.0, min_value=0.0, step=0.5, format="%.4f")
+        c_grid1, c_grid2 = st.columns(2)
+        fine_step = c_grid1.number_input("fine step", value=0.25, min_value=0.01, step=0.05, format="%.4f")
+        coarse_step = c_grid2.number_input("coarse step", value=1.0, min_value=0.01, step=0.1, format="%.4f")
+        q_step = None
 
     dt = st.number_input("dt", value=0.002, step=0.001, format="%.4f")
     n_iter = st.number_input("n_iter", value=140, step=10, min_value=1)
@@ -495,31 +537,12 @@ with st.sidebar:
         value=20.0 / 10000.0,
         step=1.0 / 10000.0,
         format="%.6f",
-        help=(
-            "Reference spread used to define reference bid/ask and quote-improvement delta. "
-            "ref_bid = mid - 0.5 * spread, ref_ask = mid + 0.5 * spread."
-        ),
     )
 
-    mid_price = st.number_input(
-        "display mid price",
-        value=1.000000,
-        step=0.000100,
-        format="%.6f",
-        help="Used only when displaying absolute bid/ask quotes in the ladder table and charts.",
-    )
+    mid_price = st.number_input("display mid price", value=1.000000, step=0.000100, format="%.6f")
 
     st.header("Spot process")
-    spot_drift = st.number_input(
-        "spot_drift",
-        value=0.0,
-        step=0.001,
-        format="%.5f",
-        help=(
-            "Constant drift in the spot process dS = spot_drift * dt + sigma * dW. "
-            "In the reduced HJB this contributes + spot_drift * q."
-        ),
-    )
+    spot_drift = st.number_input("spot_drift", value=0.0, step=0.001, format="%.5f")
 
     st.header("Ladder optimization")
     golden_tol = st.number_input("golden_tol", value=1e-4, format="%.1e")
@@ -530,12 +553,7 @@ with st.sidebar:
     tol_h = st.number_input("tol_h", value=1e-5, format="%.1e")
     tol_rhs = st.number_input("tol_rhs", value=1e-4, format="%.1e")
     min_iter = st.number_input("min_iter", value=5, step=1, min_value=0)
-    consecutive_passes_required = st.number_input(
-        "consecutive passes required",
-        value=3,
-        step=1,
-        min_value=1,
-    )
+    consecutive_passes_required = st.number_input("consecutive passes required", value=3, step=1, min_value=1)
 
     st.header("Inventory penalty")
     sigma = st.number_input("Volatility [pips / 1min]", value=20.0, step=1.0, format="%.2f")
@@ -546,7 +564,7 @@ with st.sidebar:
     tau2 = st.number_input("quartic coeff", value=0.0015, step=0.0005, format="%.5f")
 
     st.header("Pricing tiers")
-    num_tiers = st.slider("Number of tiers", min_value=1, max_value=4, value=2)
+    num_tiers = st.slider("Number of tiers", min_value=1, max_value=4, value=3)
 
 errors: List[str] = []
 tier_specs: List[TierSpec] = []
@@ -556,17 +574,37 @@ for i in range(num_tiers):
     except ValueError as exc:
         errors.append(str(exc))
 
-if q_max <= q_min:
-    errors.append("q_max must be greater than q_min.")
 if spread <= 0.0:
     errors.append("spread must be positive.")
 if golden_tol <= 0.0:
     errors.append("golden_tol must be positive.")
 
-q_grid = np.arange(float(q_min), float(q_max) + float(q_step), float(q_step), dtype=float)
+try:
+    if q_grid_mode == "uniform":
+        q_grid = build_uniform_centered_q_grid(float(q_abs_max), float(q_step))
+    else:
+        q_grid = build_piecewise_centered_q_grid(
+            q_abs_max=float(q_abs_max),
+            fine_half_width=float(fine_half_width),
+            fine_step=float(fine_step),
+            coarse_step=float(coarse_step),
+        )
+except ValueError as exc:
+    errors.append(str(exc))
+    q_grid = np.array([], dtype=float)
 
-if len(q_grid) < 2:
-    errors.append("q_grid must contain at least two points.")
+if len(q_grid) < 3:
+    errors.append("q_grid must contain at least 3 points.")
+if len(q_grid) > 0 and len(q_grid) % 2 == 0:
+    errors.append("q_grid must have odd length.")
+if len(q_grid) > 0 and not np.isclose(q_grid[len(q_grid) // 2], 0.0, atol=1e-10):
+    errors.append("q_grid must contain 0 exactly at the middle index.")
+if len(q_grid) > 0:
+    mid_idx = len(q_grid) // 2
+    for i in range(mid_idx):
+        if not np.isclose(q_grid[i] + q_grid[-1 - i], 0.0, atol=1e-10):
+            errors.append("q_grid must be symmetric around 0.")
+            break
 
 if errors:
     for e in errors:
@@ -597,7 +635,7 @@ config.tol_rhs = float(tol_rhs)
 config.min_iter = int(min_iter)
 config.consecutive_passes_required = int(consecutive_passes_required)
 
-with st.spinner("Solving HJB in C++ and building saved policies..."):
+with st.spinner("Solving HJB in C++ and building policies..."):
     solver = lp.HJBLadderSolver(config=config, penalty=penalty, tiers=cpp_tiers)
     solution: lp.HJBSolution = solver.solve()
 
@@ -633,6 +671,12 @@ with st.expander("Solver diagnostics", expanded=False):
     c9.metric("final max |Δh|", f"{diag.final_max_h_change:.2e}")
     c10.metric("final max |rhs|", f"{diag.final_max_rhs:.2e}")
 
+    st.caption(
+        f"Inventory grid: {len(config.q_grid)} points, "
+        f"center index = {len(config.q_grid)//2}, "
+        f"center q = {config.q_grid[len(config.q_grid)//2]:.6f}"
+    )
+
     st.plotly_chart(make_h_figure(solution), use_container_width=True)
     st.plotly_chart(make_convergence_h_figure(solution), use_container_width=True)
     st.plotly_chart(make_convergence_rhs_figure(solution), use_container_width=True)
@@ -647,20 +691,10 @@ for tab, spec, cpp_tier in zip(tabs, tier_specs, solution.tiers):
         st.subheader(f"Tier: {spec.name}")
 
         with st.expander("Tier parameters", expanded=False):
-            st.dataframe(
-                make_flow_parameter_table(spec, cpp_tier),
-                use_container_width=True,
-            )
+            st.dataframe(make_flow_parameter_table(spec, cpp_tier), use_container_width=True)
 
-        st.plotly_chart(
-            make_flow_curve_figure(cpp_tier, spec),
-            use_container_width=True,
-        )
-
-        st.plotly_chart(
-            make_quote_inventory_figure(cpp_tier, spec, float(config.spread), float(mid_price)),
-            use_container_width=True,
-        )
+        st.plotly_chart(make_flow_curve_figure(cpp_tier, spec), use_container_width=True)
+        st.plotly_chart(make_quote_inventory_figure(cpp_tier, spec, float(config.spread), float(mid_price)), use_container_width=True)
 
         default_q_single = 0.0 if 0.0 in available_q else available_q[len(available_q) // 2]
 
@@ -684,58 +718,14 @@ for tab, spec, cpp_tier in zip(tabs, tier_specs, solution.tiers):
         )
 
         st.dataframe(
-            make_q_ladder_table(
-                cpp_tier,
-                spec,
-                float(q_for_table),
-                float(config.spread),
-                float(mid_price),
-            ),
+            make_q_ladder_table(cpp_tier, spec, float(q_for_table), float(config.spread), float(mid_price)),
             use_container_width=True,
         )
 
 with st.expander("What this app is solving"):
     st.markdown(
         r"""
-Assume the spot process is
-
-$$
-dS_t = \mu_{\text{spot}}\,dt + \sigma\,dW_t.
-$$
-
-Let the reference spread be \(s\), and define
-
-$$
-\text{ref bid} = \text{mid} - \tfrac12 s,
-\qquad
-\text{ref ask} = \text{mid} + \tfrac12 s.
-$$
-
-The quote improvement \(\delta\) is measured as a fraction of that spread:
-
-$$
-\text{bid quote} = \text{ref bid} + s\,\delta,
-\qquad
-\text{ask quote} = \text{ref ask} - s\,\delta.
-$$
-
-So the quote relative to mid is
-
-$$
-\text{bid quote} - \text{mid} = s(\delta - 0.5),
-\qquad
-\text{ask quote} - \text{mid} = s(0.5 - \delta).
-$$
-
-The absolute distance to mid is therefore
-
-$$
-|\text{quote} - \text{mid}| = s(0.5 - \delta)
-$$
-
-under the normal regime \(\delta \le 0.5\). In the app, these quantities are shown via the `QuoteSummary` object returned by the C++ layer.
-
-For each inventory point \(q\), the Bellman right-hand side is
+All tiers, including ECN, use the same two-sided structure:
 
 $$
 -\phi(q) + \mu_{\text{spot}} q
@@ -746,173 +736,13 @@ $$
 \Big].
 $$
 
-So:
-- positive spot drift favors long inventory
-- negative spot drift favors short inventory
-- larger \(\delta\) means a more aggressive quote on both sides
-- the model chooses \(\delta(q,z)\) separately for each side, size, inventory point, and tier
+The inventory grid must be:
 
-The C++ backend solves the ladder sequentially:
-- first at the inventory point closest to \(q=0\),
-- then for \(q>0\) moving outward,
-- then for \(q<0\) moving outward.
-
-For each side and inventory, the ladder is built rung-by-rung in size order using bounded golden-section search.
-
-### What the bounds are doing
-
-Let the sizes be
-
-$$
-z_1 < z_2 < \dots < z_n
-$$
-
-and let \(\delta_j\) denote the quote improvement for rung \(z_j\).
-
-The first structural rule is monotonicity in size:
-
-$$
-\delta_{j+1} \le \delta_j.
-$$
-
-Because larger \(\delta\) means a more aggressive quote, this ensures that a larger trade size can never be quoted more aggressively than a smaller one. In practice, when the solver is optimizing rung \(j\), this immediately gives an upper bound:
-
-$$
-\delta_j \le \delta_{j-1}.
-$$
-
-That is the baseline ladder-shape constraint.
-
-### Gap notation
-
-Define the rung gap as
-
-$$
-g_j = \delta_{j-1} - \delta_j \ge 0,
-\qquad j = 2,\dots,n.
-$$
-
-So:
-- small gap means neighboring rungs are close together
-- large gap means the ladder widens more quickly in size
-
-The model uses the already-solved neighboring inventory state to decide whether these gaps should shrink or expand as inventory moves away from zero.
-
-### Shrink mode
-
-In shrink mode, the gap at the current inventory should not exceed the previously solved gap:
-
-$$
-g_j^{\text{current}} \le g_j^{\text{previous}}.
-$$
-
-Since
-
-$$
-g_j^{\text{current}} = \delta_{j-1}^{\text{current}} - \delta_j^{\text{current}},
-$$
-
-this becomes a lower bound on the current rung:
-
-$$
-\delta_j^{\text{current}}
-\ge
-\delta_{j-1}^{\text{current}} - g_j^{\text{previous}}.
-$$
-
-Interpretation:
-- the current rung is not allowed to fall too far below the previous rung
-- the ladder therefore compresses relative to the neighboring inventory state
-
-This is used when the model wants the ladder to become tighter on the risk-reducing side.
-
-### Expand mode
-
-In expand mode, the current gap must be at least as large as before:
-
-$$
-g_j^{\text{current}} \ge g_j^{\text{previous}}.
-$$
-
-This becomes an upper bound:
-
-$$
-\delta_j^{\text{current}}
-\le
-\delta_{j-1}^{\text{current}} - g_j^{\text{previous}}.
-$$
-
-Interpretation:
-- the rung must sit sufficiently below the previous rung
-- the ladder therefore widens relative to the neighboring inventory state
-
-This is used when the model wants larger trade sizes to become less competitive on the risk-increasing side.
-
-### Why the solver also reserves room for future rungs
-
-If the current rung is pushed too low, later rungs may become impossible to place while still respecting both:
-- the global lower bound \(\delta_{\min}\)
-- the required future gap expansion rules
-
-So in expand mode the solver also imposes a feasibility bound of the form
-
-$$
-\delta_j \ge \delta_{\min} + \text{(required future gap budget)}.
-$$
-
-That budget is the total amount of gap that later rungs will need below the current rung if the ladder is to remain feasible all the way to the largest size.
-
-This is important because otherwise the optimizer could choose a locally optimal \(\delta_j\) that makes rung \(j+1\), \(j+2\), or later rungs infeasible.
-
-### Why rung 1 can also have a special lower bound
-
-For the smallest rung, there is no previous rung within the same ladder, so the monotonicity constraint does not yet apply.
-
-However, in expand mode, the solver may still need to leave enough room below rung 1 for all later mandatory gaps. That gives a lower bound like
-
-$$
-\delta_1 \ge \delta_{\min} + \text{(total required ladder width)}.
-$$
-
-So even the first rung may be prevented from moving too low if doing so would make the rest of the ladder impossible to fit inside \([\delta_{\min}, \delta_{\max}]\).
-
-### Which side shrinks and which side expands?
-
-The inventory-dependent rule is:
-
-- for \(q > 0\):
-  - ask ladder gaps shrink
-  - bid ladder gaps expand
-
-- for \(q < 0\):
-  - ask ladder gaps expand
-  - bid ladder gaps shrink
-
-This matches the intuition that the side which helps reduce inventory should become more competitive, while the side that would add more inventory should become less competitive, especially for larger trade sizes.
-
-### In summary
-
-The solver is not just clipping each rung independently into \([\delta_{\min}, \delta_{\max}]\). It is enforcing a nested feasibility structure:
-
-1. global bounds:
-   $$
-   \delta_{\min} \le \delta_j \le \delta_{\max}
-   $$
-
-2. monotonicity in size:
-   $$
-   \delta_j \le \delta_{j-1}
-   $$
-
-3. shrink / expand gap rules relative to the neighboring inventory state
-
-4. future-feasibility bounds so that later rungs still fit inside the allowed region
-
-That is why the ladder tends to look smooth, ordered, and inventory-aware rather than like a collection of unrelated pointwise optima.
+- strictly increasing
+- symmetric around 0
+- odd-length
+- with \(0\) exactly at the middle index
         """
     )
 
-st.caption(
-    "This app recomputes on every widget change. If you want less frequent recomputation, "
-    "wrap the sidebar inputs in a form and solve only on submit."
-)
+st.caption("After replacing the C++ files, rebuild the extension and restart Streamlit.")

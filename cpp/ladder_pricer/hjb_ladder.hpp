@@ -36,21 +36,38 @@ inline void validate_strictly_increasing(
     }
 }
 
-inline std::size_t nearest_to_zero_index(const std::vector<double>& x) {
-    if (x.empty()) {
-        throw std::invalid_argument("nearest_to_zero_index: input cannot be empty.");
+inline void validate_centered_symmetric_grid(
+    const std::vector<double>& x,
+    const std::string& name,
+    double tol = 1e-10
+) {
+    validate_strictly_increasing(x, name);
+
+    if (x.size() < 3) {
+        throw std::invalid_argument(name + " must contain at least 3 points.");
+    }
+    if (x.size() % 2 == 0) {
+        throw std::invalid_argument(name + " must have odd length so that 0 is exactly in the middle.");
     }
 
-    std::size_t best_idx = 0;
-    double best_abs = std::numeric_limits<double>::infinity();
-    for (std::size_t i = 0; i < x.size(); ++i) {
-        const double a = std::abs(x[i]);
-        if (a < best_abs) {
-            best_abs = a;
-            best_idx = i;
+    const std::size_t mid = x.size() / 2;
+    if (std::abs(x[mid]) > tol) {
+        throw std::invalid_argument(name + " must contain 0 exactly at the middle index.");
+    }
+
+    for (std::size_t i = 0; i < mid; ++i) {
+        if (std::abs(x[i] + x[x.size() - 1 - i]) > tol) {
+            throw std::invalid_argument(name + " must be symmetric around 0.");
         }
     }
-    return best_idx;
+}
+
+inline std::size_t center_zero_index(
+    const std::vector<double>& x,
+    double tol = 1e-10
+) {
+    validate_centered_symmetric_grid(x, "center_zero_index input", tol);
+    return x.size() / 2;
 }
 
 inline std::pair<std::size_t, double> locate_segment_with_weight(
@@ -164,9 +181,15 @@ struct LogisticFlowCurve final : public FlowCurve {
     }
 
     double hit_ratio(double delta, double z) const override {
-        const double x = -(delta - shift + volume_shift * (z - 1.0)) * steepness;
-        const double ex = std::exp(x);
-        return 1.0 / (1.0 + ex);
+        const double y = (delta - shift + volume_shift * (z - 1.0)) * steepness;
+
+        if (y >= 0.0) {
+            const double e = std::exp(-y);
+            return 1.0 / (1.0 + e);
+        } else {
+            const double e = std::exp(y);
+            return e / (1.0 + e);
+        }
     }
 
     double arrival_rate(double delta, double z) const override {
@@ -489,6 +512,10 @@ struct PriceTier {
         }
     }
 
+    static double next_inventory(double q, double z, Side side) {
+        return side == Side::Bid ? q + z : q - z;
+    }
+
     double arrival_rate(double delta, double z) const {
         return flow_curve->arrival_rate(delta, z);
     }
@@ -534,7 +561,7 @@ struct SolverConfig {
     int consecutive_passes_required{3};
 
     void validate() const {
-        validate_strictly_increasing(q_grid, "SolverConfig.q_grid");
+        validate_centered_symmetric_grid(q_grid, "SolverConfig.q_grid");
 
         if (dt <= 0.0) {
             throw std::invalid_argument("SolverConfig: dt must be positive.");
@@ -760,12 +787,8 @@ struct TierPolicyBuilder {
         return *bounds_policy;
     }
 
-    static double next_inventory(double q, double z, Side side) {
-        return side == Side::Bid ? q + z : q - z;
-    }
-
     double continuation_change(double q, double z, Side side) const {
-        return h(next_inventory(q, z, side)) - h(q);
+        return h(PriceTier::next_inventory(q, z, side)) - h(q);
     }
 
     double immediate_edge(double z, double delta, double mu) const {
@@ -816,7 +839,7 @@ struct TierPolicyBuilder {
     void build_policy_inplace(QuotePolicy& policy) const {
         const auto& q_grid = policy.q_grid;
         const std::size_t nq = q_grid.size();
-        const std::size_t q0_idx = nearest_to_zero_index(q_grid);
+        const std::size_t q0_idx = center_zero_index(q_grid);
 
         build_side_ladder(policy.ask[q0_idx], q_grid[q0_idx], Side::Ask, nullptr);
         build_side_ladder(policy.bid[q0_idx], q_grid[q0_idx], Side::Bid, nullptr);
@@ -996,12 +1019,12 @@ struct HJBLadderSolver {
                     const double mu = tier->expected_markout(z);
 
                     const double d_b = tier->policy.delta_at_index(i, j, Side::Bid);
-                    const double dq_b = h_view(q + z) - h_view(q);
+                    const double dq_b = h_view(PriceTier::next_inventory(q, z, Side::Bid)) - h_view(q);
                     const double lam_b = tier->arrival_rate(d_b, z);
                     val += lam_b * (config.spread * z * (0.5 - d_b) - z * mu + dq_b);
 
                     const double d_a = tier->policy.delta_at_index(i, j, Side::Ask);
-                    const double dq_a = h_view(q - z) - h_view(q);
+                    const double dq_a = h_view(PriceTier::next_inventory(q, z, Side::Ask)) - h_view(q);
                     const double lam_a = tier->arrival_rate(d_a, z);
                     val += lam_a * (config.spread * z * (0.5 - d_a) - z * mu + dq_a);
                 }
@@ -1018,7 +1041,7 @@ struct HJBLadderSolver {
         prepare_solve_context();
 
         const std::size_t nq = config.q_grid.size();
-        const std::size_t q0_idx = nearest_to_zero_index(config.q_grid);
+        const std::size_t q0_idx = center_zero_index(config.q_grid);
 
         std::vector<double> h(nq, 0.0);
         std::vector<double> h_next(nq, 0.0);
