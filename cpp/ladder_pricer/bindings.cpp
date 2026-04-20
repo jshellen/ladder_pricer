@@ -19,12 +19,6 @@ Side parse_side(const std::string& side) {
     throw std::invalid_argument("Unknown side: " + side);
 }
 
-TierRole parse_tier_role(const std::string& role) {
-    if (role == "customer" || role == "Customer") return TierRole::Customer;
-    if (role == "ecn" || role == "ECN" || role == "Ecn") return TierRole::ECN;
-    throw std::invalid_argument("Unknown tier role: " + role);
-}
-
 } // namespace
 
 PYBIND11_MODULE(ladder_pricer, m) {
@@ -33,11 +27,6 @@ PYBIND11_MODULE(ladder_pricer, m) {
     py::enum_<Side>(m, "Side")
         .value("Bid", Side::Bid)
         .value("Ask", Side::Ask)
-        .export_values();
-
-    py::enum_<TierRole>(m, "TierRole")
-        .value("Customer", TierRole::Customer)
-        .value("ECN", TierRole::ECN)
         .export_values();
 
     py::class_<FlowCurve, std::shared_ptr<FlowCurve>>(m, "FlowCurve")
@@ -123,8 +112,13 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def(
             "delta_at_abs_inventory",
             &ExponentialECNPolicy::delta_at_abs_inventory,
+            py::arg("q_abs")
+        )
+        .def(
+            "delta_at_abs_inventory_with_decay",
+            &ExponentialECNPolicy::delta_at_abs_inventory_with_decay,
             py::arg("q_abs"),
-            py::arg("decay_override") = -1.0
+            py::arg("decay")
         );
 
     py::class_<QuoteSummary>(m, "QuoteSummary")
@@ -231,141 +225,40 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("spread")
         );
 
-    py::class_<PriceTier, std::shared_ptr<PriceTier>>(m, "PriceTier")
-        .def(py::init<>())
+    py::class_<Tier, std::shared_ptr<Tier>>(m, "Tier")
+        .def_property_readonly("name", [](const Tier& self) { return self.name; })
+        .def_property_readonly("flow_curve", [](const Tier& self) { return self.flow_curve; })
+        .def_property_readonly("markout_model", [](const Tier& self) { return self.markout_model; })
+        .def_readwrite("policy", &Tier::policy)
+        .def("validate", &Tier::validate)
+        .def("tier_type_name", &Tier::tier_type_name)
         .def(
-            py::init<
-                std::string,
-                std::vector<double>,
-                std::shared_ptr<FlowCurve>,
-                std::shared_ptr<MarkoutModel>,
-                double,
-                double,
-                TierRole,
-                ExponentialECNPolicy
-            >(),
-            py::arg("name"),
-            py::arg("sizes"),
-            py::arg("flow_curve"),
-            py::arg("markout_model"),
-            py::arg("delta_min") = -5.0,
-            py::arg("delta_max") = 5.0,
-            py::arg("role") = TierRole::Customer,
-            py::arg("ecn_policy") = ExponentialECNPolicy{}
+            "sizes",
+            [](const Tier& self) { return self.sizes(); }
         )
+        .def("arrival_rate", &Tier::arrival_rate, py::arg("delta"), py::arg("z"))
+        .def("expected_markout", &Tier::expected_markout, py::arg("z"))
         .def(
-            py::init([](
-                const std::string& name,
-                const std::vector<double>& sizes,
-                const std::shared_ptr<FlowCurve>& flow_curve,
-                const std::shared_ptr<MarkoutModel>& markout_model,
-                double delta_min,
-                double delta_max,
-                const std::string& role,
-                const ExponentialECNPolicy& ecn_policy
-            ) {
-                return PriceTier(
-                    name,
-                    sizes,
-                    flow_curve,
-                    markout_model,
-                    delta_min,
-                    delta_max,
-                    parse_tier_role(role),
-                    ecn_policy
-                );
-            }),
-            py::arg("name"),
-            py::arg("sizes"),
-            py::arg("flow_curve"),
-            py::arg("markout_model"),
-            py::arg("delta_min") = -5.0,
-            py::arg("delta_max") = 5.0,
-            py::arg("role") = std::string("customer"),
-            py::arg("ecn_policy") = ExponentialECNPolicy{}
-        )
-        .def_readwrite("name", &PriceTier::name)
-        .def_readwrite("role", &PriceTier::role)
-        .def_readwrite("sizes", &PriceTier::sizes)
-        .def_readwrite("flow_curve", &PriceTier::flow_curve)
-        .def_readwrite("markout_model", &PriceTier::markout_model)
-        .def_readwrite("delta_min", &PriceTier::delta_min)
-        .def_readwrite("delta_max", &PriceTier::delta_max)
-        .def_readwrite("ecn_policy", &PriceTier::ecn_policy)
-        .def_readwrite("policy", &PriceTier::policy)
-        .def("validate", &PriceTier::validate)
-        .def("is_customer", &PriceTier::is_customer)
-        .def("is_ecn", &PriceTier::is_ecn)
-        .def("arrival_rate", &PriceTier::arrival_rate, py::arg("delta"), py::arg("z"))
-        .def("expected_markout", &PriceTier::expected_markout, py::arg("z"))
-        .def(
-            "ecn_active_delta",
-            &PriceTier::ecn_active_delta,
-            py::arg("q"),
-            py::arg("decay_override") = -1.0
-        )
-        .def_static(
-            "next_inventory",
-            &PriceTier::next_inventory,
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side")
-        )
-        .def_static(
-            "next_inventory",
-            [](double q, double z, const std::string& side) {
-                return PriceTier::next_inventory(q, z, parse_side(side));
+            "is_admissible",
+            [](const Tier& self, double q, double z, Side side) {
+                return self.is_admissible(q, z, side);
             },
             py::arg("q"),
             py::arg("z"),
             py::arg("side")
         )
-        .def_static(
-            "is_inventory_reducing_side",
-            &PriceTier::is_inventory_reducing_side,
-            py::arg("q"),
-            py::arg("side"),
-            py::arg("tol") = 1e-12
-        )
-        .def_static(
-            "is_inventory_reducing_side",
-            [](double q, const std::string& side, double tol) {
-                return PriceTier::is_inventory_reducing_side(q, parse_side(side), tol);
-            },
-            py::arg("q"),
-            py::arg("side"),
-            py::arg("tol") = 1e-12
-        )
-        .def_static(
-            "size_does_not_cross_flat",
-            &PriceTier::size_does_not_cross_flat,
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("tol") = 1e-12
-        )
         .def(
             "is_admissible",
-            [](const PriceTier& self, double q, double z, Side side, double tol) {
-                return self.is_admissible(q, z, side, tol);
+            [](const Tier& self, double q, double z, const std::string& side) {
+                return self.is_admissible(q, z, parse_side(side));
             },
             py::arg("q"),
             py::arg("z"),
-            py::arg("side"),
-            py::arg("tol") = 1e-12
-        )
-        .def(
-            "is_admissible",
-            [](const PriceTier& self, double q, double z, const std::string& side, double tol) {
-                return self.is_admissible(q, z, parse_side(side), tol);
-            },
-            py::arg("q"),
-            py::arg("z"),
-            py::arg("side"),
-            py::arg("tol") = 1e-12
+            py::arg("side")
         )
         .def(
             "quote",
-            [](const PriceTier& self, double q, double z, Side side) {
+            [](const Tier& self, double q, double z, Side side) {
                 return self.quote(q, z, side);
             },
             py::arg("q"),
@@ -374,7 +267,7 @@ PYBIND11_MODULE(ladder_pricer, m) {
         )
         .def(
             "quote",
-            [](const PriceTier& self, double q, double z, const std::string& side) {
+            [](const Tier& self, double q, double z, const std::string& side) {
                 return self.quote(q, z, parse_side(side));
             },
             py::arg("q"),
@@ -383,7 +276,7 @@ PYBIND11_MODULE(ladder_pricer, m) {
         )
         .def(
             "quote_summary",
-            [](const PriceTier& self, double q, double z, Side side, double mid, double spread) {
+            [](const Tier& self, double q, double z, Side side, double mid, double spread) {
                 return self.quote_summary(q, z, side, mid, spread);
             },
             py::arg("q"),
@@ -394,7 +287,7 @@ PYBIND11_MODULE(ladder_pricer, m) {
         )
         .def(
             "quote_summary",
-            [](const PriceTier& self, double q, double z, const std::string& side, double mid, double spread) {
+            [](const Tier& self, double q, double z, const std::string& side, double mid, double spread) {
                 return self.quote_summary(q, z, parse_side(side), mid, spread);
             },
             py::arg("q"),
@@ -402,6 +295,127 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("side"),
             py::arg("mid"),
             py::arg("spread")
+        );
+
+    py::class_<MDPTier, Tier, std::shared_ptr<MDPTier>>(m, "MDPTier")
+        .def(py::init<>())
+        .def(
+            py::init<
+                std::string,
+                std::vector<double>,
+                std::shared_ptr<FlowCurve>,
+                std::shared_ptr<MarkoutModel>,
+                double,
+                double
+            >(),
+            py::arg("name"),
+            py::arg("sizes"),
+            py::arg("flow_curve"),
+            py::arg("markout_model"),
+            py::arg("delta_min") = -5.0,
+            py::arg("delta_max") = 5.0
+        )
+        .def_readwrite("name", &MDPTier::name)
+        .def_readwrite("flow_curve", &MDPTier::flow_curve)
+        .def_readwrite("markout_model", &MDPTier::markout_model)
+        .def_readwrite("policy", &MDPTier::policy)
+        .def_readwrite("sizes_", &MDPTier::sizes_)
+        .def_readwrite("delta_min", &MDPTier::delta_min)
+        .def_readwrite("delta_max", &MDPTier::delta_max)
+        .def("validate", &MDPTier::validate)
+        .def(
+            "sizes",
+            [](const MDPTier& self) { return self.sizes(); }
+        )
+        .def(
+            "is_admissible",
+            [](const MDPTier& self, double q, double z, Side side) {
+                return self.is_admissible(q, z, side);
+            },
+            py::arg("q"),
+            py::arg("z"),
+            py::arg("side")
+        )
+        .def(
+            "is_admissible",
+            [](const MDPTier& self, double q, double z, const std::string& side) {
+                return self.is_admissible(q, z, parse_side(side));
+            },
+            py::arg("q"),
+            py::arg("z"),
+            py::arg("side")
+        );
+
+    py::class_<ECNTier, Tier, std::shared_ptr<ECNTier>>(m, "ECNTier")
+        .def(py::init<>())
+        .def(
+            py::init<
+                std::string,
+                std::shared_ptr<FlowCurve>,
+                std::shared_ptr<MarkoutModel>,
+                double,
+                double,
+                ExponentialECNPolicy
+            >(),
+            py::arg("name"),
+            py::arg("flow_curve"),
+            py::arg("markout_model"),
+            py::arg("delta_min") = -5.0,
+            py::arg("delta_max") = 5.0,
+            py::arg("ecn_policy") = ExponentialECNPolicy{}
+        )
+        .def_readwrite("name", &ECNTier::name)
+        .def_readwrite("flow_curve", &ECNTier::flow_curve)
+        .def_readwrite("markout_model", &ECNTier::markout_model)
+        .def_readwrite("policy", &ECNTier::policy)
+        .def_readwrite("delta_min", &ECNTier::delta_min)
+        .def_readwrite("delta_max", &ECNTier::delta_max)
+        .def_readwrite("ecn_policy", &ECNTier::ecn_policy)
+        .def("validate", &ECNTier::validate)
+        .def(
+            "sizes",
+            [](const ECNTier& self) { return self.sizes(); }
+        )
+        .def_static(
+            "is_active_side",
+            &ECNTier::is_active_side,
+            py::arg("q"),
+            py::arg("side"),
+            py::arg("tol") = 1e-12
+        )
+        .def_static(
+            "is_active_side",
+            [](double q, const std::string& side, double tol) {
+                return ECNTier::is_active_side(q, parse_side(side), tol);
+            },
+            py::arg("q"),
+            py::arg("side"),
+            py::arg("tol") = 1e-12
+        )
+        .def(
+            "is_admissible",
+            [](const ECNTier& self, double q, double z, Side side) {
+                return self.is_admissible(q, z, side);
+            },
+            py::arg("q"),
+            py::arg("z"),
+            py::arg("side")
+        )
+        .def(
+            "is_admissible",
+            [](const ECNTier& self, double q, double z, const std::string& side) {
+                return self.is_admissible(q, z, parse_side(side));
+            },
+            py::arg("q"),
+            py::arg("z"),
+            py::arg("side")
+        )
+        .def("active_delta", &ECNTier::active_delta, py::arg("q"))
+        .def(
+            "active_delta_with_decay",
+            &ECNTier::active_delta_with_decay,
+            py::arg("q"),
+            py::arg("decay")
         );
 
     py::class_<SolverConfig>(m, "SolverConfig")
@@ -433,8 +447,18 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("delta_min", &LadderBoundsPolicy::delta_min)
         .def_readwrite("delta_max", &LadderBoundsPolicy::delta_max)
         .def("validate", &LadderBoundsPolicy::validate)
-        .def_static("is_shrink_mode", &LadderBoundsPolicy::is_shrink_mode, py::arg("q"), py::arg("side"))
-        .def_static("is_expand_mode", &LadderBoundsPolicy::is_expand_mode, py::arg("q"), py::arg("side"))
+        .def_static(
+            "is_shrink_mode",
+            &LadderBoundsPolicy::is_shrink_mode,
+            py::arg("q"),
+            py::arg("side")
+        )
+        .def_static(
+            "is_expand_mode",
+            &LadderBoundsPolicy::is_expand_mode,
+            py::arg("q"),
+            py::arg("side")
+        )
         .def_static(
             "is_shrink_mode",
             [](double q, const std::string& side) {
@@ -475,7 +499,7 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::init<
                 SolverConfig,
                 std::shared_ptr<InventoryPenalty>,
-                std::vector<std::shared_ptr<PriceTier>>
+                std::vector<std::shared_ptr<Tier>>
             >(),
             py::arg("config"),
             py::arg("penalty"),
@@ -499,4 +523,21 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("h_vec")
         )
         .def("solve", &HJBLadderSolver::solve);
+
+    m.def(
+        "next_inventory",
+        &next_inventory,
+        py::arg("q"),
+        py::arg("z"),
+        py::arg("side")
+    );
+    m.def(
+        "next_inventory",
+        [](double q, double z, const std::string& side) {
+            return next_inventory(q, z, parse_side(side));
+        },
+        py::arg("q"),
+        py::arg("z"),
+        py::arg("side")
+    );
 }
