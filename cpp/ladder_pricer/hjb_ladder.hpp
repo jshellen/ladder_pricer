@@ -1268,45 +1268,58 @@ struct HJBLadderSolver {
         const std::vector<double>& current_delta,
         double q,
         OptionalDeltaRow prev_delta
-    ) const {
-        validate_mdp_bounds_request(rung_idx, current_delta, prev_delta);
+        ) const {
+            validate_mdp_bounds_request(rung_idx, current_delta, prev_delta);
 
-        double lower = tier.delta_min;
-        double upper = tier.delta_max;
+            double lower = tier.delta_min;
+            double upper = tier.delta_max;
 
-        const bool has_prev_row = prev_delta.has_value();
-        const bool has_prev_rung = (rung_idx > 0);
-        const bool shrink = (q < 0.0);
-        const bool expand = (q > 0.0);
+            const bool has_prev_row = prev_delta.has_value();
+            const bool has_prev_rung = (rung_idx > 0);
+            const bool shrink = (q < 0.0); // bid reduces risk when short
+            const bool expand = (q > 0.0); // bid increases risk when long
 
-        if (has_prev_rung) {
-            upper = std::min(upper, current_delta[rung_idx - 1]);
-        }
+            if (has_prev_rung) {
+                upper = std::min(upper, current_delta[rung_idx - 1]);
+            }
 
-        if (!has_prev_row) {
+            if (!has_prev_row) {
+                return {lower, upper};
+            }
+
+            const auto& prev_row = prev_delta->get();
+
+            // Explicit monotonic anchor for the first rung.
+            // As we move away from q=0:
+            // - risk-reducing side: first rung must be at least as aggressive as previous row
+            // - risk-increasing side: first rung must be no more aggressive than previous row
+            if (!has_prev_rung) {
+                if (shrink) {
+                    lower = std::max(lower, prev_row[0]);
+                } else if (expand) {
+                    upper = std::min(upper, prev_row[0]);
+                }
+                return {lower, upper};
+            }
+
+            if (expand) {
+                const double required_tail_span = prev_row[rung_idx] - prev_row.back();
+                lower = std::max(lower, tier.delta_min + required_tail_span);
+            }
+
+            {
+                const double prev_curr = current_delta[rung_idx - 1];
+                const double prev_row_gap = prev_row[rung_idx - 1] - prev_row[rung_idx];
+
+                if (shrink) {
+                    lower = std::max(lower, prev_curr - prev_row_gap);
+                } else if (expand) {
+                    upper = std::min(upper, prev_curr - prev_row_gap);
+                }
+            }
+
             return {lower, upper};
         }
-
-        const auto& prev_row = prev_delta->get();
-
-        if (expand) {
-            const double required_tail_span = prev_row[rung_idx] - prev_row.back();
-            lower = std::max(lower, tier.delta_min + required_tail_span);
-        }
-
-        if (has_prev_rung) {
-            const double prev_curr = current_delta[rung_idx - 1];
-            const double prev_row_gap = prev_row[rung_idx - 1] - prev_row[rung_idx];
-
-            if (shrink) {
-                lower = std::max(lower, prev_curr - prev_row_gap);
-            } else if (expand) {
-                upper = std::min(upper, prev_curr - prev_row_gap);
-            }
-        }
-
-        return {lower, upper};
-    }
 
     std::pair<double, double> mdp_ask_bounds_for_rung(
         const MDPTier& tier,
@@ -1322,8 +1335,8 @@ struct HJBLadderSolver {
 
         const bool has_prev_row = prev_delta.has_value();
         const bool has_prev_rung = (rung_idx > 0);
-        const bool shrink = (q > 0.0);
-        const bool expand = (q < 0.0);
+        const bool shrink = (q > 0.0); // ask reduces risk when long
+        const bool expand = (q < 0.0); // ask increases risk when short
 
         if (has_prev_rung) {
             upper = std::min(upper, current_delta[rung_idx - 1]);
@@ -1335,12 +1348,22 @@ struct HJBLadderSolver {
 
         const auto& prev_row = prev_delta->get();
 
+        // Explicit monotonic anchor for the first rung.
+        if (!has_prev_rung) {
+            if (shrink) {
+                lower = std::max(lower, prev_row[0]);
+            } else if (expand) {
+                upper = std::min(upper, prev_row[0]);
+            }
+            return {lower, upper};
+        }
+
         if (expand) {
             const double required_tail_span = prev_row[rung_idx] - prev_row.back();
             lower = std::max(lower, tier.delta_min + required_tail_span);
         }
 
-        if (has_prev_rung) {
+        {
             const double prev_curr = current_delta[rung_idx - 1];
             const double prev_row_gap = prev_row[rung_idx - 1] - prev_row[rung_idx];
 
