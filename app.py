@@ -104,14 +104,14 @@ DEFAULT_ECN_SETTINGS = {
     "ecn_convergence_inventory": 10.0,
 }
 DEFAULT_DARK_POOL_SETTINGS = {
-    "enabled": True,
-    "lambda_bid": 0.10,
-    "lambda_ask": 0.10,
+    "enabled": False,
+    "lambda_bid": 2.00,
+    "lambda_ask": 2.00,
     "p_bid": 0.50,
     "p_ask": 0.50,
     "fee_per_unit_bid": 0.0,
     "fee_per_unit_ask": 0.0,
-    "posted_sizes": "1, 2, 3, 5, 10",
+    "posted_sizes": "1, 2, 3, 5",
     "allow_both_sides": False,
 }
 
@@ -252,7 +252,7 @@ def default_tier_values(i: int) -> dict:
         {
             "enabled": True,
             "kind": "mdp",
-            "name": "core_clients",
+            "name": "Tier 1",
             "sizes": "1, 2, 3, 5, 10, 20",
             "flow_A0": 1.00,
             "flow_theta": 0.0,
@@ -267,7 +267,7 @@ def default_tier_values(i: int) -> dict:
         {
             "enabled": True,
             "kind": "mdp",
-            "name": "aggressive_clients",
+            "name": "Tier 2",
             "sizes": "1, 2, 3, 5, 10, 20",
             "flow_A0": 1.0,
             "flow_theta": 0.0,
@@ -297,7 +297,7 @@ def default_tier_values(i: int) -> dict:
         {
             "enabled": False,
             "kind": "mdp",
-            "name": "sticky_clients",
+            "name": "Tier 3",
             "sizes": "1, 2, 3, 5, 10, 15, 20",
             "flow_A0": 0.85,
             "flow_theta": 0.15,
