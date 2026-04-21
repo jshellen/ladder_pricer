@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -73,30 +74,46 @@ def build_piecewise_centered_q_grid(
 
 def validate_centered_q_grid(q_grid: np.ndarray) -> list[str]:
     errors: list[str] = []
+
     if len(q_grid) < 3:
         errors.append("q_grid must contain at least 3 points.")
         return errors
+
     if len(q_grid) % 2 == 0:
         errors.append("q_grid must have odd length.")
+
     mid_idx = len(q_grid) // 2
     if not np.isclose(q_grid[mid_idx], 0.0, atol=1e-10):
         errors.append("q_grid must contain 0 exactly at the middle index.")
+
     for i in range(mid_idx):
         if not np.isclose(q_grid[i] + q_grid[-1 - i], 0.0, atol=1e-10):
             errors.append("q_grid must be symmetric around 0.")
             break
+
     return errors
 
 
 # ============================================================
-# Tier specs
+# Specifications
 # ============================================================
 
 DEFAULT_MDP_SIZES = "1, 2, 3, 5, 10, 20"
 DEFAULT_ECN_SETTINGS = {
     "ecn_toxicity": 0.0040,
-    "ecn_fee": 0.0000,
+    "ecn_fee": 0.0,
     "ecn_convergence_inventory": 4.0,
+}
+DEFAULT_DARK_POOL_SETTINGS = {
+    "enabled": True,
+    "lambda_bid": 0.10,
+    "lambda_ask": 0.10,
+    "p_bid": 0.50,
+    "p_ask": 0.50,
+    "fee_per_unit_bid": 0.0,
+    "fee_per_unit_ask": 0.0,
+    "posted_sizes": "1, 2, 3, 5, 10",
+    "allow_both_sides": False,
 }
 
 
@@ -167,6 +184,30 @@ class ECNTierSpec(CommonTierSpec):
         )
 
 
+@dataclass
+class DarkPoolSpec:
+    lambda_bid: float
+    lambda_ask: float
+    p_bid: float
+    p_ask: float
+    fee_per_unit_bid: float
+    fee_per_unit_ask: float
+    posted_sizes: list[float]
+    allow_both_sides: bool
+
+    def build_cpp_venue(self) -> lp.DarkPoolVenue:
+        return lp.DarkPoolVenue(
+            lambda_bid=float(self.lambda_bid),
+            lambda_ask=float(self.lambda_ask),
+            p_bid=float(self.p_bid),
+            p_ask=float(self.p_ask),
+            fee_per_unit_bid=float(self.fee_per_unit_bid),
+            fee_per_unit_ask=float(self.fee_per_unit_ask),
+            posted_sizes=[float(u) for u in self.posted_sizes],
+            allow_both_sides=bool(self.allow_both_sides),
+        )
+
+
 TierSpec = MDPTierSpec | ECNTierSpec
 CppTier = lp.MDPTier | lp.ECNTier
 
@@ -184,8 +225,17 @@ def parse_float_list(raw: str, field_name: str) -> list[float]:
         vals = [float(x.strip()) for x in raw.split(",") if x.strip()]
     except ValueError as exc:
         raise ValueError(f"Could not parse {field_name}. Use comma-separated numbers.") from exc
+
     if not vals:
         raise ValueError(f"{field_name} cannot be empty.")
+    return vals
+
+
+def parse_integer_like_list(raw: str, field_name: str) -> list[float]:
+    vals = parse_float_list(raw, field_name)
+    for v in vals:
+        if abs(v - round(v)) > 1e-10:
+            raise ValueError(f"{field_name} must contain integer-valued sizes only.")
     return vals
 
 
@@ -316,7 +366,7 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
             key=f"flow_volume_shift_{i}",
         )
 
-        st.markdown("**Markout parameters**")
+        st.markdown("**Base markout parameters**")
         c5, c6 = st.columns(2)
         markout_base = c5.number_input(
             f"Markout base {i + 1}",
@@ -356,7 +406,7 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
                 key: float(defaults.get(key, DEFAULT_ECN_SETTINGS[key]))
                 for key in DEFAULT_ECN_SETTINGS
             }
-            st.markdown("**ECN settings**")
+            st.markdown("**ECN controls**")
             c9, c10 = st.columns(2)
             ecn_toxicity = c9.number_input(
                 f"ECN toxicity {i + 1}",
@@ -380,7 +430,7 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
                 key=f"ecn_convergence_inventory_{i}",
             )
             st.caption(
-                "ECN stays one-sided and passive. The quote follows a smooth built-in inventory profile: it starts at delta_min and reaches the mid cap exactly when |q| reaches the convergence inventory."
+                "ECN stays one-sided and passive. The quote follows a smooth built-in inventory profile: it starts at delta_min and reaches the passive mid cap exactly when |q| reaches the convergence inventory."
             )
 
     if flow_A0 < 0.0:
@@ -419,9 +469,7 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
     if ecn_convergence_inventory <= 0.0:
         raise ValueError(f"Tier {i + 1}: ECN convergence inventory must be positive.")
     if tier_delta_min >= min(tier_delta_max, 0.5):
-        raise ValueError(
-            f"Tier {i + 1}: ECN delta_min must be below min(delta_max, 0.5)."
-        )
+        raise ValueError(f"Tier {i + 1}: ECN delta_min must be below min(delta_max, 0.5).")
 
     return ECNTierSpec(
         ecn_toxicity=float(ecn_toxicity),
@@ -431,8 +479,100 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
     )
 
 
+def build_dark_pool_spec_from_ui() -> DarkPoolSpec | None:
+    defaults = DEFAULT_DARK_POOL_SETTINGS
+    with st.sidebar.expander("Dark pool venue", expanded=True):
+        enabled = st.checkbox("Enable dark pool", value=bool(defaults["enabled"]))
+        if not enabled:
+            return None
+
+        allow_both_sides = st.checkbox(
+            "Allow both sides simultaneously",
+            value=bool(defaults["allow_both_sides"]),
+            help="If disabled, the dark pool only posts the inventory-reducing side.",
+        )
+
+        c1, c2 = st.columns(2)
+        lambda_bid = c1.number_input(
+            "Dark pool λ bid",
+            value=float(defaults["lambda_bid"]),
+            min_value=0.0,
+            step=0.01,
+            format="%.4f",
+        )
+        lambda_ask = c2.number_input(
+            "Dark pool λ ask",
+            value=float(defaults["lambda_ask"]),
+            min_value=0.0,
+            step=0.01,
+            format="%.4f",
+        )
+
+        c3, c4 = st.columns(2)
+        p_bid = c3.number_input(
+            "Geometric p bid",
+            value=float(defaults["p_bid"]),
+            min_value=0.001,
+            max_value=1.0,
+            step=0.01,
+            format="%.4f",
+        )
+        p_ask = c4.number_input(
+            "Geometric p ask",
+            value=float(defaults["p_ask"]),
+            min_value=0.001,
+            max_value=1.0,
+            step=0.01,
+            format="%.4f",
+        )
+
+        c5, c6 = st.columns(2)
+        fee_per_unit_bid = c5.number_input(
+            "Fee / rebate per unit bid",
+            value=float(defaults["fee_per_unit_bid"]),
+            step=0.001,
+            format="%.5f",
+            help="Positive = fee, negative = rebate.",
+        )
+        fee_per_unit_ask = c6.number_input(
+            "Fee / rebate per unit ask",
+            value=float(defaults["fee_per_unit_ask"]),
+            step=0.001,
+            format="%.5f",
+            help="Positive = fee, negative = rebate.",
+        )
+
+        posted_sizes_raw = st.text_input(
+            "Allowed posted sizes",
+            value=str(defaults["posted_sizes"]),
+            help="Integer-valued posted sizes in the same inventory units as q.",
+        )
+        posted_sizes = parse_integer_like_list(posted_sizes_raw, "dark-pool posted sizes")
+
+        if any(u <= 0.0 for u in posted_sizes):
+            raise ValueError("Dark pool posted sizes must be positive.")
+        if any(posted_sizes[k] >= posted_sizes[k + 1] for k in range(len(posted_sizes) - 1)):
+            raise ValueError("Dark pool posted sizes must be strictly increasing.")
+
+        st.caption(
+            "Dark-pool fills occur at mid. Arrival intensity is constant. Incoming order size is geometric, "
+            "and the executed size is min(posted size, incoming size)."
+        )
+
+    return DarkPoolSpec(
+        lambda_bid=float(lambda_bid),
+        lambda_ask=float(lambda_ask),
+        p_bid=float(p_bid),
+        p_ask=float(p_ask),
+        fee_per_unit_bid=float(fee_per_unit_bid),
+        fee_per_unit_ask=float(fee_per_unit_ask),
+        posted_sizes=posted_sizes,
+        allow_both_sides=bool(allow_both_sides),
+    )
+
+
 # ============================================================
-# Solver helpers
+# Solver / conversion helpers
 # ============================================================
 
 def build_solver_config(
@@ -468,60 +608,70 @@ def build_solver_config(
 def build_cpp_tiers(specs: list[TierSpec]) -> tuple[list[lp.MDPTier], list[lp.ECNTier]]:
     mdp_tiers: list[lp.MDPTier] = []
     ecn_tiers: list[lp.ECNTier] = []
+
     for spec in specs:
         cpp_tier = spec.build_cpp_tier()
         if isinstance(spec, MDPTierSpec):
             mdp_tiers.append(cpp_tier)
         else:
             ecn_tiers.append(cpp_tier)
+
     return mdp_tiers, ecn_tiers
 
 
 def ordered_solution_tiers(specs: list[TierSpec], solution: lp.HJBSolution) -> list[CppTier]:
     mdp_iter = iter(solution.mdp_tiers)
     ecn_iter = iter(solution.ecn_tiers)
+
     out: list[CppTier] = []
     for spec in specs:
         out.append(next(ecn_iter) if isinstance(spec, ECNTierSpec) else next(mdp_iter))
     return out
 
 
-def total_tier_count(solution: lp.HJBSolution) -> int:
-    return len(solution.mdp_tiers) + len(solution.ecn_tiers)
+def total_venue_count(solution: lp.HJBSolution) -> int:
+    return len(solution.mdp_tiers) + len(solution.ecn_tiers) + (0 if solution.dark_pool is None else 1)
 
 
-def is_ecn_tier(cpp_tier: CppTier) -> bool:
-    return isinstance(cpp_tier, lp.ECNTier)
+def q_index_for_policy_qgrid(q_grid: list[float] | np.ndarray, q: float) -> int:
+    q_arr = np.asarray(list(q_grid), dtype=float)
+    if q_arr.size == 0:
+        raise ValueError("Policy q_grid is empty.")
+    return int(np.argmin(np.abs(q_arr - float(q))))
 
 
-def q_index_lookup(cpp_tier: CppTier) -> dict[float, int]:
-    return {float(q): i for i, q in enumerate(cpp_tier.policy.q_grid)}
+def q_index_for_tier_policy(cpp_tier: CppTier, q: float) -> int:
+    return q_index_for_policy_qgrid(cpp_tier.policy.q_grid, q)
 
 
-def is_structurally_admissible(cpp_tier: CppTier, q: float, z: float, side: str) -> bool:
+def is_admissible(cpp_tier: CppTier, q: float, z: float, side: str) -> bool:
     return bool(cpp_tier.is_admissible(float(q), float(z), side))
 
 
-def is_policy_active(cpp_tier: CppTier, q_index: int, side: str) -> bool:
-    if is_ecn_tier(cpp_tier):
-        return bool(cpp_tier.is_policy_active(int(q_index), side))
-    return True
+def is_policy_active(cpp_tier: CppTier, q: float, side: str) -> bool:
+    if not isinstance(cpp_tier, lp.ECNTier):
+        return True
+    idx = q_index_for_tier_policy(cpp_tier, q)
+    return bool(cpp_tier.is_policy_active(idx, side))
 
 
 def masked_quote_summary(
     cpp_tier: CppTier,
-    q_index: int,
     q: float,
     z: float,
     side: str,
     mid_price: float,
     spread: float,
 ):
-    if not is_structurally_admissible(cpp_tier, q, z, side):
+    if not is_admissible(cpp_tier, q, z, side):
         return None
-    if not is_policy_active(cpp_tier, q_index, side):
+    if isinstance(cpp_tier, lp.ECNTier) and not is_policy_active(cpp_tier, q, side):
         return None
     return cpp_tier.quote_summary(float(q), float(z), side, float(mid_price), float(spread))
+
+
+def is_ecn_tier(cpp_tier: CppTier) -> bool:
+    return isinstance(cpp_tier, lp.ECNTier)
 
 
 # ============================================================
@@ -538,47 +688,56 @@ def make_flow_parameter_table(spec: TierSpec, cpp_tier: CppTier) -> pd.DataFrame
             "A(z)": spec.flow_A0 * zf ** (-spec.flow_theta),
             "delta_50(z)": spec.flow_shift - spec.flow_volume_shift * (zf - 1.0),
             "steepness": spec.flow_steepness,
-            "mu(z)": cpp_tier.expected_markout(zf),
+            "base_mu(z)": cpp_tier.expected_markout(zf),
         }
         if isinstance(spec, ECNTierSpec) and is_ecn_tier(cpp_tier):
             row |= {
                 "ecn_toxicity": float(cpp_tier.adverse_selection_model.ecn_toxicity),
                 "ecn_fee": float(cpp_tier.adverse_selection_model.ecn_fee),
                 "ecn_convergence_inventory": float(cpp_tier.adverse_selection_model.ecn_convergence_inventory),
-                "ecn_mid_cap": float(cpp_tier.delta_mid_cap()),
             }
         rows.append(row)
     return pd.DataFrame(rows)
 
 
 def make_flow_curve_figure(cpp_tier: CppTier, spec: TierSpec) -> go.Figure:
-    grid = np.linspace(-1.0, 1.0, 150)
+    grid = np.linspace(-1.0, 1.0, 160)
     fig = go.Figure()
+
     for z in tier_sizes(spec):
         zf = float(z)
         vals = [cpp_tier.arrival_rate(float(d), zf) for d in grid]
         fig.add_trace(go.Scatter(x=grid, y=vals, mode="lines", name=f"{zf:g}"))
+
     fig.update_layout(
         title=f"Flow curves λ(δ, z) — {spec.name} ({tier_kind_label(spec)})",
         xaxis_title="delta",
         yaxis_title="arrival rate",
-        height=480,
+        height=500,
     )
     return fig
 
 
-def make_quote_inventory_figure(cpp_tier: CppTier, spec: TierSpec, spread: float, mid_price: float) -> go.Figure:
+def make_quote_inventory_figure(
+    cpp_tier: CppTier,
+    spec: TierSpec,
+    spread: float,
+    mid_price: float,
+) -> go.Figure:
     q_grid = [float(q) for q in cpp_tier.policy.q_grid]
     fig = go.Figure()
+
     for z in tier_sizes(spec):
         zf = float(z)
         bid_vals: list[float] = []
         ask_vals: list[float] = []
-        for q_index, q in enumerate(q_grid):
-            bid = masked_quote_summary(cpp_tier, q_index, q, zf, "bid", mid_price, spread)
-            ask = masked_quote_summary(cpp_tier, q_index, q, zf, "ask", mid_price, spread)
+
+        for q in q_grid:
+            bid = masked_quote_summary(cpp_tier, q, zf, "bid", mid_price, spread)
+            ask = masked_quote_summary(cpp_tier, q, zf, "ask", mid_price, spread)
             bid_vals.append(np.nan if bid is None else float(bid.quote_relative_to_mid_pips))
             ask_vals.append(np.nan if ask is None else float(ask.quote_relative_to_mid_pips))
+
         fig.add_trace(go.Scatter(x=q_grid, y=bid_vals, mode="lines", name=f"{zf:g} bid"))
         fig.add_trace(
             go.Scatter(
@@ -589,6 +748,7 @@ def make_quote_inventory_figure(cpp_tier: CppTier, spec: TierSpec, spread: float
                 name=f"{zf:g} ask",
             )
         )
+
     fig.add_hline(y=0.0)
     fig.update_layout(
         title=f"Quotes vs inventory — {spec.name} ({tier_kind_label(spec)})",
@@ -599,15 +759,22 @@ def make_quote_inventory_figure(cpp_tier: CppTier, spec: TierSpec, spread: float
     return fig
 
 
-def make_ladder_figure(cpp_tier: CppTier, spec: TierSpec, q: float, spread: float, mid_price: float) -> go.Figure:
-    q_idx = q_index_lookup(cpp_tier)[float(q)]
+def make_ladder_figure(
+    cpp_tier: CppTier,
+    spec: TierSpec,
+    q: float,
+    spread: float,
+    mid_price: float,
+) -> go.Figure:
     sizes = [float(z) for z in tier_sizes(spec)]
     bid_vp, ask_vp = [], []
+
     for z in sizes:
-        bid = masked_quote_summary(cpp_tier, q_idx, q, z, "bid", mid_price, spread)
-        ask = masked_quote_summary(cpp_tier, q_idx, q, z, "ask", mid_price, spread)
+        bid = masked_quote_summary(cpp_tier, q, z, "bid", mid_price, spread)
+        ask = masked_quote_summary(cpp_tier, q, z, "ask", mid_price, spread)
         bid_vp.append(np.nan if bid is None else float(bid.volume_premium_pips))
         ask_vp.append(np.nan if ask is None else float(ask.volume_premium_pips))
+
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=sizes, y=bid_vp, mode="lines+markers", name=f"Bid q={q:g}"))
     fig.add_trace(
@@ -624,86 +791,80 @@ def make_ladder_figure(cpp_tier: CppTier, spec: TierSpec, q: float, spread: floa
         title=f"Volume premium — {spec.name} ({tier_kind_label(spec)}) at q = {q:g}",
         xaxis_title="Trade size z",
         yaxis_title="Premium vs 1M quote (pips)",
-        height=480,
+        height=500,
     )
     return fig
 
 
-def make_q_ladder_table(cpp_tier: CppTier, spec: TierSpec, q: float, spread: float, mid_price: float) -> pd.DataFrame:
-    q_idx = q_index_lookup(cpp_tier)[float(q)]
+def make_q_ladder_table(
+    cpp_tier: CppTier,
+    spec: TierSpec,
+    q: float,
+    spread: float,
+    mid_price: float,
+) -> pd.DataFrame:
     rows = []
+
     for z in tier_sizes(spec):
         zf = float(z)
-        bid = masked_quote_summary(cpp_tier, q_idx, q, zf, "bid", mid_price, spread)
-        ask = masked_quote_summary(cpp_tier, q_idx, q, zf, "ask", mid_price, spread)
+        bid_adm = is_admissible(cpp_tier, q, zf, "bid")
+        ask_adm = is_admissible(cpp_tier, q, zf, "ask")
+        bid_active = bid_adm and is_policy_active(cpp_tier, q, "bid")
+        ask_active = ask_adm and is_policy_active(cpp_tier, q, "ask")
+
+        bid = masked_quote_summary(cpp_tier, q, zf, "bid", mid_price, spread)
+        ask = masked_quote_summary(cpp_tier, q, zf, "ask", mid_price, spread)
+
         rows.append(
             {
                 "type": tier_kind_label(spec),
                 "q": float(q),
                 "z": zf,
-                "Bid active": bid is not None,
-                "Ask active": ask is not None,
+                "Bid admissible": bid_adm,
+                "Ask admissible": ask_adm,
+                "Bid active": bid_active,
+                "Ask active": ask_active,
                 "Bid delta": np.nan if bid is None else round(float(bid.delta), 6),
                 "Ask delta": np.nan if ask is None else round(float(ask.delta), 6),
                 "Bid vs mid [pips]": np.nan if bid is None else round(float(bid.quote_relative_to_mid_pips), 3),
                 "Ask vs mid [pips]": np.nan if ask is None else round(float(ask.quote_relative_to_mid_pips), 3),
-                "Bid dist to mid [pips]": np.nan if bid is None else round(float(bid.distance_to_mid_pips), 3),
-                "Ask dist to mid [pips]": np.nan if ask is None else round(float(ask.distance_to_mid_pips), 3),
                 "Bid vol premium [pips]": np.nan if bid is None else round(float(bid.volume_premium_pips), 3),
                 "Ask vol premium [pips]": np.nan if ask is None else round(float(ask.volume_premium_pips), 3),
-                "Bid quote": np.nan if bid is None else round(float(bid.quote_price), 6),
-                "Ask quote": np.nan if ask is None else round(float(ask.quote_price), 6),
             }
         )
+
     return pd.DataFrame(rows)
-
-
-def make_h_figure(solution: lp.HJBSolution) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(x=list(solution.q_grid), y=list(solution.h), mode="lines+markers", name="h(q)")
-    )
-    fig.update_layout(title="Value function h(q)", xaxis_title="Inventory q", yaxis_title="h(q)", height=440)
-    return fig
-
-
-def make_convergence_figure(values: list[float], title: str, yaxis_title: str) -> go.Figure:
-    fig = go.Figure()
-    if values:
-        fig.add_trace(go.Scatter(x=list(range(1, len(values) + 1)), y=values, mode="lines+markers"))
-    fig.update_layout(title=title, xaxis_title="Iteration", yaxis_title=yaxis_title, yaxis_type="log", height=380)
-    return fig
 
 
 def make_ecn_cap_figure(cpp_tier: lp.ECNTier, spread: float) -> go.Figure:
     q_grid = [float(q) for q in cpp_tier.policy.q_grid]
-    fig = go.Figure()
+    bid_cap, ask_cap, bid_actual, ask_actual = [], [], [], []
 
-    bid_actual: list[float] = []
-    ask_actual: list[float] = []
-    bid_cap: list[float] = []
-    ask_cap: list[float] = []
+    for q in q_grid:
+        q_abs = abs(q)
+        cap = float(cpp_tier.delta_cap(q_abs))
+        cap_pips = 10000.0 * spread * (cap - 0.5)
+        ask_cap_pips = 10000.0 * spread * (0.5 - cap)
 
-    for i, q in enumerate(q_grid):
-        cap = float(cpp_tier.delta_cap(abs(q)))
         if q < 0.0:
-            bid_cap.append(10000.0 * spread * (cap - 0.5))
+            bid_cap.append(cap_pips)
+            bid_actual.append(np.nan if not masked_quote_summary(cpp_tier, q, 1.0, "bid", 1.0, spread) else float(masked_quote_summary(cpp_tier, q, 1.0, "bid", 1.0, spread).quote_relative_to_mid_pips))
             ask_cap.append(np.nan)
-            bid_actual.append(np.nan if not cpp_tier.is_policy_active(i, "bid") else 10000.0 * spread * (float(cpp_tier.policy.bid[i][0]) - 0.5))
             ask_actual.append(np.nan)
         elif q > 0.0:
+            ask_cap.append(ask_cap_pips)
+            ask_actual.append(np.nan if not masked_quote_summary(cpp_tier, q, 1.0, "ask", 1.0, spread) else float(masked_quote_summary(cpp_tier, q, 1.0, "ask", 1.0, spread).quote_relative_to_mid_pips))
             bid_cap.append(np.nan)
-            ask_cap.append(10000.0 * spread * (0.5 - cap))
             bid_actual.append(np.nan)
-            ask_actual.append(np.nan if not cpp_tier.is_policy_active(i, "ask") else 10000.0 * spread * (0.5 - float(cpp_tier.policy.ask[i][0])))
         else:
             bid_cap.append(np.nan)
             ask_cap.append(np.nan)
             bid_actual.append(np.nan)
             ask_actual.append(np.nan)
 
-    fig.add_trace(go.Scatter(x=q_grid, y=bid_cap, mode="lines", line=dict(dash="dot"), name="Bid cap"))
-    fig.add_trace(go.Scatter(x=q_grid, y=ask_cap, mode="lines", line=dict(dash="dot"), name="Ask cap"))
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=q_grid, y=bid_cap, mode="lines", line=dict(dash="dot"), name="Bid profile"))
+    fig.add_trace(go.Scatter(x=q_grid, y=ask_cap, mode="lines", line=dict(dash="dot"), name="Ask profile"))
     fig.add_trace(go.Scatter(x=q_grid, y=bid_actual, mode="lines+markers", name="Bid quote"))
     fig.add_trace(go.Scatter(x=q_grid, y=ask_actual, mode="lines+markers", name="Ask quote"))
     fig.add_hline(y=0.0)
@@ -716,21 +877,169 @@ def make_ecn_cap_figure(cpp_tier: lp.ECNTier, spread: float) -> go.Figure:
     return fig
 
 
-def make_ecn_activity_table(cpp_tier: lp.ECNTier) -> pd.DataFrame:
-    rows = []
-    for i, q in enumerate(cpp_tier.policy.q_grid):
-        qf = float(q)
-        rows.append(
+def make_ecn_activity_figure(cpp_tier: lp.ECNTier) -> go.Figure:
+    q_grid = [float(q) for q in cpp_tier.policy.q_grid]
+    bid_active = [1.0 if cpp_tier.is_policy_active(i, "bid") else 0.0 for i in range(len(q_grid))]
+    ask_active = [1.0 if cpp_tier.is_policy_active(i, "ask") else 0.0 for i in range(len(q_grid))]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=q_grid, y=bid_active, mode="lines", name="bid active"))
+    fig.add_trace(
+        go.Scatter(x=q_grid, y=ask_active, mode="lines", line=dict(dash="dash"), name="ask active")
+    )
+    fig.update_layout(
+        title="ECN activation map",
+        xaxis_title="Inventory q",
+        yaxis_title="Active (1=yes, 0=no)",
+        height=320,
+        yaxis=dict(range=[-0.05, 1.05]),
+    )
+    return fig
+
+
+def make_ecn_cost_curve_figure(cpp_tier: lp.ECNTier) -> go.Figure:
+    delta_grid = np.linspace(float(cpp_tier.delta_min), float(cpp_tier.delta_max), 220)
+    z = 1.0
+    base_mu = [float(cpp_tier.markout_model.expected_markout(z))] * len(delta_grid)
+    tox_mu = [
+        float(cpp_tier.adverse_selection_model.toxicity_cost(float(d), z))
+        for d in delta_grid
+    ]
+    total_cost = [
+        float(cpp_tier.adverse_selection_model.expected_cost(cpp_tier.markout_model, float(d), z))
+        for d in delta_grid
+    ]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=delta_grid, y=base_mu, mode="lines", name="base markout"))
+    fig.add_trace(go.Scatter(x=delta_grid, y=tox_mu, mode="lines", name="toxicity cost"))
+    fig.add_trace(
+        go.Scatter(x=delta_grid, y=total_cost, mode="lines", line=dict(dash="dash"), name="total cost")
+    )
+    fig.update_layout(
+        title="ECN cost components vs delta (z = 1)",
+        xaxis_title="delta",
+        yaxis_title="Cost per fill",
+        height=360,
+    )
+    return fig
+
+
+def make_ecn_contribution_figure(
+    solver: lp.HJBLadderSolver,
+    cpp_tier: lp.ECNTier,
+    solution: lp.HJBSolution,
+) -> go.Figure:
+    q_grid = [float(q) for q in solution.q_grid]
+    vals = [
+        float(solver.ecn_bellman_contribution(cpp_tier, q, i, list(solution.h)))
+        for i, q in enumerate(q_grid)
+    ]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=q_grid, y=vals, mode="lines+markers", name="ECN contribution"))
+    fig.add_hline(y=0.0)
+    fig.update_layout(
+        title="ECN Bellman contribution vs inventory",
+        xaxis_title="Inventory q",
+        yaxis_title="Contribution",
+        height=360,
+    )
+    return fig
+
+
+def make_dark_pool_parameter_table(venue: lp.DarkPoolVenue) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
             {
-                "q": qf,
-                "delta_profile": float(cpp_tier.delta_cap(abs(qf))),
-                "bid_active": bool(cpp_tier.is_policy_active(i, "bid")),
-                "ask_active": bool(cpp_tier.is_policy_active(i, "ask")),
-                "bid_delta": np.nan if qf >= 0.0 else float(cpp_tier.policy.bid[i][0]),
-                "ask_delta": np.nan if qf <= 0.0 else float(cpp_tier.policy.ask[i][0]),
+                "lambda_bid": float(venue.lambda_bid),
+                "lambda_ask": float(venue.lambda_ask),
+                "p_bid": float(venue.p_bid),
+                "p_ask": float(venue.p_ask),
+                "mean arrival size bid": round(1.0 / float(venue.p_bid), 4),
+                "mean arrival size ask": round(1.0 / float(venue.p_ask), 4),
+                "fee_per_unit_bid": float(venue.fee_per_unit_bid),
+                "fee_per_unit_ask": float(venue.fee_per_unit_ask),
+                "allow_both_sides": bool(venue.allow_both_sides),
+                "posted_sizes": ", ".join(f"{float(u):g}" for u in venue.posted_sizes),
             }
+        ]
+    )
+
+
+def make_dark_pool_size_figure(venue: lp.DarkPoolVenue) -> go.Figure:
+    q_grid = [float(q) for q in venue.policy.q_grid]
+    bid_vals = [
+        np.nan if not venue.policy.is_active(i, "bid") else float(venue.policy.bid_size[i])
+        for i in range(len(q_grid))
+    ]
+    ask_vals = [
+        np.nan if not venue.policy.is_active(i, "ask") else float(venue.policy.ask_size[i])
+        for i in range(len(q_grid))
+    ]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=q_grid, y=bid_vals, mode="lines+markers", name="posted bid size"))
+    fig.add_trace(
+        go.Scatter(
+            x=q_grid,
+            y=ask_vals,
+            mode="lines+markers",
+            line=dict(dash="dash"),
+            name="posted ask size",
         )
-    return pd.DataFrame(rows)
+    )
+    fig.update_layout(
+        title="Dark-pool optimal posted size vs inventory",
+        xaxis_title="Inventory q",
+        yaxis_title="Posted size",
+        height=420,
+    )
+    return fig
+
+
+def make_dark_pool_contribution_figure(
+    solver: lp.HJBLadderSolver,
+    venue: lp.DarkPoolVenue,
+    solution: lp.HJBSolution,
+) -> go.Figure:
+    q_grid = [float(q) for q in solution.q_grid]
+    vals = [
+        float(solver.dark_pool_bellman_contribution(venue, q, i, list(solution.h)))
+        for i, q in enumerate(q_grid)
+    ]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=q_grid, y=vals, mode="lines+markers", name="dark-pool contribution"))
+    fig.add_hline(y=0.0)
+    fig.update_layout(
+        title="Dark-pool Bellman contribution vs inventory",
+        xaxis_title="Inventory q",
+        yaxis_title="Contribution",
+        height=360,
+    )
+    return fig
+
+
+def make_h_figure(solution: lp.HJBSolution) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=list(solution.q_grid), y=list(solution.h), mode="lines+markers", name="h(q)"))
+    fig.update_layout(title="Value function h(q)", xaxis_title="Inventory q", yaxis_title="h(q)", height=420)
+    return fig
+
+
+def make_convergence_figure(values: list[float], title: str, yaxis_title: str) -> go.Figure:
+    fig = go.Figure()
+    if values:
+        fig.add_trace(go.Scatter(x=list(range(1, len(values) + 1)), y=values, mode="lines+markers"))
+    fig.update_layout(
+        title=title,
+        xaxis_title="Iteration",
+        yaxis_title=yaxis_title,
+        yaxis_type="log",
+        height=360,
+    )
+    return fig
 
 
 # ============================================================
@@ -741,8 +1050,8 @@ st.set_page_config(page_title="Trinity 2.0 Pricer", layout="wide")
 st.title("Trinity 2.0 Pricer")
 st.markdown(
     "MDP tiers use rung-by-rung two-sided ladder controls. "
-    "ECN tiers quote only size z = 1 on the inventory-reducing side. "
-    "Their quote is a direct smooth cap-profile in inventory: it starts at delta_min, reaches the mid cap exactly at the convergence inventory, and never crosses mid."
+    "ECN tiers are one-size hedge channels. "
+    "The dark pool trades at mid with fee or rebate, and the only control is posted size."
 )
 
 with st.sidebar:
@@ -762,6 +1071,7 @@ with st.sidebar:
 
     dt = st.number_input("dt", value=0.002, step=0.001, format="%.4f")
     n_iter = st.number_input("n_iter", value=140, step=10, min_value=1)
+
     spread = st.number_input("reference spread", value=20.0 / 10000.0, step=1.0 / 10000.0, format="%.6f")
     mid_price = st.number_input("display mid price", value=1.000000, step=0.000100, format="%.6f")
 
@@ -789,11 +1099,18 @@ with st.sidebar:
 
 errors: list[str] = []
 tier_specs: list[TierSpec] = []
+
 for i in range(num_tiers):
     try:
         tier_specs.append(build_tier_spec_from_ui(i))
     except ValueError as exc:
         errors.append(str(exc))
+
+try:
+    dark_pool_spec = build_dark_pool_spec_from_ui()
+except ValueError as exc:
+    errors.append(str(exc))
+    dark_pool_spec = None
 
 if spread <= 0.0:
     errors.append("spread must be positive.")
@@ -823,6 +1140,7 @@ if errors:
     st.stop()
 
 mdp_cpp_tiers, ecn_cpp_tiers = build_cpp_tiers(tier_specs)
+dark_pool_cpp = None if dark_pool_spec is None else dark_pool_spec.build_cpp_venue()
 
 penalty = lp.PolynomialInventoryPenalty(
     risk_aversion=float(risk_aversion),
@@ -853,11 +1171,12 @@ with st.spinner("Solving HJB in C++ and building policies..."):
         penalty=penalty,
         mdp_tiers=mdp_cpp_tiers,
         ecn_tiers=ecn_cpp_tiers,
+        dark_pool=dark_pool_cpp,
     )
     solution: lp.HJBSolution = solver.solve()
 
-solution_tiers = ordered_solution_tiers(tier_specs, solution)
 diag = solution.diagnostics
+solution_tiers = ordered_solution_tiers(tier_specs, solution)
 
 st.success("Solver run complete.")
 
@@ -877,7 +1196,7 @@ else:
 with st.expander("Solver diagnostics", expanded=False):
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("q points", len(config.q_grid))
-    c2.metric("tiers", total_tier_count(solution))
+    c2.metric("venues", total_venue_count(solution))
     c3.metric("iterations used", diag.iterations_used)
     c4.metric("converged", "yes" if diag.converged else "no")
     c5.metric("spot drift", f"{config.spot_drift:.5f}")
@@ -885,24 +1204,38 @@ with st.expander("Solver diagnostics", expanded=False):
 
     st.plotly_chart(make_h_figure(solution), use_container_width=True)
     st.plotly_chart(
-        make_convergence_figure(list(diag.history_max_h_change), "Convergence: max |Δh|", "max |Δh|"),
+        make_convergence_figure(
+            list(solution.diagnostics.history_max_h_change),
+            "Convergence: max |Δh|",
+            "max |Δh|",
+        ),
         use_container_width=True,
     )
     st.plotly_chart(
-        make_convergence_figure(list(diag.history_max_rhs), "Convergence: max |rhs|", "max |rhs|"),
+        make_convergence_figure(
+            list(solution.diagnostics.history_max_rhs),
+            "Convergence: max |rhs|",
+            "max |rhs|",
+        ),
         use_container_width=True,
     )
 
-tabs = st.tabs([f"{spec.name} [{tier_kind_label(spec)}]" for spec in tier_specs])
+tab_names = [f"{spec.name} [{tier_kind_label(spec)}]" for spec in tier_specs]
+if solution.dark_pool is not None:
+    tab_names.append("Dark Pool")
+
+tabs = st.tabs(tab_names)
 available_q = [float(q) for q in solution.q_grid]
 default_q = 0.0 if 0.0 in available_q else available_q[len(available_q) // 2]
 
-for idx, (tab, spec, cpp_tier) in enumerate(zip(tabs, tier_specs, solution_tiers)):
-    with tab:
+for idx, (spec, cpp_tier) in enumerate(zip(tier_specs, solution_tiers)):
+    with tabs[idx]:
         st.subheader(f"Tier: {spec.name}")
         st.caption(f"Type: {tier_kind_label(spec)}")
 
-        if isinstance(spec, ECNTierSpec) and is_ecn_tier(cpp_tier):
+        is_ecn = isinstance(spec, ECNTierSpec) and is_ecn_tier(cpp_tier)
+
+        if is_ecn:
             c1, c2, c3 = st.columns(3)
             c1.metric("quoted size", "1.0")
             c2.metric("ECN toxicity", f"{float(cpp_tier.adverse_selection_model.ecn_toxicity):.5f}")
@@ -913,20 +1246,13 @@ for idx, (tab, spec, cpp_tier) in enumerate(zip(tabs, tier_specs, solution_tiers
             c5.metric("delta_min", f"{float(cpp_tier.delta_min):.4f}")
             c6.metric("mid cap", f"{float(cpp_tier.delta_mid_cap()):.4f}")
 
-            st.info(
-                "ECN quotes only the inventory-reducing side. The quote itself follows a smooth built-in inventory profile, reaching the passive mid cap exactly when |q| reaches the convergence inventory."
-            )
-
         with st.expander("Tier parameters", expanded=False):
             st.dataframe(make_flow_parameter_table(spec, cpp_tier), use_container_width=True)
 
         st.plotly_chart(make_flow_curve_figure(cpp_tier, spec), use_container_width=True)
 
-        if isinstance(spec, ECNTierSpec) and is_ecn_tier(cpp_tier):
+        if is_ecn:
             st.plotly_chart(make_ecn_cap_figure(cpp_tier, float(config.spread)), use_container_width=True)
-
-        if isinstance(spec, ECNTierSpec) and is_ecn_tier(cpp_tier):
-            pass
         else:
             st.plotly_chart(
                 make_quote_inventory_figure(cpp_tier, spec, float(config.spread), float(mid_price)),
@@ -957,20 +1283,54 @@ for idx, (tab, spec, cpp_tier) in enumerate(zip(tabs, tier_specs, solution_tiers
                 use_container_width=True,
             )
 
+if solution.dark_pool is not None:
+    dark_pool_tab = tabs[-1]
+    venue = solution.dark_pool
+    with dark_pool_tab:
+        st.subheader("Dark pool venue")
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("λ bid", f"{float(venue.lambda_bid):.4f}")
+        c2.metric("λ ask", f"{float(venue.lambda_ask):.4f}")
+        c3.metric("mean arrival size bid", f"{1.0 / float(venue.p_bid):.3f}")
+        c4.metric("mean arrival size ask", f"{1.0 / float(venue.p_ask):.3f}")
+
+        c5, c6, c7 = st.columns(3)
+        c5.metric("fee / rebate bid", f"{float(venue.fee_per_unit_bid):.5f}")
+        c6.metric("fee / rebate ask", f"{float(venue.fee_per_unit_ask):.5f}")
+        c7.metric("both sides allowed", "yes" if bool(venue.allow_both_sides) else "no")
+
+        with st.expander("Dark-pool parameters", expanded=False):
+            st.dataframe(make_dark_pool_parameter_table(venue), use_container_width=True)
+
+        st.plotly_chart(make_dark_pool_size_figure(venue), use_container_width=True)
+        st.plotly_chart(make_dark_pool_contribution_figure(solver, venue, solution), use_container_width=True)
+
 with st.expander("What this app is solving"):
     st.markdown(
         r"""
 MDP tiers use rung-by-rung two-sided ladder optimization.
 
-ECN tiers are different:
-
-- the quoted size is fixed to \(z = 1\)
+ECN tiers are one-size hedge channels:
+- quoted size is fixed to $z = 1$
 - only the inventory-reducing side is admissible
-- the quote itself follows a smooth built-in profile in \(|q|\)
-- the profile starts at `delta_min` and reaches the passive mid cap exactly at `ecn_convergence_inventory`
-- toxicity and fee still affect the ECN Bellman contribution once the quote is used
+- the quote follows a direct smooth inventory profile
+- it starts at `delta_min` and reaches the passive mid cap exactly at `ecn_convergence_inventory`
+- it never crosses mid
 
-So ECN is treated as a simple parametric hedge curve rather than a fully optimized ladder.
+Dark-pool venue:
+- execution price is the mid
+- there is no quote-price optimization
+- arrival intensity is constant
+- incoming order size is geometric
+- if posted size is $u$ and incoming size is $Z$, then executed size is $\min(u, Z)$
+- the optimizer chooses posted bid size, ask size, or both depending on the venue mode
+
+The inventory grid must be:
+- strictly increasing
+- symmetric around 0
+- odd-length
+- with $0$ exactly at the middle index
         """
     )
 

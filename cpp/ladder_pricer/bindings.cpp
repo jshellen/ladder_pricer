@@ -96,7 +96,7 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::init<double, double, double>(),
             py::arg("ecn_toxicity"),
             py::arg("ecn_fee"),
-            py::arg("ecn_convergence_inventory")
+            py::arg("ecn_convergence_inventory") = 4.0
         )
         .def_readwrite("ecn_toxicity", &ECNAdverseSelectionModel::ecn_toxicity)
         .def_readwrite("ecn_fee", &ECNAdverseSelectionModel::ecn_fee)
@@ -141,6 +141,12 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("delta", &ECNQuoteDecision::delta)
         .def_readwrite("contribution", &ECNQuoteDecision::contribution)
         .def_readwrite("active", &ECNQuoteDecision::active);
+
+    py::class_<DarkPoolSizeDecision>(m, "DarkPoolSizeDecision")
+        .def(py::init<>())
+        .def_readwrite("posted_size", &DarkPoolSizeDecision::posted_size)
+        .def_readwrite("contribution", &DarkPoolSizeDecision::contribution)
+        .def_readwrite("active", &DarkPoolSizeDecision::active);
 
     py::class_<QuoteSummary>(m, "QuoteSummary")
         .def(py::init<>())
@@ -265,6 +271,44 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("side"),
             py::arg("mid"),
             py::arg("spread")
+        );
+
+
+    py::class_<DarkPoolPolicy>(m, "DarkPoolPolicy")
+        .def(py::init<>())
+        .def(py::init<std::vector<double>>(), py::arg("q_grid"))
+        .def_readwrite("q_grid", &DarkPoolPolicy::q_grid)
+        .def_readwrite("bid_size", &DarkPoolPolicy::bid_size)
+        .def_readwrite("ask_size", &DarkPoolPolicy::ask_size)
+        .def_readwrite("bid_active", &DarkPoolPolicy::bid_active)
+        .def_readwrite("ask_active", &DarkPoolPolicy::ask_active)
+        .def("reset_shape", &DarkPoolPolicy::reset_shape, py::arg("q_grid"))
+        .def("validate", &DarkPoolPolicy::validate)
+        .def(
+            "posted_size",
+            [](const DarkPoolPolicy& self, double q, const py::object& side) {
+                return self.posted_size(q, parse_side_object(side));
+            },
+            py::arg("q"),
+            py::arg("side")
+        )
+        .def(
+            "is_active",
+            [](const DarkPoolPolicy& self, std::size_t q_index, const py::object& side) {
+                return self.is_active(q_index, parse_side_object(side));
+            },
+            py::arg("q_index"),
+            py::arg("side")
+        )
+        .def(
+            "set_posted_size",
+            [](DarkPoolPolicy& self, std::size_t q_index, const py::object& side, double size, bool active) {
+                self.set_posted_size(q_index, parse_side_object(side), size, active);
+            },
+            py::arg("q_index"),
+            py::arg("side"),
+            py::arg("size"),
+            py::arg("active")
         );
 
     py::class_<SolverConfig>(m, "SolverConfig")
@@ -419,10 +463,11 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("delta_min", &ECNTier::delta_min)
         .def_readwrite("delta_max", &ECNTier::delta_max)
         .def_readwrite("adverse_selection_model", &ECNTier::adverse_selection_model)
-        .def("delta_mid_cap", &ECNTier::delta_mid_cap)
-        .def("delta_cap", &ECNTier::delta_cap, py::arg("q_abs"))
         .def_readwrite("bid_active", &ECNTier::bid_active)
         .def_readwrite("ask_active", &ECNTier::ask_active)
+        .def("delta_mid_cap", &ECNTier::delta_mid_cap)
+        .def("delta_profile", &ECNTier::delta_profile, py::arg("q_abs"))
+        .def("delta_cap", &ECNTier::delta_cap, py::arg("q_abs"))
         .def("reset_activity_shape", &ECNTier::reset_activity_shape, py::arg("nq"))
         .def_static(
             "is_active_side",
@@ -449,6 +494,51 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("q_index"),
             py::arg("side"),
             py::arg("active")
+        );
+
+
+    py::class_<DarkPoolVenue>(m, "DarkPoolVenue")
+        .def(py::init<>())
+        .def(
+            py::init<
+                double,
+                double,
+                double,
+                double,
+                double,
+                double,
+                std::vector<double>,
+                bool
+            >(),
+            py::arg("lambda_bid"),
+            py::arg("lambda_ask"),
+            py::arg("p_bid"),
+            py::arg("p_ask"),
+            py::arg("fee_per_unit_bid"),
+            py::arg("fee_per_unit_ask"),
+            py::arg("posted_sizes"),
+            py::arg("allow_both_sides") = false
+        )
+        .def_readwrite("lambda_bid", &DarkPoolVenue::lambda_bid)
+        .def_readwrite("lambda_ask", &DarkPoolVenue::lambda_ask)
+        .def_readwrite("p_bid", &DarkPoolVenue::p_bid)
+        .def_readwrite("p_ask", &DarkPoolVenue::p_ask)
+        .def_readwrite("fee_per_unit_bid", &DarkPoolVenue::fee_per_unit_bid)
+        .def_readwrite("fee_per_unit_ask", &DarkPoolVenue::fee_per_unit_ask)
+        .def_readwrite("posted_sizes", &DarkPoolVenue::posted_sizes)
+        .def_readwrite("allow_both_sides", &DarkPoolVenue::allow_both_sides)
+        .def_readwrite("policy", &DarkPoolVenue::policy)
+        .def("validate", &DarkPoolVenue::validate)
+        .def("reset_policy_shape", &DarkPoolVenue::reset_policy_shape, py::arg("q_grid"))
+        .def_static("is_integer_like", &DarkPoolVenue::is_integer_like, py::arg("x"), py::arg("tol") = 1e-10)
+        .def(
+            "is_admissible",
+            [](const DarkPoolVenue& self, double q, const py::object& side, double tol) {
+                return self.is_admissible(q, parse_side_object(side), tol);
+            },
+            py::arg("q"),
+            py::arg("side"),
+            py::arg("tol") = 1e-12
         );
 
     py::class_<SolverDiagnostics>(m, "SolverDiagnostics")
@@ -483,6 +573,7 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("q_grid", &HJBSolution::q_grid)
         .def_readwrite("mdp_tiers", &HJBSolution::mdp_tiers)
         .def_readwrite("ecn_tiers", &HJBSolution::ecn_tiers)
+        .def_readwrite("dark_pool", &HJBSolution::dark_pool)
         .def_readwrite("diagnostics", &HJBSolution::diagnostics);
 
     py::class_<HJBLadderSolver>(m, "HJBLadderSolver")
@@ -491,17 +582,20 @@ PYBIND11_MODULE(ladder_pricer, m) {
                 SolverConfig,
                 PolynomialInventoryPenalty,
                 std::vector<MDPTier>,
-                std::vector<ECNTier>
+                std::vector<ECNTier>,
+                std::optional<DarkPoolVenue>
             >(),
             py::arg("config"),
             py::arg("penalty"),
             py::arg("mdp_tiers") = std::vector<MDPTier>{},
-            py::arg("ecn_tiers") = std::vector<ECNTier>{}
+            py::arg("ecn_tiers") = std::vector<ECNTier>{},
+            py::arg("dark_pool") = std::nullopt
         )
         .def_readwrite("config", &HJBLadderSolver::config)
         .def_readwrite("penalty", &HJBLadderSolver::penalty)
         .def_readwrite("mdp_tiers", &HJBLadderSolver::mdp_tiers)
         .def_readwrite("ecn_tiers", &HJBLadderSolver::ecn_tiers)
+        .def_readwrite("dark_pool", &HJBLadderSolver::dark_pool)
         .def_readwrite("optimizer", &HJBLadderSolver::optimizer)
         .def_readwrite("grid_meta_", &HJBLadderSolver::grid_meta_)
         .def_static(
@@ -663,6 +757,56 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("q_index"),
             py::arg("h_vec")
         )
+
+        .def(
+            "optimize_dark_pool_size_for_state",
+            [](const HJBLadderSolver& self,
+               const DarkPoolVenue& venue,
+               const std::vector<double>& h_vec,
+               double q,
+               const py::object& side) {
+                validate_h_vec_against_solver(self, h_vec, "optimize_dark_pool_size_for_state");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+                return self.optimize_dark_pool_size_for_state(
+                    venue,
+                    h,
+                    q,
+                    parse_side_object(side)
+                );
+            },
+            py::arg("venue"),
+            py::arg("h_vec"),
+            py::arg("q"),
+            py::arg("side")
+        )
+        .def("clear_dark_pool_policy", &HJBLadderSolver::clear_dark_pool_policy, py::arg("venue"))
+        .def(
+            "build_dark_pool_policy",
+            [](const HJBLadderSolver& self, DarkPoolVenue& venue, const std::vector<double>& h_vec) {
+                validate_h_vec_against_solver(self, h_vec, "build_dark_pool_policy");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+                self.build_dark_pool_policy(venue, h);
+            },
+            py::arg("venue"),
+            py::arg("h_vec")
+        )
+        .def(
+            "dark_pool_bellman_contribution",
+            [](const HJBLadderSolver& self,
+               const DarkPoolVenue& venue,
+               double q,
+               std::size_t q_index,
+               const std::vector<double>& h_vec) {
+                validate_h_vec_against_solver(self, h_vec, "dark_pool_bellman_contribution");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+                return self.dark_pool_bellman_contribution(venue, q, q_index, h);
+            },
+            py::arg("venue"),
+            py::arg("q"),
+            py::arg("q_index"),
+            py::arg("h_vec")
+        )
+
         .def(
             "update_policies",
             [](HJBLadderSolver& self, const std::vector<double>& h_vec) {

@@ -196,7 +196,7 @@ struct SqrtMarkoutModel {
 struct ECNAdverseSelectionModel {
     double ecn_toxicity{0.003};
     double ecn_fee{0.0};
-    double ecn_convergence_inventory{3.0};
+    double ecn_convergence_inventory{4.0};
 
     ECNAdverseSelectionModel() = default;
 
@@ -357,6 +357,61 @@ inline double ecn_ask_trade_contribution(
     const double cost = adverse_selection_model.expected_cost(base_markout_model, delta, z);
     const double dq = h(q - z) - h(q);
     return lam * (z * spread * (0.5 - delta) - cost + dq);
+}
+
+
+inline double dark_pool_ask_trade_contribution(
+    double lambda,
+    double p,
+    double fee_per_unit,
+    const LinearInterpolator1D& h,
+    double q,
+    double posted_size
+) {
+    if (lambda <= 0.0 || posted_size <= 0.0) {
+        return 0.0;
+    }
+
+    const int u = static_cast<int>(std::llround(posted_size));
+    const double r = 1.0 - p;
+
+    double expected = 0.0;
+    for (int k = 1; k < u; ++k) {
+        const double prob = p * std::pow(r, static_cast<double>(k - 1));
+        expected += prob * (h(q - static_cast<double>(k)) - h(q) - fee_per_unit * k);
+    }
+
+    const double tail_prob = std::pow(r, static_cast<double>(u - 1));
+    expected += tail_prob * (h(q - static_cast<double>(u)) - h(q) - fee_per_unit * u);
+
+    return lambda * expected;
+}
+
+inline double dark_pool_bid_trade_contribution(
+    double lambda,
+    double p,
+    double fee_per_unit,
+    const LinearInterpolator1D& h,
+    double q,
+    double posted_size
+) {
+    if (lambda <= 0.0 || posted_size <= 0.0) {
+        return 0.0;
+    }
+
+    const int u = static_cast<int>(std::llround(posted_size));
+    const double r = 1.0 - p;
+
+    double expected = 0.0;
+    for (int k = 1; k < u; ++k) {
+        const double prob = p * std::pow(r, static_cast<double>(k - 1));
+        expected += prob * (h(q + static_cast<double>(k)) - h(q) - fee_per_unit * k);
+    }
+
+    const double tail_prob = std::pow(r, static_cast<double>(u - 1));
+    expected += tail_prob * (h(q + static_cast<double>(u)) - h(q) - fee_per_unit * u);
+
+    return lambda * expected;
 }
 
 // ============================================================
@@ -568,6 +623,84 @@ struct QuotePolicy {
     }
 };
 
+
+struct DarkPoolPolicy {
+    std::vector<double> q_grid;
+    std::vector<double> bid_size;
+    std::vector<double> ask_size;
+    std::vector<unsigned char> bid_active;
+    std::vector<unsigned char> ask_active;
+
+    DarkPoolPolicy() = default;
+
+    explicit DarkPoolPolicy(std::vector<double> q_grid_)
+        : q_grid(std::move(q_grid_)) {
+        reset_shape(q_grid);
+    }
+
+    void reset_shape(const std::vector<double>& q_grid_) {
+        q_grid = q_grid_;
+        bid_size.assign(q_grid.size(), 0.0);
+        ask_size.assign(q_grid.size(), 0.0);
+        bid_active.assign(q_grid.size(), 0u);
+        ask_active.assign(q_grid.size(), 0u);
+    }
+
+    void validate() const {
+        validate_strictly_increasing(q_grid, "DarkPoolPolicy.q_grid");
+        if (bid_size.size() != q_grid.size() || ask_size.size() != q_grid.size()) {
+            throw std::invalid_argument("DarkPoolPolicy: size vector length mismatch.");
+        }
+        if (bid_active.size() != q_grid.size() || ask_active.size() != q_grid.size()) {
+            throw std::invalid_argument("DarkPoolPolicy: active flag length mismatch.");
+        }
+    }
+
+    const std::vector<double>& size_vector(Side side) const {
+        return side == Side::Bid ? bid_size : ask_size;
+    }
+
+    std::vector<double>& size_vector_mut(Side side) {
+        return side == Side::Bid ? bid_size : ask_size;
+    }
+
+    const std::vector<unsigned char>& active_vector(Side side) const {
+        return side == Side::Bid ? bid_active : ask_active;
+    }
+
+    std::vector<unsigned char>& active_vector_mut(Side side) {
+        return side == Side::Bid ? bid_active : ask_active;
+    }
+
+    double posted_size(double q, Side side) const {
+        const auto& vals = size_vector(side);
+        if (q_grid.empty()) {
+            throw std::runtime_error("DarkPoolPolicy::posted_size: q_grid is empty.");
+        }
+        if (q_grid.size() == 1) {
+            return vals.front();
+        }
+
+        const auto [i, tq] = locate_segment_with_weight(q_grid, q);
+        return tq <= 0.5 ? vals[i] : vals[i + 1];
+    }
+
+    bool is_active(std::size_t q_index, Side side) const {
+        const auto& flags = active_vector(side);
+        return q_index < flags.size() && flags[q_index] != 0u;
+    }
+
+    void set_posted_size(std::size_t q_index, Side side, double size, bool active) {
+        auto& vals = size_vector_mut(side);
+        auto& flags = active_vector_mut(side);
+        if (q_index >= vals.size() || q_index >= flags.size()) {
+            throw std::out_of_range("DarkPoolPolicy::set_posted_size: q_index out of range.");
+        }
+        vals[q_index] = size;
+        flags[q_index] = active ? 1u : 0u;
+    }
+};
+
 // ============================================================
 // Solver config and cached grid metadata
 // ============================================================
@@ -707,6 +840,12 @@ struct ECNQuoteDecision {
     bool active{false};
 };
 
+struct DarkPoolSizeDecision {
+    double posted_size{0.0};
+    double contribution{0.0};
+    bool active{false};
+};
+
 // ============================================================
 // Tier hierarchy
 // ============================================================
@@ -830,17 +969,25 @@ struct ECNTier final : public Tier {
         return fixed_size;
     }
 
+    static double smoothstep01(double x) {
+        const double u = clamp(x, 0.0, 1.0);
+        return u * u * (3.0 - 2.0 * u);
+    }
+
     double delta_mid_cap() const {
         return std::min(delta_max, 0.5);
     }
 
-    double delta_cap(double q_abs) const {
+    double delta_profile(double q_abs) const {
         const double q = std::max(q_abs, 0.0);
-        const double cap_hi = delta_mid_cap();
         const double q_star = adverse_selection_model.ecn_convergence_inventory;
-        const double u = clamp(q / q_star, 0.0, 1.0);
-        const double s = u * u * (3.0 - 2.0 * u);
-        return delta_min + (cap_hi - delta_min) * s;
+        const double u = q_star > 0.0 ? std::min(q / q_star, 1.0) : 1.0;
+        const double s = smoothstep01(u);
+        return delta_min + (delta_mid_cap() - delta_min) * s;
+    }
+
+    double delta_cap(double q_abs) const {
+        return delta_profile(q_abs);
     }
 
     void validate() const override {
@@ -880,6 +1027,74 @@ struct ECNTier final : public Tier {
             throw std::out_of_range("ECNTier::set_policy_active: q_index out of range.");
         }
         flags[q_index] = active ? 1u : 0u;
+    }
+};
+
+
+struct DarkPoolVenue {
+    double lambda_bid{0.0};
+    double lambda_ask{0.0};
+    double p_bid{0.5};
+    double p_ask{0.5};
+    double fee_per_unit_bid{0.0};
+    double fee_per_unit_ask{0.0};
+    std::vector<double> posted_sizes{1.0, 2.0, 3.0};
+    bool allow_both_sides{false};
+    DarkPoolPolicy policy;
+
+    DarkPoolVenue() = default;
+
+    DarkPoolVenue(
+        double lambda_bid_,
+        double lambda_ask_,
+        double p_bid_,
+        double p_ask_,
+        double fee_per_unit_bid_,
+        double fee_per_unit_ask_,
+        std::vector<double> posted_sizes_,
+        bool allow_both_sides_ = false
+    )
+        : lambda_bid(lambda_bid_),
+          lambda_ask(lambda_ask_),
+          p_bid(p_bid_),
+          p_ask(p_ask_),
+          fee_per_unit_bid(fee_per_unit_bid_),
+          fee_per_unit_ask(fee_per_unit_ask_),
+          posted_sizes(std::move(posted_sizes_)),
+          allow_both_sides(allow_both_sides_) {
+        validate();
+    }
+
+    static bool is_integer_like(double x, double tol = 1e-10) {
+        return std::abs(x - std::round(x)) <= tol;
+    }
+
+    void validate() const {
+        if (lambda_bid < 0.0 || lambda_ask < 0.0) {
+            throw std::invalid_argument("DarkPoolVenue: arrival intensities must be nonnegative.");
+        }
+        if (!(p_bid > 0.0 && p_bid <= 1.0) || !(p_ask > 0.0 && p_ask <= 1.0)) {
+            throw std::invalid_argument("DarkPoolVenue: geometric probabilities must lie in (0, 1].");
+        }
+        validate_positive_strictly_increasing(posted_sizes, "DarkPoolVenue.posted_sizes");
+        for (double u : posted_sizes) {
+            if (!is_integer_like(u)) {
+                throw std::invalid_argument(
+                    "DarkPoolVenue: posted_sizes must be integer-valued because arrival sizes are geometric in unit chunks."
+                );
+            }
+        }
+    }
+
+    void reset_policy_shape(const std::vector<double>& q_grid) {
+        policy.reset_shape(q_grid);
+    }
+
+    bool is_admissible(double q, Side side, double tol = 1e-12) const {
+        if (allow_both_sides) {
+            return true;
+        }
+        return (q > tol && side == Side::Ask) || (q < -tol && side == Side::Bid);
     }
 };
 
@@ -941,6 +1156,7 @@ struct HJBSolution {
     std::vector<double> q_grid;
     std::vector<MDPTier> mdp_tiers;
     std::vector<ECNTier> ecn_tiers;
+    std::optional<DarkPoolVenue> dark_pool;
     SolverDiagnostics diagnostics;
 };
 
@@ -954,6 +1170,7 @@ struct HJBLadderSolver {
 
     std::vector<MDPTier> mdp_tiers;
     std::vector<ECNTier> ecn_tiers;
+    std::optional<DarkPoolVenue> dark_pool;
 
     GoldenSectionSearch optimizer;
     SolverGridMeta grid_meta_;
@@ -962,12 +1179,14 @@ struct HJBLadderSolver {
         SolverConfig config_,
         PolynomialInventoryPenalty penalty_,
         std::vector<MDPTier> mdp_tiers_ = {},
-        std::vector<ECNTier> ecn_tiers_ = {}
+        std::vector<ECNTier> ecn_tiers_ = {},
+        std::optional<DarkPoolVenue> dark_pool_ = std::nullopt
     )
         : config(std::move(config_)),
           penalty(std::move(penalty_)),
           mdp_tiers(std::move(mdp_tiers_)),
           ecn_tiers(std::move(ecn_tiers_)),
+          dark_pool(std::move(dark_pool_)),
           optimizer(config.golden_tol, config.golden_max_iter) {
         config.validate();
     }
@@ -1015,6 +1234,9 @@ struct HJBLadderSolver {
         for (const auto& tier : ecn_tiers) {
             tier.validate();
         }
+        if (dark_pool.has_value()) {
+            dark_pool->validate();
+        }
     }
 
     void initialize_policy_shapes() {
@@ -1024,6 +1246,9 @@ struct HJBLadderSolver {
         for (auto& tier : ecn_tiers) {
             tier.reset_policy_shape(config.q_grid);
             tier.reset_activity_shape(config.q_grid.size());
+        }
+        if (dark_pool.has_value()) {
+            dark_pool->reset_policy_shape(config.q_grid);
         }
     }
 
@@ -1276,7 +1501,7 @@ struct HJBLadderSolver {
             return out;
         }
 
-        const double d = tier.delta_cap(std::abs(q));
+        const double d = clamp(tier.delta_profile(std::abs(q)), tier.delta_min, tier.delta_mid_cap());
         const double v = side == Side::Ask
             ? ecn_ask_trade_contribution(
                 tier.flow_curve,
@@ -1314,18 +1539,98 @@ struct HJBLadderSolver {
         }
     }
 
-    void build_ecn_policy(ECNTier& tier, const LinearInterpolator1D& h) const {
+    void build_ecn_policy(ECNTier& tier, const LinearInterpolator1D&) const {
         clear_ecn_policy(tier);
-        (void) h;
 
         for (std::size_t i = 0; i < grid_meta_.nq; ++i) {
             const double q = config.q_grid[i];
-            if (q < 0.0) {
-                tier.policy.delta_ref(i, 0, Side::Bid) = tier.delta_cap(std::abs(q));
-                tier.set_policy_active(i, Side::Bid, true);
-            } else if (q > 0.0) {
-                tier.policy.delta_ref(i, 0, Side::Ask) = tier.delta_cap(std::abs(q));
+            if (q > 0.0) {
+                tier.policy.delta_ref(i, 0, Side::Ask) = tier.delta_profile(std::abs(q));
                 tier.set_policy_active(i, Side::Ask, true);
+            } else if (q < 0.0) {
+                tier.policy.delta_ref(i, 0, Side::Bid) = tier.delta_profile(std::abs(q));
+                tier.set_policy_active(i, Side::Bid, true);
+            }
+        }
+    }
+
+
+    // --------------------------------------------------------
+    // Dark-pool policy construction
+    // --------------------------------------------------------
+
+    DarkPoolSizeDecision optimize_dark_pool_size_for_state(
+        const DarkPoolVenue& venue,
+        const LinearInterpolator1D& h,
+        double q,
+        Side side
+    ) const {
+        DarkPoolSizeDecision out;
+
+        if (!venue.is_admissible(q, side)) {
+            return out;
+        }
+
+        for (double u : venue.posted_sizes) {
+            const double value = side == Side::Ask
+                ? dark_pool_ask_trade_contribution(
+                    venue.lambda_ask,
+                    venue.p_ask,
+                    venue.fee_per_unit_ask,
+                    h,
+                    q,
+                    u
+                )
+                : dark_pool_bid_trade_contribution(
+                    venue.lambda_bid,
+                    venue.p_bid,
+                    venue.fee_per_unit_bid,
+                    h,
+                    q,
+                    u
+                );
+
+            if (value > out.contribution) {
+                out.posted_size = u;
+                out.contribution = value;
+                out.active = value > 0.0;
+            }
+        }
+
+        if (!out.active) {
+            out.posted_size = 0.0;
+            out.contribution = 0.0;
+        }
+        return out;
+    }
+
+    void clear_dark_pool_policy(DarkPoolVenue& venue) const {
+        for (std::size_t i = 0; i < grid_meta_.nq; ++i) {
+            venue.policy.set_posted_size(i, Side::Bid, 0.0, false);
+            venue.policy.set_posted_size(i, Side::Ask, 0.0, false);
+        }
+    }
+
+    void build_dark_pool_policy(DarkPoolVenue& venue, const LinearInterpolator1D& h) const {
+        clear_dark_pool_policy(venue);
+
+        for (std::size_t i = 0; i < grid_meta_.nq; ++i) {
+            const double q = config.q_grid[i];
+
+            if (venue.allow_both_sides || q < 0.0) {
+                const DarkPoolSizeDecision bid_decision =
+                    optimize_dark_pool_size_for_state(venue, h, q, Side::Bid);
+                venue.policy.set_posted_size(
+                    i, Side::Bid, bid_decision.posted_size, bid_decision.active
+                );
+            }
+
+            if (venue.allow_both_sides || q > 0.0) {
+                const DarkPoolSizeDecision ask_decision =
+                    optimize_dark_pool_size_for_state(venue, h, q, Side::Ask);
+                venue.policy.set_posted_size(
+                    i, Side::Ask, ask_decision.posted_size, ask_decision.active
+                );
             }
         }
     }
@@ -1421,6 +1726,40 @@ struct HJBLadderSolver {
         return 0.0;
     }
 
+
+    double dark_pool_bellman_contribution(
+        const DarkPoolVenue& venue,
+        double q,
+        std::size_t q_index,
+        const LinearInterpolator1D& h
+    ) const {
+        double total = 0.0;
+
+        if (venue.policy.is_active(q_index, Side::Bid)) {
+            total += dark_pool_bid_trade_contribution(
+                venue.lambda_bid,
+                venue.p_bid,
+                venue.fee_per_unit_bid,
+                h,
+                q,
+                venue.policy.bid_size[q_index]
+            );
+        }
+
+        if (venue.policy.is_active(q_index, Side::Ask)) {
+            total += dark_pool_ask_trade_contribution(
+                venue.lambda_ask,
+                venue.p_ask,
+                venue.fee_per_unit_ask,
+                h,
+                q,
+                venue.policy.ask_size[q_index]
+            );
+        }
+
+        return total;
+    }
+
     // --------------------------------------------------------
     // Public-ish internal solver steps
     // --------------------------------------------------------
@@ -1433,6 +1772,9 @@ struct HJBLadderSolver {
 
         for (auto& tier : ecn_tiers) {
             build_ecn_policy(tier, h);
+        }
+        if (dark_pool.has_value()) {
+            build_dark_pool_policy(*dark_pool, h);
         }
     }
 
@@ -1449,6 +1791,9 @@ struct HJBLadderSolver {
             }
             for (const auto& tier : ecn_tiers) {
                 val += ecn_bellman_contribution(tier, q, i, h);
+            }
+            if (dark_pool.has_value()) {
+                val += dark_pool_bellman_contribution(*dark_pool, q, i, h);
             }
 
             rhs[i] = val;
@@ -1525,6 +1870,7 @@ struct HJBLadderSolver {
         out.q_grid = config.q_grid;
         out.mdp_tiers = mdp_tiers;
         out.ecn_tiers = ecn_tiers;
+        out.dark_pool = dark_pool;
         out.diagnostics = std::move(diagnostics);
         return out;
     }
