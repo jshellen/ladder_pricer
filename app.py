@@ -101,7 +101,7 @@ DEFAULT_MDP_SIZES = "1, 2, 3, 5, 10, 20"
 DEFAULT_ECN_SETTINGS = {
     "ecn_toxicity": 0.0040,
     "ecn_fee": 0.0,
-    "ecn_convergence_inventory": 4.0,
+    "ecn_convergence_inventory": 10.0,
 }
 DEFAULT_DARK_POOL_SETTINGS = {
     "enabled": True,
@@ -280,14 +280,14 @@ def default_tier_values(i: int) -> dict:
             "delta_max": 100.0,
         },
         {
-            "enabled": True,
+            "enabled": False,
             "kind": "ecn",
             "name": "ecn",
             "flow_A0": 0.70,
             "flow_theta": 0.10,
-            "flow_steepness": 8.0,
-            "flow_shift": 0.18,
-            "flow_volume_shift": 0.020,
+            "flow_steepness": 12.0,
+            "flow_shift": 0.4,
+            "flow_volume_shift": 0.0,
             "markout_base": 0.000,
             "markout_coeff": 0.000,
             "delta_min": -2.0,
@@ -295,7 +295,7 @@ def default_tier_values(i: int) -> dict:
             **DEFAULT_ECN_SETTINGS,
         },
         {
-            "enabled": True,
+            "enabled": False,
             "kind": "mdp",
             "name": "sticky_clients",
             "sizes": "1, 2, 3, 5, 10, 15, 20",
@@ -800,6 +800,7 @@ def make_quote_inventory_figure(
         xaxis_title="Inventory q",
         yaxis_title="Quote relative to mid (pips)",
         height=500,
+        yaxis=dict(range=[-20, 20]),
     )
     return fig
 
