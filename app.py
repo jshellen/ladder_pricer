@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import chain
 
 import numpy as np
 import pandas as pd
@@ -74,37 +73,30 @@ def build_piecewise_centered_q_grid(
 
 def validate_centered_q_grid(q_grid: np.ndarray) -> list[str]:
     errors: list[str] = []
-
     if len(q_grid) < 3:
         errors.append("q_grid must contain at least 3 points.")
         return errors
-
     if len(q_grid) % 2 == 0:
         errors.append("q_grid must have odd length.")
-
     mid_idx = len(q_grid) // 2
     if not np.isclose(q_grid[mid_idx], 0.0, atol=1e-10):
         errors.append("q_grid must contain 0 exactly at the middle index.")
-
     for i in range(mid_idx):
         if not np.isclose(q_grid[i] + q_grid[-1 - i], 0.0, atol=1e-10):
             errors.append("q_grid must be symmetric around 0.")
             break
-
     return errors
 
 
 # ============================================================
-# Tier specification
+# Tier specs
 # ============================================================
 
 DEFAULT_MDP_SIZES = "1, 2, 3, 5, 10, 20"
-DEFAULT_ECN_POLICY = {
-    "ecn_delta_start": 0.10,
-    "ecn_delta_target": 0.50,
-    "ecn_decay": 2.0,
-    "ecn_decay_min": 0.25,
-    "ecn_decay_max": 10.0,
+DEFAULT_ECN_SETTINGS = {
+    "ecn_toxicity": 0.0040,
+    "ecn_fee": 0.0000,
+    "ecn_convergence_inventory": 4.0,
 }
 
 
@@ -154,20 +146,16 @@ class MDPTierSpec(CommonTierSpec):
 
 @dataclass
 class ECNTierSpec(CommonTierSpec):
-    ecn_delta_start: float
-    ecn_delta_target: float
-    ecn_decay: float
-    ecn_decay_min: float
-    ecn_decay_max: float
+    ecn_toxicity: float
+    ecn_fee: float
+    ecn_convergence_inventory: float
 
     def build_cpp_tier(self) -> lp.ECNTier:
         flow, markout = self.build_models()
-        ecn_policy = lp.ExponentialECNPolicy(
-            delta_start=float(self.ecn_delta_start),
-            delta_target=float(self.ecn_delta_target),
-            decay=float(self.ecn_decay),
-            decay_min=float(self.ecn_decay_min),
-            decay_max=float(self.ecn_decay_max),
+        adverse_selection = lp.ECNAdverseSelectionModel(
+            ecn_toxicity=float(self.ecn_toxicity),
+            ecn_fee=float(self.ecn_fee),
+            ecn_convergence_inventory=float(self.ecn_convergence_inventory),
         )
         return lp.ECNTier(
             name=self.name,
@@ -175,7 +163,7 @@ class ECNTierSpec(CommonTierSpec):
             markout_model=markout,
             delta_min=float(self.delta_min),
             delta_max=float(self.delta_max),
-            ecn_policy=ecn_policy,
+            adverse_selection_model=adverse_selection,
         )
 
 
@@ -196,7 +184,6 @@ def parse_float_list(raw: str, field_name: str) -> list[float]:
         vals = [float(x.strip()) for x in raw.split(",") if x.strip()]
     except ValueError as exc:
         raise ValueError(f"Could not parse {field_name}. Use comma-separated numbers.") from exc
-
     if not vals:
         raise ValueError(f"{field_name} cannot be empty.")
     return vals
@@ -244,7 +231,7 @@ def default_tier_values(i: int) -> dict:
             "markout_coeff": 0.000,
             "delta_min": -2.0,
             "delta_max": 2.0,
-            **DEFAULT_ECN_POLICY,
+            **DEFAULT_ECN_SETTINGS,
         },
         {
             "kind": "mdp",
@@ -363,57 +350,37 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
             key=f"tier_delta_max_{i}",
         )
 
-        ecn_delta_start = ecn_delta_target = ecn_decay = ecn_decay_min = ecn_decay_max = None
+        ecn_toxicity = ecn_fee = ecn_convergence_inventory = None
         if kind == "ecn":
             ecn_defaults = {
-                key: float(defaults.get(key, DEFAULT_ECN_POLICY[key]))
-                for key in DEFAULT_ECN_POLICY
+                key: float(defaults.get(key, DEFAULT_ECN_SETTINGS[key]))
+                for key in DEFAULT_ECN_SETTINGS
             }
-
-            st.markdown("**ECN exponential policy**")
+            st.markdown("**ECN settings**")
             c9, c10 = st.columns(2)
-            ecn_delta_start = c9.number_input(
-                f"ECN delta_start {i + 1}",
-                value=ecn_defaults["ecn_delta_start"],
-                step=0.01,
-                format="%.4f",
-                key=f"ecn_delta_start_{i}",
+            ecn_toxicity = c9.number_input(
+                f"ECN toxicity {i + 1}",
+                value=ecn_defaults["ecn_toxicity"],
+                step=0.0005,
+                format="%.5f",
+                key=f"ecn_toxicity_{i}",
             )
-            ecn_delta_target = c10.number_input(
-                f"ECN delta_target {i + 1}",
-                value=ecn_defaults["ecn_delta_target"],
-                step=0.01,
-                format="%.4f",
-                key=f"ecn_delta_target_{i}",
+            ecn_fee = c10.number_input(
+                f"ECN fee {i + 1}",
+                value=ecn_defaults["ecn_fee"],
+                step=0.0005,
+                format="%.5f",
+                key=f"ecn_fee_{i}",
             )
-
-            c11, c12, c13 = st.columns(3)
-            ecn_decay = c11.number_input(
-                f"ECN decay init {i + 1}",
-                value=ecn_defaults["ecn_decay"],
-                step=0.05,
+            ecn_convergence_inventory = st.number_input(
+                f"ECN convergence inventory {i + 1}",
+                value=ecn_defaults["ecn_convergence_inventory"],
+                step=0.25,
                 format="%.4f",
-                key=f"ecn_decay_{i}",
+                key=f"ecn_convergence_inventory_{i}",
             )
-            ecn_decay_min = c12.number_input(
-                f"ECN decay min {i + 1}",
-                value=ecn_defaults["ecn_decay_min"],
-                step=0.05,
-                format="%.4f",
-                key=f"ecn_decay_min_{i}",
-            )
-            ecn_decay_max = c13.number_input(
-                f"ECN decay max {i + 1}",
-                value=ecn_defaults["ecn_decay_max"],
-                step=0.05,
-                format="%.4f",
-                key=f"ecn_decay_max_{i}",
-            )
-
             st.caption(
-                "The ECN tier quotes only the inventory-reducing side. "
-                "Its active-side quote follows a smooth exponential approach toward delta_target, "
-                "and the decay parameter is optimized in C++."
+                "ECN stays one-sided and passive. The quote follows a smooth built-in inventory profile: it starts at delta_min and reaches the mid cap exactly when |q| reaches the convergence inventory."
             )
 
     if flow_A0 < 0.0:
@@ -444,33 +411,28 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
             raise ValueError(f"Tier {i + 1}: sizes must be strictly increasing.")
         return MDPTierSpec(sizes=sizes, **common)
 
-    assert None not in (ecn_delta_start, ecn_delta_target, ecn_decay, ecn_decay_min, ecn_decay_max)
-
-    if ecn_decay_min <= 0.0:
-        raise ValueError(f"Tier {i + 1}: ECN decay_min must be positive.")
-    if ecn_decay_max <= ecn_decay_min:
-        raise ValueError(f"Tier {i + 1}: ECN decay_max must be greater than decay_min.")
-    if ecn_decay <= 0.0:
-        raise ValueError(f"Tier {i + 1}: ECN decay init must be positive.")
-    if ecn_delta_target < ecn_delta_start:
-        raise ValueError(f"Tier {i + 1}: ECN delta_target must be >= delta_start.")
-    if not (tier_delta_min <= ecn_delta_start <= tier_delta_max):
-        raise ValueError(f"Tier {i + 1}: ECN delta_start must lie inside [delta_min, delta_max].")
-    if not (tier_delta_min <= ecn_delta_target <= tier_delta_max):
-        raise ValueError(f"Tier {i + 1}: ECN delta_target must lie inside [delta_min, delta_max].")
+    assert ecn_toxicity is not None and ecn_fee is not None and ecn_convergence_inventory is not None
+    if ecn_toxicity < 0.0:
+        raise ValueError(f"Tier {i + 1}: ECN toxicity must be nonnegative.")
+    if ecn_fee < 0.0:
+        raise ValueError(f"Tier {i + 1}: ECN fee must be nonnegative.")
+    if ecn_convergence_inventory <= 0.0:
+        raise ValueError(f"Tier {i + 1}: ECN convergence inventory must be positive.")
+    if tier_delta_min >= min(tier_delta_max, 0.5):
+        raise ValueError(
+            f"Tier {i + 1}: ECN delta_min must be below min(delta_max, 0.5)."
+        )
 
     return ECNTierSpec(
-        ecn_delta_start=float(ecn_delta_start),
-        ecn_delta_target=float(ecn_delta_target),
-        ecn_decay=float(ecn_decay),
-        ecn_decay_min=float(ecn_decay_min),
-        ecn_decay_max=float(ecn_decay_max),
+        ecn_toxicity=float(ecn_toxicity),
+        ecn_fee=float(ecn_fee),
+        ecn_convergence_inventory=float(ecn_convergence_inventory),
         **common,
     )
 
 
 # ============================================================
-# Solver / tier conversion helpers
+# Solver helpers
 # ============================================================
 
 def build_solver_config(
@@ -506,21 +468,18 @@ def build_solver_config(
 def build_cpp_tiers(specs: list[TierSpec]) -> tuple[list[lp.MDPTier], list[lp.ECNTier]]:
     mdp_tiers: list[lp.MDPTier] = []
     ecn_tiers: list[lp.ECNTier] = []
-
     for spec in specs:
         cpp_tier = spec.build_cpp_tier()
         if isinstance(spec, MDPTierSpec):
             mdp_tiers.append(cpp_tier)
         else:
             ecn_tiers.append(cpp_tier)
-
     return mdp_tiers, ecn_tiers
 
 
 def ordered_solution_tiers(specs: list[TierSpec], solution: lp.HJBSolution) -> list[CppTier]:
     mdp_iter = iter(solution.mdp_tiers)
     ecn_iter = iter(solution.ecn_tiers)
-
     out: list[CppTier] = []
     for spec in specs:
         out.append(next(ecn_iter) if isinstance(spec, ECNTierSpec) else next(mdp_iter))
@@ -531,25 +490,38 @@ def total_tier_count(solution: lp.HJBSolution) -> int:
     return len(solution.mdp_tiers) + len(solution.ecn_tiers)
 
 
-def is_admissible(cpp_tier: CppTier, q: float, z: float, side: str) -> bool:
+def is_ecn_tier(cpp_tier: CppTier) -> bool:
+    return isinstance(cpp_tier, lp.ECNTier)
+
+
+def q_index_lookup(cpp_tier: CppTier) -> dict[float, int]:
+    return {float(q): i for i, q in enumerate(cpp_tier.policy.q_grid)}
+
+
+def is_structurally_admissible(cpp_tier: CppTier, q: float, z: float, side: str) -> bool:
     return bool(cpp_tier.is_admissible(float(q), float(z), side))
+
+
+def is_policy_active(cpp_tier: CppTier, q_index: int, side: str) -> bool:
+    if is_ecn_tier(cpp_tier):
+        return bool(cpp_tier.is_policy_active(int(q_index), side))
+    return True
 
 
 def masked_quote_summary(
     cpp_tier: CppTier,
+    q_index: int,
     q: float,
     z: float,
     side: str,
     mid_price: float,
     spread: float,
 ):
-    if not is_admissible(cpp_tier, q, z, side):
+    if not is_structurally_admissible(cpp_tier, q, z, side):
+        return None
+    if not is_policy_active(cpp_tier, q_index, side):
         return None
     return cpp_tier.quote_summary(float(q), float(z), side, float(mid_price), float(spread))
-
-
-def is_ecn_tier(cpp_tier: CppTier) -> bool:
-    return isinstance(cpp_tier, lp.ECNTier)
 
 
 # ============================================================
@@ -570,54 +542,43 @@ def make_flow_parameter_table(spec: TierSpec, cpp_tier: CppTier) -> pd.DataFrame
         }
         if isinstance(spec, ECNTierSpec) and is_ecn_tier(cpp_tier):
             row |= {
-                "ecn_delta_start": float(cpp_tier.ecn_policy.delta_start),
-                "ecn_delta_target": float(cpp_tier.ecn_policy.delta_target),
-                "ecn_decay_opt": float(cpp_tier.ecn_policy.decay),
-                "ecn_decay_min": float(cpp_tier.ecn_policy.decay_min),
-                "ecn_decay_max": float(cpp_tier.ecn_policy.decay_max),
+                "ecn_toxicity": float(cpp_tier.adverse_selection_model.ecn_toxicity),
+                "ecn_fee": float(cpp_tier.adverse_selection_model.ecn_fee),
+                "ecn_convergence_inventory": float(cpp_tier.adverse_selection_model.ecn_convergence_inventory),
+                "ecn_mid_cap": float(cpp_tier.delta_mid_cap()),
             }
         rows.append(row)
     return pd.DataFrame(rows)
 
 
 def make_flow_curve_figure(cpp_tier: CppTier, spec: TierSpec) -> go.Figure:
-    grid = np.linspace(-1.0, 1.0, 100)
+    grid = np.linspace(-1.0, 1.0, 150)
     fig = go.Figure()
-
     for z in tier_sizes(spec):
         zf = float(z)
         vals = [cpp_tier.arrival_rate(float(d), zf) for d in grid]
         fig.add_trace(go.Scatter(x=grid, y=vals, mode="lines", name=f"{zf:g}"))
-
     fig.update_layout(
         title=f"Flow curves λ(δ, z) — {spec.name} ({tier_kind_label(spec)})",
         xaxis_title="delta",
         yaxis_title="arrival rate",
-        height=520,
+        height=480,
     )
     return fig
 
 
-def make_quote_inventory_figure(
-    cpp_tier: CppTier,
-    spec: TierSpec,
-    spread: float,
-    mid_price: float,
-) -> go.Figure:
+def make_quote_inventory_figure(cpp_tier: CppTier, spec: TierSpec, spread: float, mid_price: float) -> go.Figure:
     q_grid = [float(q) for q in cpp_tier.policy.q_grid]
     fig = go.Figure()
-
     for z in tier_sizes(spec):
         zf = float(z)
         bid_vals: list[float] = []
         ask_vals: list[float] = []
-
-        for q in q_grid:
-            bid = masked_quote_summary(cpp_tier, q, zf, "bid", mid_price, spread)
-            ask = masked_quote_summary(cpp_tier, q, zf, "ask", mid_price, spread)
+        for q_index, q in enumerate(q_grid):
+            bid = masked_quote_summary(cpp_tier, q_index, q, zf, "bid", mid_price, spread)
+            ask = masked_quote_summary(cpp_tier, q_index, q, zf, "ask", mid_price, spread)
             bid_vals.append(np.nan if bid is None else float(bid.quote_relative_to_mid_pips))
             ask_vals.append(np.nan if ask is None else float(ask.quote_relative_to_mid_pips))
-
         fig.add_trace(go.Scatter(x=q_grid, y=bid_vals, mode="lines", name=f"{zf:g} bid"))
         fig.add_trace(
             go.Scatter(
@@ -628,33 +589,25 @@ def make_quote_inventory_figure(
                 name=f"{zf:g} ask",
             )
         )
-
     fig.add_hline(y=0.0)
     fig.update_layout(
         title=f"Quotes vs inventory — {spec.name} ({tier_kind_label(spec)})",
         xaxis_title="Inventory q",
         yaxis_title="Quote relative to mid (pips)",
-        height=520,
+        height=500,
     )
     return fig
 
 
-def make_ladder_figure(
-    cpp_tier: CppTier,
-    spec: TierSpec,
-    q: float,
-    spread: float,
-    mid_price: float,
-) -> go.Figure:
+def make_ladder_figure(cpp_tier: CppTier, spec: TierSpec, q: float, spread: float, mid_price: float) -> go.Figure:
+    q_idx = q_index_lookup(cpp_tier)[float(q)]
     sizes = [float(z) for z in tier_sizes(spec)]
     bid_vp, ask_vp = [], []
-
     for z in sizes:
-        bid = masked_quote_summary(cpp_tier, q, z, "bid", mid_price, spread)
-        ask = masked_quote_summary(cpp_tier, q, z, "ask", mid_price, spread)
+        bid = masked_quote_summary(cpp_tier, q_idx, q, z, "bid", mid_price, spread)
+        ask = masked_quote_summary(cpp_tier, q_idx, q, z, "ask", mid_price, spread)
         bid_vp.append(np.nan if bid is None else float(bid.volume_premium_pips))
         ask_vp.append(np.nan if ask is None else float(ask.volume_premium_pips))
-
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=sizes, y=bid_vp, mode="lines+markers", name=f"Bid q={q:g}"))
     fig.add_trace(
@@ -671,73 +624,27 @@ def make_ladder_figure(
         title=f"Volume premium — {spec.name} ({tier_kind_label(spec)}) at q = {q:g}",
         xaxis_title="Trade size z",
         yaxis_title="Premium vs 1M quote (pips)",
-        height=520,
+        height=480,
     )
     return fig
 
 
-def make_ecn_decay_figure(cpp_tier: lp.ECNTier, spread: float) -> go.Figure:
-    q_grid = [float(q) for q in cpp_tier.policy.q_grid]
-    q_neg = [q for q in q_grid if q < 0.0]
-    q_pos = [q for q in q_grid if q > 0.0]
-
-    bid_vals = [10000.0 * spread * (float(cpp_tier.active_delta(q)) - 0.5) for q in q_neg]
-    ask_vals = [10000.0 * spread * (0.5 - float(cpp_tier.active_delta(q))) for q in q_pos]
-
-    fig = go.Figure()
-    if q_neg:
-        fig.add_trace(go.Scatter(x=q_neg, y=bid_vals, mode="lines", name="bid active side"))
-    if q_pos:
-        fig.add_trace(
-            go.Scatter(
-                x=q_pos,
-                y=ask_vals,
-                mode="lines",
-                line=dict(dash="dash"),
-                name="ask active side",
-            )
-        )
-
-    fig.add_hline(y=0.0)
-    fig.update_layout(
-        title="ECN active-side exponential quote vs inventory",
-        xaxis_title="Inventory q",
-        yaxis_title="Quote relative to mid (pips)",
-        height=420,
-    )
-    return fig
-
-
-def make_q_ladder_table(
-    cpp_tier: CppTier,
-    spec: TierSpec,
-    q: float,
-    spread: float,
-    mid_price: float,
-) -> pd.DataFrame:
+def make_q_ladder_table(cpp_tier: CppTier, spec: TierSpec, q: float, spread: float, mid_price: float) -> pd.DataFrame:
+    q_idx = q_index_lookup(cpp_tier)[float(q)]
     rows = []
-
     for z in tier_sizes(spec):
         zf = float(z)
-        bid_adm = is_admissible(cpp_tier, q, zf, "bid")
-        ask_adm = is_admissible(cpp_tier, q, zf, "ask")
-
-        bid = masked_quote_summary(cpp_tier, q, zf, "bid", mid_price, spread)
-        ask = masked_quote_summary(cpp_tier, q, zf, "ask", mid_price, spread)
-
+        bid = masked_quote_summary(cpp_tier, q_idx, q, zf, "bid", mid_price, spread)
+        ask = masked_quote_summary(cpp_tier, q_idx, q, zf, "ask", mid_price, spread)
         rows.append(
             {
                 "type": tier_kind_label(spec),
                 "q": float(q),
                 "z": zf,
-                "Bid admissible": bid_adm,
-                "Ask admissible": ask_adm,
+                "Bid active": bid is not None,
+                "Ask active": ask is not None,
                 "Bid delta": np.nan if bid is None else round(float(bid.delta), 6),
                 "Ask delta": np.nan if ask is None else round(float(ask.delta), 6),
-                "Bid improvement [% of spread]": np.nan if bid is None else round(float(bid.price_improvement_pct_of_spread), 2),
-                "Ask improvement [% of spread]": np.nan if ask is None else round(float(ask.price_improvement_pct_of_spread), 2),
-                "Bid improvement [pips]": np.nan if bid is None else round(float(bid.price_improvement_pips), 3),
-                "Ask improvement [pips]": np.nan if ask is None else round(float(ask.price_improvement_pips), 3),
                 "Bid vs mid [pips]": np.nan if bid is None else round(float(bid.quote_relative_to_mid_pips), 3),
                 "Ask vs mid [pips]": np.nan if ask is None else round(float(ask.quote_relative_to_mid_pips), 3),
                 "Bid dist to mid [pips]": np.nan if bid is None else round(float(bid.distance_to_mid_pips), 3),
@@ -748,14 +655,15 @@ def make_q_ladder_table(
                 "Ask quote": np.nan if ask is None else round(float(ask.quote_price), 6),
             }
         )
-
     return pd.DataFrame(rows)
 
 
 def make_h_figure(solution: lp.HJBSolution) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=list(solution.q_grid), y=list(solution.h), mode="lines+markers", name="h(q)"))
-    fig.update_layout(title="Value function h(q)", xaxis_title="Inventory q", yaxis_title="h(q)", height=480)
+    fig.add_trace(
+        go.Scatter(x=list(solution.q_grid), y=list(solution.h), mode="lines+markers", name="h(q)")
+    )
+    fig.update_layout(title="Value function h(q)", xaxis_title="Inventory q", yaxis_title="h(q)", height=440)
     return fig
 
 
@@ -763,14 +671,66 @@ def make_convergence_figure(values: list[float], title: str, yaxis_title: str) -
     fig = go.Figure()
     if values:
         fig.add_trace(go.Scatter(x=list(range(1, len(values) + 1)), y=values, mode="lines+markers"))
+    fig.update_layout(title=title, xaxis_title="Iteration", yaxis_title=yaxis_title, yaxis_type="log", height=380)
+    return fig
+
+
+def make_ecn_cap_figure(cpp_tier: lp.ECNTier, spread: float) -> go.Figure:
+    q_grid = [float(q) for q in cpp_tier.policy.q_grid]
+    fig = go.Figure()
+
+    bid_actual: list[float] = []
+    ask_actual: list[float] = []
+    bid_cap: list[float] = []
+    ask_cap: list[float] = []
+
+    for i, q in enumerate(q_grid):
+        cap = float(cpp_tier.delta_cap(abs(q)))
+        if q < 0.0:
+            bid_cap.append(10000.0 * spread * (cap - 0.5))
+            ask_cap.append(np.nan)
+            bid_actual.append(np.nan if not cpp_tier.is_policy_active(i, "bid") else 10000.0 * spread * (float(cpp_tier.policy.bid[i][0]) - 0.5))
+            ask_actual.append(np.nan)
+        elif q > 0.0:
+            bid_cap.append(np.nan)
+            ask_cap.append(10000.0 * spread * (0.5 - cap))
+            bid_actual.append(np.nan)
+            ask_actual.append(np.nan if not cpp_tier.is_policy_active(i, "ask") else 10000.0 * spread * (0.5 - float(cpp_tier.policy.ask[i][0])))
+        else:
+            bid_cap.append(np.nan)
+            ask_cap.append(np.nan)
+            bid_actual.append(np.nan)
+            ask_actual.append(np.nan)
+
+    fig.add_trace(go.Scatter(x=q_grid, y=bid_cap, mode="lines", line=dict(dash="dot"), name="Bid cap"))
+    fig.add_trace(go.Scatter(x=q_grid, y=ask_cap, mode="lines", line=dict(dash="dot"), name="Ask cap"))
+    fig.add_trace(go.Scatter(x=q_grid, y=bid_actual, mode="lines+markers", name="Bid quote"))
+    fig.add_trace(go.Scatter(x=q_grid, y=ask_actual, mode="lines+markers", name="Ask quote"))
+    fig.add_hline(y=0.0)
     fig.update_layout(
-        title=title,
-        xaxis_title="Iteration",
-        yaxis_title=yaxis_title,
-        yaxis_type="log",
-        height=420,
+        title="ECN profile and quote vs inventory",
+        xaxis_title="Inventory q",
+        yaxis_title="Quote relative to mid (pips)",
+        height=480,
     )
     return fig
+
+
+def make_ecn_activity_table(cpp_tier: lp.ECNTier) -> pd.DataFrame:
+    rows = []
+    for i, q in enumerate(cpp_tier.policy.q_grid):
+        qf = float(q)
+        rows.append(
+            {
+                "q": qf,
+                "delta_profile": float(cpp_tier.delta_cap(abs(qf))),
+                "bid_active": bool(cpp_tier.is_policy_active(i, "bid")),
+                "ask_active": bool(cpp_tier.is_policy_active(i, "ask")),
+                "bid_delta": np.nan if qf >= 0.0 else float(cpp_tier.policy.bid[i][0]),
+                "ask_delta": np.nan if qf <= 0.0 else float(cpp_tier.policy.ask[i][0]),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 # ============================================================
@@ -781,8 +741,8 @@ st.set_page_config(page_title="Trinity 2.0 Pricer", layout="wide")
 st.title("Trinity 2.0 Pricer")
 st.markdown(
     "MDP tiers use rung-by-rung two-sided ladder controls. "
-    "ECN tiers are low-dimensional hedge channels: they always quote size z = 1, "
-    "only the inventory-reducing side is active, and the active quote follows an exponential policy whose decay is optimized in C++."
+    "ECN tiers quote only size z = 1 on the inventory-reducing side. "
+    "Their quote is a direct smooth cap-profile in inventory: it starts at delta_min, reaches the mid cap exactly at the convergence inventory, and never crosses mid."
 )
 
 with st.sidebar:
@@ -802,7 +762,6 @@ with st.sidebar:
 
     dt = st.number_input("dt", value=0.002, step=0.001, format="%.4f")
     n_iter = st.number_input("n_iter", value=140, step=10, min_value=1)
-
     spread = st.number_input("reference spread", value=20.0 / 10000.0, step=1.0 / 10000.0, format="%.6f")
     mid_price = st.number_input("display mid price", value=1.000000, step=0.000100, format="%.6f")
 
@@ -830,7 +789,6 @@ with st.sidebar:
 
 errors: list[str] = []
 tier_specs: list[TierSpec] = []
-
 for i in range(num_tiers):
     try:
         tier_specs.append(build_tier_spec_from_ui(i))
@@ -898,8 +856,8 @@ with st.spinner("Solving HJB in C++ and building policies..."):
     )
     solution: lp.HJBSolution = solver.solve()
 
-diag = solution.diagnostics
 solution_tiers = ordered_solution_tiers(tier_specs, solution)
+diag = solution.diagnostics
 
 st.success("Solver run complete.")
 
@@ -925,33 +883,13 @@ with st.expander("Solver diagnostics", expanded=False):
     c5.metric("spot drift", f"{config.spot_drift:.5f}")
     c6.metric("spread", f"{config.spread:.6f}")
 
-    c7, c8, c9, c10 = st.columns(4)
-    c7.metric("golden tol", f"{config.golden_tol:.1e}")
-    c8.metric("golden max iter", int(config.golden_max_iter))
-    c9.metric("final max |Δh|", f"{diag.final_max_h_change:.2e}")
-    c10.metric("final max |rhs|", f"{diag.final_max_rhs:.2e}")
-
-    st.caption(
-        f"Inventory grid: {len(config.q_grid)} points, "
-        f"center index = {len(config.q_grid) // 2}, "
-        f"center q = {config.q_grid[len(config.q_grid) // 2]:.6f}"
-    )
-
     st.plotly_chart(make_h_figure(solution), use_container_width=True)
     st.plotly_chart(
-        make_convergence_figure(
-            list(solution.diagnostics.history_max_h_change),
-            "Convergence: max |Δh|",
-            "max |Δh|",
-        ),
+        make_convergence_figure(list(diag.history_max_h_change), "Convergence: max |Δh|", "max |Δh|"),
         use_container_width=True,
     )
     st.plotly_chart(
-        make_convergence_figure(
-            list(solution.diagnostics.history_max_rhs),
-            "Convergence: max |rhs|",
-            "max |rhs|",
-        ),
+        make_convergence_figure(list(diag.history_max_rhs), "Convergence: max |rhs|", "max |rhs|"),
         use_container_width=True,
     )
 
@@ -967,17 +905,16 @@ for idx, (tab, spec, cpp_tier) in enumerate(zip(tabs, tier_specs, solution_tiers
         if isinstance(spec, ECNTierSpec) and is_ecn_tier(cpp_tier):
             c1, c2, c3 = st.columns(3)
             c1.metric("quoted size", "1.0")
-            c2.metric("delta_start", f"{float(cpp_tier.ecn_policy.delta_start):.4f}")
-            c3.metric("optimized decay", f"{float(cpp_tier.ecn_policy.decay):.4f}")
+            c2.metric("ECN toxicity", f"{float(cpp_tier.adverse_selection_model.ecn_toxicity):.5f}")
+            c3.metric("ECN fee", f"{float(cpp_tier.adverse_selection_model.ecn_fee):.5f}")
 
             c4, c5, c6 = st.columns(3)
-            c4.metric("delta_target", f"{float(cpp_tier.ecn_policy.delta_target):.4f}")
-            c5.metric("decay min", f"{float(cpp_tier.ecn_policy.decay_min):.4f}")
-            c6.metric("decay max", f"{float(cpp_tier.ecn_policy.decay_max):.4f}")
+            c4.metric("convergence inventory", f"{float(cpp_tier.adverse_selection_model.ecn_convergence_inventory):.3f}")
+            c5.metric("delta_min", f"{float(cpp_tier.delta_min):.4f}")
+            c6.metric("mid cap", f"{float(cpp_tier.delta_mid_cap()):.4f}")
 
             st.info(
-                "This ECN tier is a one-size hedge channel. "
-                "Only the inventory-reducing side is active, and its quote follows a smooth exponential function of |q|."
+                "ECN quotes only the inventory-reducing side. The quote itself follows a smooth built-in inventory profile, reaching the passive mid cap exactly when |q| reaches the convergence inventory."
             )
 
         with st.expander("Tier parameters", expanded=False):
@@ -986,36 +923,39 @@ for idx, (tab, spec, cpp_tier) in enumerate(zip(tabs, tier_specs, solution_tiers
         st.plotly_chart(make_flow_curve_figure(cpp_tier, spec), use_container_width=True)
 
         if isinstance(spec, ECNTierSpec) and is_ecn_tier(cpp_tier):
-            st.plotly_chart(make_ecn_decay_figure(cpp_tier, float(config.spread)), use_container_width=True)
+            st.plotly_chart(make_ecn_cap_figure(cpp_tier, float(config.spread)), use_container_width=True)
 
-        st.plotly_chart(
-            make_quote_inventory_figure(cpp_tier, spec, float(config.spread), float(mid_price)),
-            use_container_width=True,
-        )
+        if isinstance(spec, ECNTierSpec) and is_ecn_tier(cpp_tier):
+            pass
+        else:
+            st.plotly_chart(
+                make_quote_inventory_figure(cpp_tier, spec, float(config.spread), float(mid_price)),
+                use_container_width=True,
+            )
 
-        q_for_ladder = st.select_slider(
-            f"Inventory level for ladder — {spec.name}",
-            options=available_q,
-            value=default_q,
-            key=f"qslider_{idx}",
-        )
+            q_for_ladder = st.select_slider(
+                f"Inventory level for ladder — {spec.name}",
+                options=available_q,
+                value=default_q,
+                key=f"qslider_{idx}",
+            )
 
-        st.plotly_chart(
-            make_ladder_figure(cpp_tier, spec, float(q_for_ladder), float(config.spread), float(mid_price)),
-            use_container_width=True,
-        )
+            st.plotly_chart(
+                make_ladder_figure(cpp_tier, spec, float(q_for_ladder), float(config.spread), float(mid_price)),
+                use_container_width=True,
+            )
 
-        q_for_table = st.selectbox(
-            f"q for ladder table — {spec.name}",
-            options=available_q,
-            index=available_q.index(default_q),
-            key=f"qtable_{idx}",
-        )
+            q_for_table = st.selectbox(
+                f"q for ladder table — {spec.name}",
+                options=available_q,
+                index=available_q.index(default_q),
+                key=f"qtable_{idx}",
+            )
 
-        st.dataframe(
-            make_q_ladder_table(cpp_tier, spec, float(q_for_table), float(config.spread), float(mid_price)),
-            use_container_width=True,
-        )
+            st.dataframe(
+                make_q_ladder_table(cpp_tier, spec, float(q_for_table), float(config.spread), float(mid_price)),
+                use_container_width=True,
+            )
 
 with st.expander("What this app is solving"):
     st.markdown(
@@ -1026,17 +966,11 @@ ECN tiers are different:
 
 - the quoted size is fixed to \(z = 1\)
 - only the inventory-reducing side is admissible
-- the active ECN quote is parameterized as an exponential function of \(|q|\)
-- the decay parameter is optimized in C++ using the current value function \(h(q)\)
+- the quote itself follows a smooth built-in profile in \(|q|\)
+- the profile starts at `delta_min` and reaches the passive mid cap exactly at `ecn_convergence_inventory`
+- toxicity and fee still affect the ECN Bellman contribution once the quote is used
 
-So ECN is treated as a smooth hedge channel rather than a full ladder optimization problem.
-
-The inventory grid must be:
-
-- strictly increasing
-- symmetric around 0
-- odd-length
-- with \(0\) exactly at the middle index
+So ECN is treated as a simple parametric hedge curve rather than a fully optimized ladder.
         """
     )
 

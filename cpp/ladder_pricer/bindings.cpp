@@ -90,6 +90,35 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("coeff", &SqrtMarkoutModel::coeff)
         .def("expected_markout", &SqrtMarkoutModel::expected_markout, py::arg("z"));
 
+    py::class_<ECNAdverseSelectionModel>(m, "ECNAdverseSelectionModel")
+        .def(py::init<>())
+        .def(
+            py::init<double, double, double>(),
+            py::arg("ecn_toxicity"),
+            py::arg("ecn_fee"),
+            py::arg("ecn_convergence_inventory")
+        )
+        .def_readwrite("ecn_toxicity", &ECNAdverseSelectionModel::ecn_toxicity)
+        .def_readwrite("ecn_fee", &ECNAdverseSelectionModel::ecn_fee)
+        .def_readwrite(
+            "ecn_convergence_inventory",
+            &ECNAdverseSelectionModel::ecn_convergence_inventory
+        )
+        .def("validate", &ECNAdverseSelectionModel::validate)
+        .def(
+            "toxicity_cost",
+            &ECNAdverseSelectionModel::toxicity_cost,
+            py::arg("delta"),
+            py::arg("z")
+        )
+        .def(
+            "expected_cost",
+            &ECNAdverseSelectionModel::expected_cost,
+            py::arg("base_markout_model"),
+            py::arg("delta"),
+            py::arg("z")
+        );
+
     py::class_<PolynomialInventoryPenalty>(m, "PolynomialInventoryPenalty")
         .def(py::init<>())
         .def(
@@ -107,28 +136,11 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("tau2", &PolynomialInventoryPenalty::tau2)
         .def("value", &PolynomialInventoryPenalty::value, py::arg("q"));
 
-    py::class_<ExponentialECNPolicy>(m, "ExponentialECNPolicy")
+    py::class_<ECNQuoteDecision>(m, "ECNQuoteDecision")
         .def(py::init<>())
-        .def(
-            py::init<double, double, double, double, double>(),
-            py::arg("delta_start"),
-            py::arg("delta_target"),
-            py::arg("decay"),
-            py::arg("decay_min"),
-            py::arg("decay_max")
-        )
-        .def_readwrite("delta_start", &ExponentialECNPolicy::delta_start)
-        .def_readwrite("delta_target", &ExponentialECNPolicy::delta_target)
-        .def_readwrite("decay", &ExponentialECNPolicy::decay)
-        .def_readwrite("decay_min", &ExponentialECNPolicy::decay_min)
-        .def_readwrite("decay_max", &ExponentialECNPolicy::decay_max)
-        .def("validate", &ExponentialECNPolicy::validate)
-        .def(
-            "delta_at_abs_inventory_with_decay",
-            &ExponentialECNPolicy::delta_at_abs_inventory_with_decay,
-            py::arg("q_abs"),
-            py::arg("decay")
-        );
+        .def_readwrite("delta", &ECNQuoteDecision::delta)
+        .def_readwrite("contribution", &ECNQuoteDecision::contribution)
+        .def_readwrite("active", &ECNQuoteDecision::active);
 
     py::class_<QuoteSummary>(m, "QuoteSummary")
         .def(py::init<>())
@@ -297,7 +309,6 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("policy", &Tier::policy)
         .def("tier_type_name", &Tier::tier_type_name)
         .def("sizes", &Tier::sizes, py::return_value_policy::reference_internal)
-
         .def(
             "A",
             [](const Tier& self, double z) {
@@ -328,7 +339,6 @@ PYBIND11_MODULE(ladder_pricer, m) {
             },
             py::arg("z")
         )
-
         .def(
             "is_admissible",
             [](const Tier& self, double q, double z, const py::object& side) {
@@ -397,18 +407,23 @@ PYBIND11_MODULE(ladder_pricer, m) {
                 SqrtMarkoutModel,
                 double,
                 double,
-                ExponentialECNPolicy
+                ECNAdverseSelectionModel
             >(),
             py::arg("name"),
             py::arg("flow_curve"),
             py::arg("markout_model"),
             py::arg("delta_min") = -5.0,
             py::arg("delta_max") = 5.0,
-            py::arg("ecn_policy") = ExponentialECNPolicy{}
+            py::arg("adverse_selection_model") = ECNAdverseSelectionModel{}
         )
         .def_readwrite("delta_min", &ECNTier::delta_min)
         .def_readwrite("delta_max", &ECNTier::delta_max)
-        .def_readwrite("ecn_policy", &ECNTier::ecn_policy)
+        .def_readwrite("adverse_selection_model", &ECNTier::adverse_selection_model)
+        .def("delta_mid_cap", &ECNTier::delta_mid_cap)
+        .def("delta_cap", &ECNTier::delta_cap, py::arg("q_abs"))
+        .def_readwrite("bid_active", &ECNTier::bid_active)
+        .def_readwrite("ask_active", &ECNTier::ask_active)
+        .def("reset_activity_shape", &ECNTier::reset_activity_shape, py::arg("nq"))
         .def_static(
             "is_active_side",
             [](double q, const py::object& side, double tol) {
@@ -419,17 +434,21 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("tol") = 1e-12
         )
         .def(
-            "active_delta_with_decay",
-            &ECNTier::active_delta_with_decay,
-            py::arg("q"),
-            py::arg("decay")
+            "is_policy_active",
+            [](const ECNTier& self, std::size_t q_index, const py::object& side) {
+                return self.is_policy_active(q_index, parse_side_object(side));
+            },
+            py::arg("q_index"),
+            py::arg("side")
         )
         .def(
-            "active_delta",
-            [](const ECNTier& self, double q) {
-                return self.active_delta_with_decay(q, self.ecn_policy.decay);
+            "set_policy_active",
+            [](ECNTier& self, std::size_t q_index, const py::object& side, bool active) {
+                self.set_policy_active(q_index, parse_side_object(side), active);
             },
-            py::arg("q")
+            py::arg("q_index"),
+            py::arg("side"),
+            py::arg("active")
         );
 
     py::class_<SolverDiagnostics>(m, "SolverDiagnostics")
@@ -485,7 +504,6 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("ecn_tiers", &HJBLadderSolver::ecn_tiers)
         .def_readwrite("optimizer", &HJBLadderSolver::optimizer)
         .def_readwrite("grid_meta_", &HJBLadderSolver::grid_meta_)
-
         .def_static(
             "validate_mdp_bounds_request",
             [](std::size_t rung_idx,
@@ -515,11 +533,9 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("tier_name"),
             py::arg("side_name")
         )
-
         .def("validate_problem_definition", &HJBLadderSolver::validate_problem_definition)
         .def("initialize_policy_shapes", &HJBLadderSolver::initialize_policy_shapes)
         .def("prepare_solve_context", &HJBLadderSolver::prepare_solve_context)
-
         .def(
             "mdp_bid_bounds_for_rung",
             [](const HJBLadderSolver& self,
@@ -564,22 +580,37 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("q"),
             py::arg("prev_delta") = std::nullopt
         )
-
         .def(
-            "build_ecn_policy_from_decay",
-            &HJBLadderSolver::build_ecn_policy_from_decay,
-            py::arg("tier"),
-            py::arg("decay")
-        )
-
-        .def(
-            "optimize_ecn_decay",
+            "optimize_ecn_quote_for_state",
             [](const HJBLadderSolver& self,
                const ECNTier& tier,
-               const std::vector<double>& h_vec) {
-                validate_h_vec_against_solver(self, h_vec, "optimize_ecn_decay");
+               const std::vector<double>& h_vec,
+               double q,
+               const py::object& side,
+               const std::optional<double>& lower_bound) {
+                validate_h_vec_against_solver(self, h_vec, "optimize_ecn_quote_for_state");
                 const LinearInterpolator1D h{self.config.q_grid, h_vec};
-                return self.optimize_ecn_decay(tier, h);
+                return self.optimize_ecn_quote_for_state(
+                    tier,
+                    h,
+                    q,
+                    parse_side_object(side),
+                    lower_bound
+                );
+            },
+            py::arg("tier"),
+            py::arg("h_vec"),
+            py::arg("q"),
+            py::arg("side"),
+            py::arg("lower_bound") = std::nullopt
+        )
+        .def("clear_ecn_policy", &HJBLadderSolver::clear_ecn_policy, py::arg("tier"))
+        .def(
+            "build_ecn_policy",
+            [](const HJBLadderSolver& self, ECNTier& tier, const std::vector<double>& h_vec) {
+                validate_h_vec_against_solver(self, h_vec, "build_ecn_policy");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+                self.build_ecn_policy(tier, h);
             },
             py::arg("tier"),
             py::arg("h_vec")

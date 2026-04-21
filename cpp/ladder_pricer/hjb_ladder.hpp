@@ -193,6 +193,58 @@ struct SqrtMarkoutModel {
     }
 };
 
+struct ECNAdverseSelectionModel {
+    double ecn_toxicity{0.003};
+    double ecn_fee{0.0};
+    double ecn_convergence_inventory{3.0};
+
+    ECNAdverseSelectionModel() = default;
+
+    ECNAdverseSelectionModel(
+        double ecn_toxicity_,
+        double ecn_fee_,
+        double ecn_convergence_inventory_
+    )
+        : ecn_toxicity(ecn_toxicity_),
+          ecn_fee(ecn_fee_),
+          ecn_convergence_inventory(ecn_convergence_inventory_) {
+        validate();
+    }
+
+    void validate() const {
+        if (ecn_toxicity < 0.0) {
+            throw std::invalid_argument(
+                "ECNAdverseSelectionModel: ecn_toxicity must be nonnegative."
+            );
+        }
+        if (ecn_fee < 0.0) {
+            throw std::invalid_argument(
+                "ECNAdverseSelectionModel: ecn_fee must be nonnegative."
+            );
+        }
+        if (ecn_convergence_inventory <= 0.0) {
+            throw std::invalid_argument(
+                "ECNAdverseSelectionModel: ecn_convergence_inventory must be positive."
+            );
+        }
+    }
+
+    double toxicity_cost(double delta, double z) const {
+        const double delta_pos = std::max(delta, 0.0);
+        return z * ecn_toxicity * delta_pos;
+    }
+
+    double expected_cost(
+        const SqrtMarkoutModel& base_markout_model,
+        double delta,
+        double z
+    ) const {
+        return z * base_markout_model.expected_markout(z) +
+               toxicity_cost(delta, z) +
+               ecn_fee;
+    }
+};
+
 struct PolynomialInventoryPenalty {
     double risk_aversion{2.0};
     double sigma{0.25};
@@ -275,56 +327,37 @@ inline double ask_trade_contribution(
     return lam * (z * spread * (0.5 - delta) - z * mu + dq);
 }
 
-// ============================================================
-// ECN parametric policy
-// ============================================================
+inline double ecn_bid_trade_contribution(
+    const LogisticFlowCurve& flow_curve,
+    const SqrtMarkoutModel& base_markout_model,
+    const ECNAdverseSelectionModel& adverse_selection_model,
+    const LinearInterpolator1D& h,
+    double spread,
+    double q,
+    double z,
+    double delta
+) {
+    const double lam = flow_curve.arrival_rate(delta, z);
+    const double cost = adverse_selection_model.expected_cost(base_markout_model, delta, z);
+    const double dq = h(q + z) - h(q);
+    return lam * (z * spread * (0.5 - delta) - cost + dq);
+}
 
-struct ExponentialECNPolicy {
-    double delta_start{0.10};
-    double delta_target{0.50};
-    double decay{2.0};
-    double decay_min{0.25};
-    double decay_max{10.0};
-
-    ExponentialECNPolicy() = default;
-
-    ExponentialECNPolicy(
-        double delta_start_,
-        double delta_target_,
-        double decay_,
-        double decay_min_,
-        double decay_max_
-    )
-        : delta_start(delta_start_),
-          delta_target(delta_target_),
-          decay(decay_),
-          decay_min(decay_min_),
-          decay_max(decay_max_) {
-        validate();
-    }
-
-    void validate() const {
-        if (decay_min <= 0.0) {
-            throw std::invalid_argument("ExponentialECNPolicy: decay_min must be positive.");
-        }
-        if (decay_max <= decay_min) {
-            throw std::invalid_argument("ExponentialECNPolicy: decay_max must be > decay_min.");
-        }
-        if (decay <= 0.0) {
-            throw std::invalid_argument("ExponentialECNPolicy: decay must be positive.");
-        }
-        if (delta_target < delta_start) {
-            throw std::invalid_argument(
-                "ExponentialECNPolicy: delta_target must be >= delta_start."
-            );
-        }
-    }
-
-    double delta_at_abs_inventory_with_decay(double q_abs, double decay_) const {
-        const double x = std::max(q_abs - 1.0, 0.0);
-        return delta_target - (delta_target - delta_start) * std::exp(-x / decay_);
-    }
-};
+inline double ecn_ask_trade_contribution(
+    const LogisticFlowCurve& flow_curve,
+    const SqrtMarkoutModel& base_markout_model,
+    const ECNAdverseSelectionModel& adverse_selection_model,
+    const LinearInterpolator1D& h,
+    double spread,
+    double q,
+    double z,
+    double delta
+) {
+    const double lam = flow_curve.arrival_rate(delta, z);
+    const double cost = adverse_selection_model.expected_cost(base_markout_model, delta, z);
+    const double dq = h(q - z) - h(q);
+    return lam * (z * spread * (0.5 - delta) - cost + dq);
+}
 
 // ============================================================
 // Quote analytics
@@ -668,6 +701,12 @@ struct GoldenSectionSearch {
     }
 };
 
+struct ECNQuoteDecision {
+    double delta{0.0};
+    double contribution{0.0};
+    bool active{false};
+};
+
 // ============================================================
 // Tier hierarchy
 // ============================================================
@@ -761,7 +800,9 @@ struct MDPTier final : public Tier {
 struct ECNTier final : public Tier {
     double delta_min{-5.0};
     double delta_max{5.0};
-    ExponentialECNPolicy ecn_policy{};
+    ECNAdverseSelectionModel adverse_selection_model{};
+    std::vector<unsigned char> bid_active;
+    std::vector<unsigned char> ask_active;
 
     ECNTier() = default;
 
@@ -771,12 +812,12 @@ struct ECNTier final : public Tier {
         SqrtMarkoutModel markout_model_,
         double delta_min_ = -5.0,
         double delta_max_ = 5.0,
-        ExponentialECNPolicy ecn_policy_ = ExponentialECNPolicy{}
+        ECNAdverseSelectionModel adverse_selection_model_ = ECNAdverseSelectionModel{}
     )
         : Tier(std::move(name_), std::move(flow_curve_), std::move(markout_model_)),
           delta_min(delta_min_),
           delta_max(delta_max_),
-          ecn_policy(std::move(ecn_policy_)) {
+          adverse_selection_model(std::move(adverse_selection_model_)) {
         validate();
     }
 
@@ -789,23 +830,34 @@ struct ECNTier final : public Tier {
         return fixed_size;
     }
 
+    double delta_mid_cap() const {
+        return std::min(delta_max, 0.5);
+    }
+
+    double delta_cap(double q_abs) const {
+        const double q = std::max(q_abs, 0.0);
+        const double cap_hi = delta_mid_cap();
+        const double q_star = adverse_selection_model.ecn_convergence_inventory;
+        const double u = clamp(q / q_star, 0.0, 1.0);
+        const double s = u * u * (3.0 - 2.0 * u);
+        return delta_min + (cap_hi - delta_min) * s;
+    }
+
     void validate() const override {
         if (delta_max <= delta_min) {
             throw std::invalid_argument("ECNTier: delta_max must be > delta_min.");
         }
-
-        ecn_policy.validate();
-
-        if (ecn_policy.delta_start < delta_min || ecn_policy.delta_start > delta_max) {
+        adverse_selection_model.validate();
+        if (delta_min >= delta_mid_cap()) {
             throw std::invalid_argument(
-                "ECNTier: delta_start must lie inside [delta_min, delta_max]."
+                "ECNTier: delta_min must be < min(delta_max, 0.5) for passive ECN quoting."
             );
         }
-        if (ecn_policy.delta_target < delta_min || ecn_policy.delta_target > delta_max) {
-            throw std::invalid_argument(
-                "ECNTier: delta_target must lie inside [delta_min, delta_max]."
-            );
-        }
+    }
+
+    void reset_activity_shape(std::size_t nq) {
+        bid_active.assign(nq, 0u);
+        ask_active.assign(nq, 0u);
     }
 
     static bool is_active_side(double q, Side side, double tol = 1e-12) {
@@ -817,8 +869,17 @@ struct ECNTier final : public Tier {
         return std::abs(z - 1.0) <= tol && is_active_side(q, side, tol);
     }
 
-    double active_delta_with_decay(double q, double decay) const {
-        return ecn_policy.delta_at_abs_inventory_with_decay(std::abs(q), decay);
+    bool is_policy_active(std::size_t q_index, Side side) const {
+        const auto& flags = side == Side::Bid ? bid_active : ask_active;
+        return q_index < flags.size() && flags[q_index] != 0u;
+    }
+
+    void set_policy_active(std::size_t q_index, Side side, bool active) {
+        auto& flags = side == Side::Bid ? bid_active : ask_active;
+        if (q_index >= flags.size()) {
+            throw std::out_of_range("ECNTier::set_policy_active: q_index out of range.");
+        }
+        flags[q_index] = active ? 1u : 0u;
     }
 };
 
@@ -962,6 +1023,7 @@ struct HJBLadderSolver {
         }
         for (auto& tier : ecn_tiers) {
             tier.reset_policy_shape(config.q_grid);
+            tier.reset_activity_shape(config.q_grid.size());
         }
     }
 
@@ -1196,59 +1258,74 @@ struct HJBLadderSolver {
     // ECN policy construction
     // --------------------------------------------------------
 
-    double optimize_ecn_decay(const ECNTier& tier, const LinearInterpolator1D& h) const {
-        const auto objective = [&](double decay) {
-            double total = 0.0;
+    ECNQuoteDecision optimize_ecn_quote_for_state(
+        const ECNTier& tier,
+        const LinearInterpolator1D& h,
+        double q,
+        Side side,
+        std::optional<double> lower_bound = std::nullopt
+    ) const {
+        (void) lower_bound;
 
-            for (std::size_t i = 0; i < grid_meta_.q0_idx; ++i) {
-                const double q = config.q_grid[i];
-                total += bid_trade_contribution(
-                    tier.flow_curve,
-                    tier.markout_model,
-                    h,
-                    config.spread,
-                    q,
-                    1.0,
-                    tier.active_delta_with_decay(q, decay)
-                );
-            }
+        ECNQuoteDecision out;
+        out.delta = tier.delta_min;
+        out.contribution = 0.0;
+        out.active = false;
 
-            for (std::size_t i = grid_meta_.q0_idx + 1; i < grid_meta_.nq; ++i) {
-                const double q = config.q_grid[i];
-                total += ask_trade_contribution(
-                    tier.flow_curve,
-                    tier.markout_model,
-                    h,
-                    config.spread,
-                    q,
-                    1.0,
-                    tier.active_delta_with_decay(q, decay)
-                );
-            }
+        if (!tier.is_admissible(q, 1.0, side)) {
+            return out;
+        }
 
-            return total;
-        };
+        const double d = tier.delta_cap(std::abs(q));
+        const double v = side == Side::Ask
+            ? ecn_ask_trade_contribution(
+                tier.flow_curve,
+                tier.markout_model,
+                tier.adverse_selection_model,
+                h,
+                config.spread,
+                q,
+                1.0,
+                d
+            )
+            : ecn_bid_trade_contribution(
+                tier.flow_curve,
+                tier.markout_model,
+                tier.adverse_selection_model,
+                h,
+                config.spread,
+                q,
+                1.0,
+                d
+            );
 
-        return clamp(
-            optimizer.maximize(objective, tier.ecn_policy.decay_min, tier.ecn_policy.decay_max),
-            tier.ecn_policy.decay_min,
-            tier.ecn_policy.decay_max
-        );
+        out.delta = d;
+        out.contribution = v;
+        out.active = true;
+        return out;
     }
 
-    void build_ecn_policy_from_decay(ECNTier& tier, double decay) {
-        const double parked_delta = tier.ecn_policy.delta_target;
+    void clear_ecn_policy(ECNTier& tier) const {
+        for (std::size_t i = 0; i < grid_meta_.nq; ++i) {
+            tier.policy.delta_ref(i, 0, Side::Bid) = tier.delta_min;
+            tier.policy.delta_ref(i, 0, Side::Ask) = tier.delta_min;
+            tier.set_policy_active(i, Side::Bid, false);
+            tier.set_policy_active(i, Side::Ask, false);
+        }
+    }
+
+    void build_ecn_policy(ECNTier& tier, const LinearInterpolator1D& h) const {
+        clear_ecn_policy(tier);
+        (void) h;
 
         for (std::size_t i = 0; i < grid_meta_.nq; ++i) {
             const double q = config.q_grid[i];
-
-            tier.policy.delta_ref(i, 0, Side::Bid) = parked_delta;
-            tier.policy.delta_ref(i, 0, Side::Ask) = parked_delta;
-
-            if (q > 0.0) {
-                tier.policy.delta_ref(i, 0, Side::Ask) = tier.active_delta_with_decay(q, decay);
-            } else if (q < 0.0) {
-                tier.policy.delta_ref(i, 0, Side::Bid) = tier.active_delta_with_decay(q, decay);
+            if (q < 0.0) {
+                tier.policy.delta_ref(i, 0, Side::Bid) = tier.delta_cap(std::abs(q));
+                tier.set_policy_active(i, Side::Bid, true);
+            } else if (q > 0.0) {
+                tier.policy.delta_ref(i, 0, Side::Ask) = tier.delta_cap(std::abs(q));
+                tier.set_policy_active(i, Side::Ask, true);
             }
         }
     }
@@ -1317,10 +1394,11 @@ struct HJBLadderSolver {
         std::size_t q_index,
         const LinearInterpolator1D& h
     ) const {
-        if (q > 0.0) {
-            return ask_trade_contribution(
+        if (q > 0.0 && tier.is_policy_active(q_index, Side::Ask)) {
+            return ecn_ask_trade_contribution(
                 tier.flow_curve,
                 tier.markout_model,
+                tier.adverse_selection_model,
                 h,
                 config.spread,
                 q,
@@ -1328,10 +1406,11 @@ struct HJBLadderSolver {
                 tier.policy.ask[q_index][0]
             );
         }
-        if (q < 0.0) {
-            return bid_trade_contribution(
+        if (q < 0.0 && tier.is_policy_active(q_index, Side::Bid)) {
+            return ecn_bid_trade_contribution(
                 tier.flow_curve,
                 tier.markout_model,
+                tier.adverse_selection_model,
                 h,
                 config.spread,
                 q,
@@ -1353,8 +1432,7 @@ struct HJBLadderSolver {
         }
 
         for (auto& tier : ecn_tiers) {
-            tier.ecn_policy.decay = optimize_ecn_decay(tier, h);
-            build_ecn_policy_from_decay(tier, tier.ecn_policy.decay);
+            build_ecn_policy(tier, h);
         }
     }
 
