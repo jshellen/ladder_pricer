@@ -18,7 +18,6 @@ namespace hjb {
 // ============================================================
 
 using Matrix = std::vector<std::vector<double>>;
-using OptionalDeltaRow = std::optional<std::reference_wrapper<const std::vector<double>>>;
 
 inline double clamp(double x, double lo, double hi) {
     return std::min(std::max(x, lo), hi);
@@ -170,10 +169,10 @@ struct LogisticFlowCurve {
         if (y >= 0.0) {
             const double e = std::exp(-y);
             return 1.0 / (1.0 + e);
-        } else {
-            const double e = std::exp(y);
-            return e / (1.0 + e);
         }
+
+        const double e = std::exp(y);
+        return e / (1.0 + e);
     }
 
     double arrival_rate(double delta, double z) const {
@@ -297,7 +296,7 @@ struct LinearInterpolator1D {
 // Trade-value helpers
 // ============================================================
 
-inline double bid_trade_contribution(
+inline double bid_trade_value(
     const LogisticFlowCurve& flow_curve,
     const SqrtMarkoutModel& markout_model,
     const LinearInterpolator1D& h,
@@ -312,7 +311,7 @@ inline double bid_trade_contribution(
     return lam * (z * spread * (0.5 - delta) - z * mu + dq);
 }
 
-inline double ask_trade_contribution(
+inline double ask_trade_value(
     const LogisticFlowCurve& flow_curve,
     const SqrtMarkoutModel& markout_model,
     const LinearInterpolator1D& h,
@@ -327,7 +326,7 @@ inline double ask_trade_contribution(
     return lam * (z * spread * (0.5 - delta) - z * mu + dq);
 }
 
-inline double ecn_bid_trade_contribution(
+inline double ecn_bid_trade_value(
     const LogisticFlowCurve& flow_curve,
     const SqrtMarkoutModel& base_markout_model,
     const ECNAdverseSelectionModel& adverse_selection_model,
@@ -343,7 +342,7 @@ inline double ecn_bid_trade_contribution(
     return lam * (z * spread * (0.5 - delta) - cost + dq);
 }
 
-inline double ecn_ask_trade_contribution(
+inline double ecn_ask_trade_value(
     const LogisticFlowCurve& flow_curve,
     const SqrtMarkoutModel& base_markout_model,
     const ECNAdverseSelectionModel& adverse_selection_model,
@@ -359,59 +358,105 @@ inline double ecn_ask_trade_contribution(
     return lam * (z * spread * (0.5 - delta) - cost + dq);
 }
 
-
-inline double dark_pool_ask_trade_contribution(
-    double lambda,
-    double p,
+inline double dark_pool_poisson_trade_value(
+    double arrival_lambda,
+    double size_lambda,
     double fee_per_unit,
     const LinearInterpolator1D& h,
     double q,
-    double posted_size
+    double posted_size,
+    Side side
 ) {
-    if (lambda <= 0.0 || posted_size <= 0.0) {
+    if (arrival_lambda <= 0.0 || size_lambda <= 0.0 || posted_size <= 0.0) {
         return 0.0;
     }
 
     const int u = static_cast<int>(std::llround(posted_size));
-    const double r = 1.0 - p;
-
-    double expected = 0.0;
-    for (int k = 1; k < u; ++k) {
-        const double prob = p * std::pow(r, static_cast<double>(k - 1));
-        expected += prob * (h(q - static_cast<double>(k)) - h(q) - fee_per_unit * k);
+    if (u <= 0) {
+        return 0.0;
     }
 
-    const double tail_prob = std::pow(r, static_cast<double>(u - 1));
-    expected += tail_prob * (h(q - static_cast<double>(u)) - h(q) - fee_per_unit * u);
+    // Opportunity arrivals are controlled by arrival_lambda.
+    // Conditional opportunity size is modeled as:
+    //
+    //     K ~ Poisson(size_lambda) | K >= 1
+    //
+    // The executed size is min(K, posted_size).
+    const double p0 = std::exp(-size_lambda);
+    const double positive_mass = 1.0 - p0;
 
-    return lambda * expected;
+    if (positive_mass <= 0.0) {
+        return 0.0;
+    }
+
+    const double hq = h(q);
+
+    auto continuation_value = [&](int k) {
+        const double size = static_cast<double>(k);
+
+        if (side == Side::Ask) {
+            return h(q - size) - hq - fee_per_unit * size;
+        }
+
+        return h(q + size) - hq - fee_per_unit * size;
+    };
+
+    double expected = 0.0;
+
+    double pk = p0;
+    double cumulative_positive_prob = 0.0;
+
+    for (int k = 1; k < u; ++k) {
+        pk *= size_lambda / static_cast<double>(k);
+
+        const double prob = pk / positive_mass;
+        cumulative_positive_prob += prob;
+
+        expected += prob * continuation_value(k);
+    }
+
+    const double tail_prob = std::max(0.0, 1.0 - cumulative_positive_prob);
+    expected += tail_prob * continuation_value(u);
+
+    return arrival_lambda * expected;
 }
 
-inline double dark_pool_bid_trade_contribution(
-    double lambda,
-    double p,
+inline double dark_pool_ask_trade_value(
+    double arrival_lambda,
+    double size_lambda,
     double fee_per_unit,
     const LinearInterpolator1D& h,
     double q,
     double posted_size
 ) {
-    if (lambda <= 0.0 || posted_size <= 0.0) {
-        return 0.0;
-    }
+    return dark_pool_poisson_trade_value(
+        arrival_lambda,
+        size_lambda,
+        fee_per_unit,
+        h,
+        q,
+        posted_size,
+        Side::Ask
+    );
+}
 
-    const int u = static_cast<int>(std::llround(posted_size));
-    const double r = 1.0 - p;
-
-    double expected = 0.0;
-    for (int k = 1; k < u; ++k) {
-        const double prob = p * std::pow(r, static_cast<double>(k - 1));
-        expected += prob * (h(q + static_cast<double>(k)) - h(q) - fee_per_unit * k);
-    }
-
-    const double tail_prob = std::pow(r, static_cast<double>(u - 1));
-    expected += tail_prob * (h(q + static_cast<double>(u)) - h(q) - fee_per_unit * u);
-
-    return lambda * expected;
+inline double dark_pool_bid_trade_value(
+    double arrival_lambda,
+    double size_lambda,
+    double fee_per_unit,
+    const LinearInterpolator1D& h,
+    double q,
+    double posted_size
+) {
+    return dark_pool_poisson_trade_value(
+        arrival_lambda,
+        size_lambda,
+        fee_per_unit,
+        h,
+        q,
+        posted_size,
+        Side::Bid
+    );
 }
 
 // ============================================================
@@ -622,7 +667,6 @@ struct QuotePolicy {
         return QuoteMetrics::make_summary(d, d_ref, side, mid, spread);
     }
 };
-
 
 struct DarkPoolPolicy {
     std::vector<double> q_grid;
@@ -1030,34 +1074,37 @@ struct ECNTier final : public Tier {
     }
 };
 
-
 struct DarkPoolVenue {
-    double lambda_bid{0.0};
-    double lambda_ask{0.0};
-    double p_bid{0.5};
-    double p_ask{0.5};
+    double arrival_lambda_bid{0.0};
+    double arrival_lambda_ask{0.0};
+
+    double size_lambda_bid{1.0};
+    double size_lambda_ask{1.0};
+
     double fee_per_unit_bid{0.0};
     double fee_per_unit_ask{0.0};
+
     std::vector<double> posted_sizes{1.0, 2.0, 3.0};
     bool allow_both_sides{false};
+
     DarkPoolPolicy policy;
 
     DarkPoolVenue() = default;
 
     DarkPoolVenue(
-        double lambda_bid_,
-        double lambda_ask_,
-        double p_bid_,
-        double p_ask_,
+        double arrival_lambda_bid_,
+        double arrival_lambda_ask_,
+        double size_lambda_bid_,
+        double size_lambda_ask_,
         double fee_per_unit_bid_,
         double fee_per_unit_ask_,
         std::vector<double> posted_sizes_,
         bool allow_both_sides_ = false
     )
-        : lambda_bid(lambda_bid_),
-          lambda_ask(lambda_ask_),
-          p_bid(p_bid_),
-          p_ask(p_ask_),
+        : arrival_lambda_bid(arrival_lambda_bid_),
+          arrival_lambda_ask(arrival_lambda_ask_),
+          size_lambda_bid(size_lambda_bid_),
+          size_lambda_ask(size_lambda_ask_),
           fee_per_unit_bid(fee_per_unit_bid_),
           fee_per_unit_ask(fee_per_unit_ask_),
           posted_sizes(std::move(posted_sizes_)),
@@ -1070,17 +1117,24 @@ struct DarkPoolVenue {
     }
 
     void validate() const {
-        if (lambda_bid < 0.0 || lambda_ask < 0.0) {
-            throw std::invalid_argument("DarkPoolVenue: arrival intensities must be nonnegative.");
+        if (arrival_lambda_bid < 0.0 || arrival_lambda_ask < 0.0) {
+            throw std::invalid_argument("DarkPoolVenue: arrival lambdas must be nonnegative.");
         }
-        if (!(p_bid > 0.0 && p_bid <= 1.0) || !(p_ask > 0.0 && p_ask <= 1.0)) {
-            throw std::invalid_argument("DarkPoolVenue: geometric probabilities must lie in (0, 1].");
+        if (size_lambda_bid <= 0.0 || size_lambda_ask <= 0.0) {
+            throw std::invalid_argument(
+                "DarkPoolVenue: size-distribution lambdas must be positive."
+            );
         }
+        if (fee_per_unit_bid < 0.0 || fee_per_unit_ask < 0.0) {
+            throw std::invalid_argument("DarkPoolVenue: fees must be nonnegative.");
+        }
+
         validate_positive_strictly_increasing(posted_sizes, "DarkPoolVenue.posted_sizes");
+
         for (double u : posted_sizes) {
             if (!is_integer_like(u)) {
                 throw std::invalid_argument(
-                    "DarkPoolVenue: posted_sizes must be integer-valued because arrival sizes are geometric in unit chunks."
+                    "DarkPoolVenue: posted_sizes must be integer-valued because dark-pool fills are modeled in unit chunks."
                 );
             }
         }
@@ -1094,7 +1148,9 @@ struct DarkPoolVenue {
         if (allow_both_sides) {
             return true;
         }
-        return (q > tol && side == Side::Ask) || (q < -tol && side == Side::Bid);
+
+        return (q > tol && side == Side::Ask) ||
+               (q < -tol && side == Side::Bid);
     }
 };
 
@@ -1191,26 +1247,15 @@ struct HJBLadderSolver {
         config.validate();
     }
 
-    static void validate_mdp_bounds_request(
-        std::size_t rung_idx,
-        const std::vector<double>& current_delta,
-        OptionalDeltaRow prev_delta
-    ) {
-        if (rung_idx >= current_delta.size()) {
-            throw std::out_of_range("mdp_bounds_for_rung: rung_idx out of range.");
-        }
-        if (prev_delta && prev_delta->get().size() != current_delta.size()) {
-            throw std::invalid_argument(
-                "mdp_bounds_for_rung: prev_delta must have same size as current_delta."
-            );
-        }
+    static const char* side_name(Side side) {
+        return side == Side::Bid ? "bid" : "ask";
     }
 
     static void repair_or_throw_bounds(
         double& lower,
         double& upper,
         const std::string& tier_name,
-        const char* side_name
+        const char* side_name_
     ) {
         constexpr double tol = 1e-12;
 
@@ -1218,7 +1263,7 @@ struct HJBLadderSolver {
             if (lower - upper > tol) {
                 throw std::runtime_error(
                     "Infeasible ladder bounds for MDP tier '" + tier_name +
-                    "', side '" + std::string(side_name) + "'."
+                    "', side '" + std::string(side_name_) + "'."
                 );
             }
             upper = lower;
@@ -1262,138 +1307,89 @@ struct HJBLadderSolver {
     // MDP policy construction
     // --------------------------------------------------------
 
-    std::pair<double, double> mdp_bid_bounds_for_rung(
+    std::pair<double, double> mdp_bounds_for_rung(
         const MDPTier& tier,
         std::size_t rung_idx,
         const std::vector<double>& current_delta,
+        const std::vector<double>* prev_delta_row,
         double q,
-        OptionalDeltaRow prev_delta
-        ) const {
-            validate_mdp_bounds_request(rung_idx, current_delta, prev_delta);
-
-            double lower = tier.delta_min;
-            double upper = tier.delta_max;
-
-            const bool has_prev_row = prev_delta.has_value();
-            const bool has_prev_rung = (rung_idx > 0);
-            const bool shrink = (q < 0.0); // bid reduces risk when short
-            const bool expand = (q > 0.0); // bid increases risk when long
-
-            if (has_prev_rung) {
-                upper = std::min(upper, current_delta[rung_idx - 1]);
-            }
-
-            if (!has_prev_row) {
-                return {lower, upper};
-            }
-
-            const auto& prev_row = prev_delta->get();
-
-            // Explicit monotonic anchor for the first rung.
-            // As we move away from q=0:
-            // - risk-reducing side: first rung must be at least as aggressive as previous row
-            // - risk-increasing side: first rung must be no more aggressive than previous row
-            if (!has_prev_rung) {
-                if (shrink) {
-                    lower = std::max(lower, prev_row[0]);
-                } else if (expand) {
-                    upper = std::min(upper, prev_row[0]);
-                }
-                return {lower, upper};
-            }
-
-            if (expand) {
-                const double required_tail_span = prev_row[rung_idx] - prev_row.back();
-                lower = std::max(lower, tier.delta_min + required_tail_span);
-            }
-
-            {
-                const double prev_curr = current_delta[rung_idx - 1];
-                const double prev_row_gap = prev_row[rung_idx - 1] - prev_row[rung_idx];
-
-                if (shrink) {
-                    lower = std::max(lower, prev_curr - prev_row_gap);
-                } else if (expand) {
-                    upper = std::min(upper, prev_curr - prev_row_gap);
-                }
-            }
-
-            return {lower, upper};
+        Side side
+    ) const {
+        if (rung_idx >= current_delta.size()) {
+            throw std::out_of_range("mdp_bounds_for_rung: rung_idx out of range.");
         }
 
-    std::pair<double, double> mdp_ask_bounds_for_rung(
-        const MDPTier& tier,
-        std::size_t rung_idx,
-        const std::vector<double>& current_delta,
-        double q,
-        OptionalDeltaRow prev_delta
-    ) const {
-        validate_mdp_bounds_request(rung_idx, current_delta, prev_delta);
+        if (prev_delta_row != nullptr && prev_delta_row->size() != current_delta.size()) {
+            throw std::invalid_argument(
+                "mdp_bounds_for_rung: prev_delta_row must have same size as current_delta."
+            );
+        }
 
         double lower = tier.delta_min;
         double upper = tier.delta_max;
 
-        const bool has_prev_row = prev_delta.has_value();
-        const bool has_prev_rung = (rung_idx > 0);
-        const bool shrink = (q > 0.0); // ask reduces risk when long
-        const bool expand = (q < 0.0); // ask increases risk when short
-
-        if (has_prev_rung) {
+        // 1. Size-ladder monotonicity.
+        // Larger size rungs should not be more aggressive than smaller size rungs.
+        if (rung_idx > 0) {
             upper = std::min(upper, current_delta[rung_idx - 1]);
         }
 
-        if (!has_prev_row) {
+        // 2. Zero-inventory row.
+        constexpr double q_tol = 1e-12;
+        if (prev_delta_row == nullptr || std::abs(q) <= q_tol) {
             return {lower, upper};
         }
 
-        const auto& prev_row = prev_delta->get();
+        const auto& prev = *prev_delta_row;
 
-        // Explicit monotonic anchor for the first rung.
-        if (!has_prev_rung) {
-            if (shrink) {
-                lower = std::max(lower, prev_row[0]);
-            } else if (expand) {
-                upper = std::min(upper, prev_row[0]);
+        const bool risk_decreasing =
+            (side == Side::Bid && q < -q_tol) ||
+            (side == Side::Ask && q > q_tol);
+
+        const bool risk_increasing =
+            (side == Side::Bid && q > q_tol) ||
+            (side == Side::Ask && q < -q_tol);
+
+        // 3. First rung inventory monotonicity.
+        if (rung_idx == 0) {
+            if (risk_decreasing) {
+                lower = std::max(lower, prev[0]);
+            } else if (risk_increasing) {
+                upper = std::min(upper, prev[0]);
             }
+
             return {lower, upper};
         }
 
-        if (expand) {
-            const double required_tail_span = prev_row[rung_idx] - prev_row.back();
+        // 4. Larger rung inventory monotonicity.
+        const double prev_curr = current_delta[rung_idx - 1];
+        const double prev_row_gap = prev[rung_idx - 1] - prev[rung_idx];
+
+        if (risk_decreasing) {
+            lower = std::max(lower, prev_curr - prev_row_gap);
+        } else if (risk_increasing) {
+            const double required_tail_span = prev[rung_idx] - prev.back();
             lower = std::max(lower, tier.delta_min + required_tail_span);
-        }
-
-        {
-            const double prev_curr = current_delta[rung_idx - 1];
-            const double prev_row_gap = prev_row[rung_idx - 1] - prev_row[rung_idx];
-
-            if (shrink) {
-                lower = std::max(lower, prev_curr - prev_row_gap);
-            } else if (expand) {
-                upper = std::min(upper, prev_curr - prev_row_gap);
-            }
+            upper = std::min(upper, prev_curr - prev_row_gap);
         }
 
         return {lower, upper};
     }
 
-    void build_mdp_bid_ladder(
+    double optimize_mdp_rung(
         const MDPTier& tier,
         const LinearInterpolator1D& h,
-        std::vector<double>& bid_delta_row,
         double q,
-        OptionalDeltaRow prev_delta = std::nullopt
+        double z,
+        Side side,
+        double lower,
+        double upper
     ) const {
-        const std::size_t nz = tier.sizes_.size();
-        bid_delta_row.assign(nz, tier.delta_min);
+        repair_or_throw_bounds(lower, upper, tier.name, side_name(side));
 
-        for (std::size_t j = 0; j < nz; ++j) {
-            const double z = tier.sizes_[j];
-            auto [lower, upper] = mdp_bid_bounds_for_rung(tier, j, bid_delta_row, q, prev_delta);
-            repair_or_throw_bounds(lower, upper, tier.name, "bid");
-
+        if (side == Side::Bid) {
             const auto obj = [&](double d) {
-                return bid_trade_contribution(
+                return bid_trade_value(
                     tier.flow_curve,
                     tier.markout_model,
                     h,
@@ -1404,38 +1400,56 @@ struct HJBLadderSolver {
                 );
             };
 
-            bid_delta_row[j] = clamp(optimizer.maximize(obj, lower, upper), lower, upper);
+            return clamp(optimizer.maximize(obj, lower, upper), lower, upper);
         }
+
+        const auto obj = [&](double d) {
+            return ask_trade_value(
+                tier.flow_curve,
+                tier.markout_model,
+                h,
+                config.spread,
+                q,
+                z,
+                d
+            );
+        };
+
+        return clamp(optimizer.maximize(obj, lower, upper), lower, upper);
     }
 
-    void build_mdp_ask_ladder(
+    void build_mdp_ladder_row(
         const MDPTier& tier,
         const LinearInterpolator1D& h,
-        std::vector<double>& ask_delta_row,
+        std::vector<double>& delta_row,
+        const std::vector<double>* prev_delta_row,
         double q,
-        OptionalDeltaRow prev_delta = std::nullopt
+        Side side
     ) const {
         const std::size_t nz = tier.sizes_.size();
-        ask_delta_row.assign(nz, tier.delta_min);
+        delta_row.assign(nz, tier.delta_min);
 
         for (std::size_t j = 0; j < nz; ++j) {
             const double z = tier.sizes_[j];
-            auto [lower, upper] = mdp_ask_bounds_for_rung(tier, j, ask_delta_row, q, prev_delta);
-            repair_or_throw_bounds(lower, upper, tier.name, "ask");
 
-            const auto obj = [&](double d) {
-                return ask_trade_contribution(
-                    tier.flow_curve,
-                    tier.markout_model,
-                    h,
-                    config.spread,
-                    q,
-                    z,
-                    d
-                );
-            };
+            auto [lower, upper] = mdp_bounds_for_rung(
+                tier,
+                j,
+                delta_row,
+                prev_delta_row,
+                q,
+                side
+            );
 
-            ask_delta_row[j] = clamp(optimizer.maximize(obj, lower, upper), lower, upper);
+            delta_row[j] = optimize_mdp_rung(
+                tier,
+                h,
+                q,
+                z,
+                side,
+                lower,
+                upper
+            );
         }
     }
 
@@ -1448,25 +1462,34 @@ struct HJBLadderSolver {
         const std::size_t nq = grid_meta_.nq;
         const std::size_t q0_idx = grid_meta_.q0_idx;
 
-        build_mdp_bid_ladder(tier, h, tier.policy.bid[q0_idx], q_grid[q0_idx]);
+        build_mdp_ladder_row(
+            tier,
+            h,
+            tier.policy.bid[q0_idx],
+            nullptr,
+            q_grid[q0_idx],
+            Side::Bid
+        );
 
         for (std::size_t i = q0_idx + 1; i < nq; ++i) {
-            build_mdp_bid_ladder(
+            build_mdp_ladder_row(
                 tier,
                 h,
                 tier.policy.bid[i],
+                &tier.policy.bid[i - 1],
                 q_grid[i],
-                std::cref(tier.policy.bid[i - 1])
+                Side::Bid
             );
         }
 
         for (std::size_t i = q0_idx; i-- > 0;) {
-            build_mdp_bid_ladder(
+            build_mdp_ladder_row(
                 tier,
                 h,
                 tier.policy.bid[i],
+                &tier.policy.bid[i + 1],
                 q_grid[i],
-                std::cref(tier.policy.bid[i + 1])
+                Side::Bid
             );
         }
     }
@@ -1476,28 +1499,38 @@ struct HJBLadderSolver {
         const LinearInterpolator1D& h
     ) const {
         const auto& q_grid = config.q_grid;
+
         const std::size_t nq = grid_meta_.nq;
         const std::size_t q0_idx = grid_meta_.q0_idx;
 
-        build_mdp_ask_ladder(tier, h, tier.policy.ask[q0_idx], q_grid[q0_idx]);
+        build_mdp_ladder_row(
+            tier,
+            h,
+            tier.policy.ask[q0_idx],
+            nullptr,
+            q_grid[q0_idx],
+            Side::Ask
+        );
 
         for (std::size_t i = q0_idx + 1; i < nq; ++i) {
-            build_mdp_ask_ladder(
+            build_mdp_ladder_row(
                 tier,
                 h,
                 tier.policy.ask[i],
+                &tier.policy.ask[i - 1],
                 q_grid[i],
-                std::cref(tier.policy.ask[i - 1])
+                Side::Ask
             );
         }
 
         for (std::size_t i = q0_idx; i-- > 0;) {
-            build_mdp_ask_ladder(
+            build_mdp_ladder_row(
                 tier,
                 h,
                 tier.policy.ask[i],
+                &tier.policy.ask[i + 1],
                 q_grid[i],
-                std::cref(tier.policy.ask[i + 1])
+                Side::Ask
             );
         }
     }
@@ -1526,7 +1559,7 @@ struct HJBLadderSolver {
 
         const double d = clamp(tier.delta_profile(std::abs(q)), tier.delta_min, tier.delta_mid_cap());
         const double v = side == Side::Ask
-            ? ecn_ask_trade_contribution(
+            ? ecn_ask_trade_value(
                 tier.flow_curve,
                 tier.markout_model,
                 tier.adverse_selection_model,
@@ -1536,7 +1569,7 @@ struct HJBLadderSolver {
                 1.0,
                 d
             )
-            : ecn_bid_trade_contribution(
+            : ecn_bid_trade_value(
                 tier.flow_curve,
                 tier.markout_model,
                 tier.adverse_selection_model,
@@ -1577,7 +1610,6 @@ struct HJBLadderSolver {
         }
     }
 
-
     // --------------------------------------------------------
     // Dark-pool policy construction
     // --------------------------------------------------------
@@ -1596,17 +1628,17 @@ struct HJBLadderSolver {
 
         for (double u : venue.posted_sizes) {
             const double value = side == Side::Ask
-                ? dark_pool_ask_trade_contribution(
-                    venue.lambda_ask,
-                    venue.p_ask,
+                ? dark_pool_ask_trade_value(
+                    venue.arrival_lambda_ask,
+                    venue.size_lambda_ask,
                     venue.fee_per_unit_ask,
                     h,
                     q,
                     u
                 )
-                : dark_pool_bid_trade_contribution(
-                    venue.lambda_bid,
-                    venue.p_bid,
+                : dark_pool_bid_trade_value(
+                    venue.arrival_lambda_bid,
+                    venue.size_lambda_bid,
                     venue.fee_per_unit_bid,
                     h,
                     q,
@@ -1624,6 +1656,7 @@ struct HJBLadderSolver {
             out.posted_size = 0.0;
             out.contribution = 0.0;
         }
+
         return out;
     }
 
@@ -1675,7 +1708,7 @@ struct HJBLadderSolver {
 
         for (std::size_t j = 0; j < nz; ++j) {
             const double z = tier.sizes_[j];
-            total += bid_trade_contribution(
+            total += bid_trade_value(
                 tier.flow_curve,
                 tier.markout_model,
                 h,
@@ -1702,7 +1735,7 @@ struct HJBLadderSolver {
 
         for (std::size_t j = 0; j < nz; ++j) {
             const double z = tier.sizes_[j];
-            total += ask_trade_contribution(
+            total += ask_trade_value(
                 tier.flow_curve,
                 tier.markout_model,
                 h,
@@ -1723,7 +1756,7 @@ struct HJBLadderSolver {
         const LinearInterpolator1D& h
     ) const {
         if (q > 0.0 && tier.is_policy_active(q_index, Side::Ask)) {
-            return ecn_ask_trade_contribution(
+            return ecn_ask_trade_value(
                 tier.flow_curve,
                 tier.markout_model,
                 tier.adverse_selection_model,
@@ -1735,7 +1768,7 @@ struct HJBLadderSolver {
             );
         }
         if (q < 0.0 && tier.is_policy_active(q_index, Side::Bid)) {
-            return ecn_bid_trade_contribution(
+            return ecn_bid_trade_value(
                 tier.flow_curve,
                 tier.markout_model,
                 tier.adverse_selection_model,
@@ -1749,7 +1782,6 @@ struct HJBLadderSolver {
         return 0.0;
     }
 
-
     double dark_pool_bellman_contribution(
         const DarkPoolVenue& venue,
         double q,
@@ -1759,9 +1791,9 @@ struct HJBLadderSolver {
         double total = 0.0;
 
         if (venue.policy.is_active(q_index, Side::Bid)) {
-            total += dark_pool_bid_trade_contribution(
-                venue.lambda_bid,
-                venue.p_bid,
+            total += dark_pool_bid_trade_value(
+                venue.arrival_lambda_bid,
+                venue.size_lambda_bid,
                 venue.fee_per_unit_bid,
                 h,
                 q,
@@ -1770,9 +1802,9 @@ struct HJBLadderSolver {
         }
 
         if (venue.policy.is_active(q_index, Side::Ask)) {
-            total += dark_pool_ask_trade_contribution(
-                venue.lambda_ask,
-                venue.p_ask,
+            total += dark_pool_ask_trade_value(
+                venue.arrival_lambda_ask,
+                venue.size_lambda_ask,
                 venue.fee_per_unit_ask,
                 h,
                 q,
@@ -1796,6 +1828,7 @@ struct HJBLadderSolver {
         for (auto& tier : ecn_tiers) {
             build_ecn_policy(tier, h);
         }
+
         if (dark_pool.has_value()) {
             build_dark_pool_policy(*dark_pool, h);
         }

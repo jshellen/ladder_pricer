@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import numpy as np
 import pandas as pd
@@ -98,17 +99,19 @@ def validate_centered_q_grid(q_grid: np.ndarray) -> list[str]:
 # ============================================================
 
 DEFAULT_MDP_SIZES = "1, 2, 3, 5, 10, 20"
+
 DEFAULT_ECN_SETTINGS = {
     "ecn_toxicity": 0.0040,
     "ecn_fee": 0.0,
     "ecn_convergence_inventory": 10.0,
 }
+
 DEFAULT_DARK_POOL_SETTINGS = {
     "enabled": False,
-    "lambda_bid": 2.00,
-    "lambda_ask": 2.00,
-    "p_bid": 0.50,
-    "p_ask": 0.50,
+    "arrival_lambda_bid": 2.00,
+    "arrival_lambda_ask": 2.00,
+    "size_lambda_bid": 2.00,
+    "size_lambda_ask": 2.00,
     "fee_per_unit_bid": 0.0,
     "fee_per_unit_ask": 0.0,
     "posted_sizes": "1, 2, 3, 5",
@@ -186,10 +189,10 @@ class ECNTierSpec(CommonTierSpec):
 
 @dataclass
 class DarkPoolSpec:
-    lambda_bid: float
-    lambda_ask: float
-    p_bid: float
-    p_ask: float
+    arrival_lambda_bid: float
+    arrival_lambda_ask: float
+    size_lambda_bid: float
+    size_lambda_ask: float
     fee_per_unit_bid: float
     fee_per_unit_ask: float
     posted_sizes: list[float]
@@ -197,10 +200,10 @@ class DarkPoolSpec:
 
     def build_cpp_venue(self) -> lp.DarkPoolVenue:
         return lp.DarkPoolVenue(
-            lambda_bid=float(self.lambda_bid),
-            lambda_ask=float(self.lambda_ask),
-            p_bid=float(self.p_bid),
-            p_ask=float(self.p_ask),
+            arrival_lambda_bid=float(self.arrival_lambda_bid),
+            arrival_lambda_ask=float(self.arrival_lambda_ask),
+            size_lambda_bid=float(self.size_lambda_bid),
+            size_lambda_ask=float(self.size_lambda_ask),
             fee_per_unit_bid=float(self.fee_per_unit_bid),
             fee_per_unit_ask=float(self.fee_per_unit_ask),
             posted_sizes=[float(u) for u in self.posted_sizes],
@@ -245,6 +248,40 @@ def parse_integer_like_list(raw: str, field_name: str) -> list[float]:
         if abs(v - round(v)) > 1e-10:
             raise ValueError(f"{field_name} must contain integer-valued sizes only.")
     return vals
+
+
+def zero_truncated_poisson_mean(size_lambda: float) -> float:
+    if size_lambda <= 0.0:
+        return np.nan
+
+    positive_mass = 1.0 - math.exp(-size_lambda)
+    if positive_mass <= 0.0:
+        return np.nan
+
+    return size_lambda / positive_mass
+
+
+def zero_truncated_poisson_pmf(size_lambda: float, k_max: int) -> pd.DataFrame:
+    if size_lambda <= 0.0 or k_max < 1:
+        return pd.DataFrame(columns=["k", "probability"])
+
+    positive_mass = 1.0 - math.exp(-size_lambda)
+    if positive_mass <= 0.0:
+        return pd.DataFrame(columns=["k", "probability"])
+
+    rows = []
+    log_lambda = math.log(size_lambda)
+
+    for k in range(1, k_max + 1):
+        log_pk = -size_lambda + k * log_lambda - math.lgamma(k + 1)
+        rows.append(
+            {
+                "k": k,
+                "probability": math.exp(log_pk) / positive_mass,
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
 def default_tier_values(i: int) -> dict:
@@ -455,7 +492,9 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
                 key=f"ecn_convergence_inventory_{i}",
             )
             st.caption(
-                "ECN stays one-sided and passive. The quote follows a smooth built-in inventory profile: it starts at delta_min and reaches the passive mid cap exactly when |q| reaches the convergence inventory."
+                "ECN stays one-sided and passive. The quote follows a smooth built-in inventory profile: "
+                "it starts at delta_min and reaches the passive mid cap exactly when |q| reaches the "
+                "convergence inventory."
             )
 
         if not enabled:
@@ -479,6 +518,7 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
         if kind == "mdp":
             assert sizes is not None
             return MDPTierSpec(sizes=sizes, **common)
+
         return ECNTierSpec(
             ecn_toxicity=float(ecn_toxicity or 0.0),
             ecn_fee=float(ecn_fee or 0.0),
@@ -521,6 +561,7 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
 
 def build_dark_pool_spec_from_ui() -> DarkPoolSpec | None:
     defaults = DEFAULT_DARK_POOL_SETTINGS
+
     with st.sidebar.expander("Dark pool venue", expanded=True):
         enabled = st.checkbox("Enable dark pool", value=bool(defaults["enabled"]))
         if not enabled:
@@ -533,54 +574,58 @@ def build_dark_pool_spec_from_ui() -> DarkPoolSpec | None:
             help="If disabled, the dark pool only posts the inventory-reducing side.",
         )
 
+        st.markdown("**Opportunity arrival intensity**")
         c1, c2 = st.columns(2)
-        lambda_bid = c1.number_input(
-            "Dark pool λ bid",
-            value=float(defaults["lambda_bid"]),
+        arrival_lambda_bid = c1.number_input(
+            "Arrival λ bid",
+            value=float(defaults["arrival_lambda_bid"]),
             min_value=0.0,
             step=0.01,
             format="%.4f",
+            help="Poisson intensity of bid-side dark-pool opportunities.",
         )
-        lambda_ask = c2.number_input(
-            "Dark pool λ ask",
-            value=float(defaults["lambda_ask"]),
+        arrival_lambda_ask = c2.number_input(
+            "Arrival λ ask",
+            value=float(defaults["arrival_lambda_ask"]),
             min_value=0.0,
             step=0.01,
             format="%.4f",
+            help="Poisson intensity of ask-side dark-pool opportunities.",
         )
 
+        st.markdown("**Incoming size distribution**")
         c3, c4 = st.columns(2)
-        p_bid = c3.number_input(
-            "Geometric p bid",
-            value=float(defaults["p_bid"]),
+        size_lambda_bid = c3.number_input(
+            "Size λ bid",
+            value=float(defaults["size_lambda_bid"]),
             min_value=0.001,
-            max_value=1.0,
-            step=0.01,
+            step=0.05,
             format="%.4f",
+            help="Poisson lambda for incoming bid-side contra size, conditional on a dark-pool opportunity.",
         )
-        p_ask = c4.number_input(
-            "Geometric p ask",
-            value=float(defaults["p_ask"]),
+        size_lambda_ask = c4.number_input(
+            "Size λ ask",
+            value=float(defaults["size_lambda_ask"]),
             min_value=0.001,
-            max_value=1.0,
-            step=0.01,
+            step=0.05,
             format="%.4f",
+            help="Poisson lambda for incoming ask-side contra size, conditional on a dark-pool opportunity.",
         )
 
         c5, c6 = st.columns(2)
         fee_per_unit_bid = c5.number_input(
-            "Fee / rebate per unit bid",
+            "Fee per unit bid",
             value=float(defaults["fee_per_unit_bid"]),
+            min_value=0.0,
             step=0.001,
             format="%.5f",
-            help="Positive = fee, negative = rebate.",
         )
         fee_per_unit_ask = c6.number_input(
-            "Fee / rebate per unit ask",
+            "Fee per unit ask",
             value=float(defaults["fee_per_unit_ask"]),
+            min_value=0.0,
             step=0.001,
             format="%.5f",
-            help="Positive = fee, negative = rebate.",
         )
 
         posted_sizes_raw = st.text_input(
@@ -596,15 +641,16 @@ def build_dark_pool_spec_from_ui() -> DarkPoolSpec | None:
             raise ValueError("Dark pool posted sizes must be strictly increasing.")
 
         st.caption(
-            "Dark-pool fills occur at mid. Arrival intensity is constant. Incoming order size is geometric, "
-            "and the executed size is min(posted size, incoming size)."
+            "Dark-pool fills occur at mid. Opportunity arrivals are Poisson. "
+            "Conditional incoming size is zero-truncated Poisson, and executed size is "
+            "min(posted size, incoming size)."
         )
 
     return DarkPoolSpec(
-        lambda_bid=float(lambda_bid),
-        lambda_ask=float(lambda_ask),
-        p_bid=float(p_bid),
-        p_ask=float(p_ask),
+        arrival_lambda_bid=float(arrival_lambda_bid),
+        arrival_lambda_ask=float(arrival_lambda_ask),
+        size_lambda_bid=float(size_lambda_bid),
+        size_lambda_ask=float(size_lambda_ask),
         fee_per_unit_bid=float(fee_per_unit_bid),
         fee_per_unit_ask=float(fee_per_unit_ask),
         posted_sizes=posted_sizes,
@@ -739,7 +785,9 @@ def make_flow_parameter_table(spec: TierSpec, cpp_tier: CppTier) -> pd.DataFrame
             row |= {
                 "ecn_toxicity": float(cpp_tier.adverse_selection_model.ecn_toxicity),
                 "ecn_fee": float(cpp_tier.adverse_selection_model.ecn_fee),
-                "ecn_convergence_inventory": float(cpp_tier.adverse_selection_model.ecn_convergence_inventory),
+                "ecn_convergence_inventory": float(
+                    cpp_tier.adverse_selection_model.ecn_convergence_inventory
+                ),
             }
         rows.append(row)
     return pd.DataFrame(rows)
@@ -890,11 +938,11 @@ def make_ecn_cap_figure(cpp_tier: lp.ECNTier, spread: float) -> go.Figure:
     for q in q_grid:
         q_abs = abs(q)
         cap = float(cpp_tier.delta_cap(q_abs))
-        cap_pips = 10000.0 * spread * (cap - 0.5)
+        bid_cap_pips = 10000.0 * spread * (cap - 0.5)
         ask_cap_pips = 10000.0 * spread * (0.5 - cap)
 
         if q < 0.0:
-            bid_cap.append(cap_pips)
+            bid_cap.append(bid_cap_pips)
             bid_quote = masked_quote_summary(cpp_tier, q, 1.0, "bid", 1.0, spread)
             bid_actual.append(np.nan if bid_quote is None else float(bid_quote.quote_relative_to_mid_pips))
             ask_cap.append(np.nan)
@@ -949,6 +997,7 @@ def make_ecn_activity_figure(cpp_tier: lp.ECNTier) -> go.Figure:
 def make_ecn_cost_curve_figure(cpp_tier: lp.ECNTier) -> go.Figure:
     delta_grid = np.linspace(float(cpp_tier.delta_min), float(cpp_tier.delta_max), 220)
     z = 1.0
+
     base_mu = [float(cpp_tier.markout_model.expected_markout(z))] * len(delta_grid)
     tox_mu = [
         float(cpp_tier.adverse_selection_model.toxicity_cost(float(d), z))
@@ -974,39 +1023,16 @@ def make_ecn_cost_curve_figure(cpp_tier: lp.ECNTier) -> go.Figure:
     return fig
 
 
-def make_ecn_contribution_figure(
-    solver: lp.HJBLadderSolver,
-    cpp_tier: lp.ECNTier,
-    solution: lp.HJBSolution,
-) -> go.Figure:
-    q_grid = [float(q) for q in solution.q_grid]
-    vals = [
-        float(solver.ecn_bellman_contribution(cpp_tier, q, i, list(solution.h)))
-        for i, q in enumerate(q_grid)
-    ]
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=q_grid, y=vals, mode="lines+markers", name="ECN contribution"))
-    fig.add_hline(y=0.0)
-    fig.update_layout(
-        title="ECN Bellman contribution vs inventory",
-        xaxis_title="Inventory q",
-        yaxis_title="Contribution",
-        height=360,
-    )
-    return fig
-
-
 def make_dark_pool_parameter_table(venue: lp.DarkPoolVenue) -> pd.DataFrame:
     return pd.DataFrame(
         [
             {
-                "lambda_bid": float(venue.lambda_bid),
-                "lambda_ask": float(venue.lambda_ask),
-                "p_bid": float(venue.p_bid),
-                "p_ask": float(venue.p_ask),
-                "mean arrival size bid": round(1.0 / float(venue.p_bid), 4),
-                "mean arrival size ask": round(1.0 / float(venue.p_ask), 4),
+                "arrival_lambda_bid": float(venue.arrival_lambda_bid),
+                "arrival_lambda_ask": float(venue.arrival_lambda_ask),
+                "size_lambda_bid": float(venue.size_lambda_bid),
+                "size_lambda_ask": float(venue.size_lambda_ask),
+                "mean positive size bid": round(zero_truncated_poisson_mean(float(venue.size_lambda_bid)), 4),
+                "mean positive size ask": round(zero_truncated_poisson_mean(float(venue.size_lambda_ask)), 4),
                 "fee_per_unit_bid": float(venue.fee_per_unit_bid),
                 "fee_per_unit_ask": float(venue.fee_per_unit_ask),
                 "allow_both_sides": bool(venue.allow_both_sides),
@@ -1047,25 +1073,54 @@ def make_dark_pool_size_figure(venue: lp.DarkPoolVenue) -> go.Figure:
     return fig
 
 
-def make_dark_pool_contribution_figure(
-    solver: lp.HJBLadderSolver,
-    venue: lp.DarkPoolVenue,
-    solution: lp.HJBSolution,
-) -> go.Figure:
-    q_grid = [float(q) for q in solution.q_grid]
-    vals = [
-        float(solver.dark_pool_bellman_contribution(venue, q, i, list(solution.h)))
-        for i, q in enumerate(q_grid)
-    ]
+def make_dark_pool_size_distribution_figure(venue: lp.DarkPoolVenue) -> go.Figure:
+    max_posted_size = max(float(u) for u in venue.posted_sizes)
+    max_size_lambda = max(float(venue.size_lambda_bid), float(venue.size_lambda_ask))
+
+    k_max = int(
+        max(
+            max_posted_size,
+            math.ceil(max_size_lambda + 6.0 * math.sqrt(max_size_lambda)),
+            10,
+        )
+    )
+
+    bid_df = zero_truncated_poisson_pmf(float(venue.size_lambda_bid), k_max)
+    ask_df = zero_truncated_poisson_pmf(float(venue.size_lambda_ask), k_max)
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=q_grid, y=vals, mode="lines+markers", name="dark-pool contribution"))
-    fig.add_hline(y=0.0)
+
+    fig.add_trace(
+        go.Bar(
+            x=bid_df["k"],
+            y=bid_df["probability"],
+            name="bid incoming size",
+            opacity=0.75,
+        )
+    )
+    fig.add_trace(
+        go.Bar(
+            x=ask_df["k"],
+            y=ask_df["probability"],
+            name="ask incoming size",
+            opacity=0.75,
+        )
+    )
+
+    for u in venue.posted_sizes:
+        fig.add_vline(
+            x=float(u),
+            line_dash="dot",
+            annotation_text=f"posted {float(u):g}",
+            annotation_position="top",
+        )
+
     fig.update_layout(
-        title="Dark-pool Bellman contribution vs inventory",
-        xaxis_title="Inventory q",
-        yaxis_title="Contribution",
-        height=360,
+        title="Dark-pool incoming size distribution",
+        xaxis_title="Incoming size k",
+        yaxis_title="P(K = k | K ≥ 1)",
+        barmode="overlay",
+        height=420,
     )
     return fig
 
@@ -1100,7 +1155,8 @@ st.title("Trinity 2.0 Pricer")
 st.markdown(
     "MDP tiers use rung-by-rung two-sided ladder controls. "
     "ECN tiers are one-size hedge channels. "
-    "The dark pool trades at mid with fee or rebate, and the only control is posted size."
+    "The dark pool trades at mid with a posted-size control. "
+    "Dark-pool opportunity arrivals and incoming sizes are both Poisson-driven."
 )
 
 with st.sidebar:
@@ -1310,7 +1366,10 @@ if tab_names:
                 c3.metric("ECN fee", f"{float(cpp_tier.adverse_selection_model.ecn_fee):.5f}")
 
                 c4, c5, c6 = st.columns(3)
-                c4.metric("convergence inventory", f"{float(cpp_tier.adverse_selection_model.ecn_convergence_inventory):.3f}")
+                c4.metric(
+                    "convergence inventory",
+                    f"{float(cpp_tier.adverse_selection_model.ecn_convergence_inventory):.3f}",
+                )
                 c5.metric("delta_min", f"{float(cpp_tier.delta_min):.4f}")
                 c6.metric("mid cap", f"{float(cpp_tier.delta_mid_cap()):.4f}")
 
@@ -1321,10 +1380,8 @@ if tab_names:
 
             if is_ecn:
                 st.plotly_chart(make_ecn_cap_figure(cpp_tier, float(config.spread)), use_container_width=True)
-                with st.expander("ECN internals", expanded=False):
-                    st.plotly_chart(make_ecn_activity_figure(cpp_tier), use_container_width=True)
-                    st.plotly_chart(make_ecn_cost_curve_figure(cpp_tier), use_container_width=True)
-                    st.plotly_chart(make_ecn_contribution_figure(solver, cpp_tier, solution), use_container_width=True)
+                st.plotly_chart(make_ecn_activity_figure(cpp_tier), use_container_width=True)
+                st.plotly_chart(make_ecn_cost_curve_figure(cpp_tier), use_container_width=True)
             else:
                 st.plotly_chart(
                     make_quote_inventory_figure(cpp_tier, spec, float(config.spread), float(mid_price)),
@@ -1356,27 +1413,41 @@ if tab_names:
                 )
 
     if solution.dark_pool is not None:
-        dark_pool_tab = tabs[-1]
         venue = solution.dark_pool
-        with dark_pool_tab:
+        with tabs[-1]:
             st.subheader("Dark pool venue")
 
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("λ bid", f"{float(venue.lambda_bid):.4f}")
-            c2.metric("λ ask", f"{float(venue.lambda_ask):.4f}")
-            c3.metric("mean arrival size bid", f"{1.0 / float(venue.p_bid):.3f}")
-            c4.metric("mean arrival size ask", f"{1.0 / float(venue.p_ask):.3f}")
+            c1.metric("arrival λ bid", f"{float(venue.arrival_lambda_bid):.4f}")
+            c2.metric("arrival λ ask", f"{float(venue.arrival_lambda_ask):.4f}")
+            c3.metric("size λ bid", f"{float(venue.size_lambda_bid):.4f}")
+            c4.metric("size λ ask", f"{float(venue.size_lambda_ask):.4f}")
 
-            c5, c6, c7 = st.columns(3)
-            c5.metric("fee / rebate bid", f"{float(venue.fee_per_unit_bid):.5f}")
-            c6.metric("fee / rebate ask", f"{float(venue.fee_per_unit_ask):.5f}")
-            c7.metric("both sides allowed", "yes" if bool(venue.allow_both_sides) else "no")
+            c5, c6, c7, c8 = st.columns(4)
+            c5.metric("mean positive size bid", f"{zero_truncated_poisson_mean(float(venue.size_lambda_bid)):.3f}")
+            c6.metric("mean positive size ask", f"{zero_truncated_poisson_mean(float(venue.size_lambda_ask)):.3f}")
+            c7.metric("fee bid", f"{float(venue.fee_per_unit_bid):.5f}")
+            c8.metric("both sides allowed", "yes" if bool(venue.allow_both_sides) else "no")
+
+            c9, c10 = st.columns(2)
+            c9.metric("fee ask", f"{float(venue.fee_per_unit_ask):.5f}")
+            c10.metric("posted size candidates", ", ".join(f"{float(u):g}" for u in venue.posted_sizes))
 
             with st.expander("Dark-pool parameters", expanded=False):
                 st.dataframe(make_dark_pool_parameter_table(venue), use_container_width=True)
 
             st.plotly_chart(make_dark_pool_size_figure(venue), use_container_width=True)
-            st.plotly_chart(make_dark_pool_contribution_figure(solver, venue, solution), use_container_width=True)
+
+            with st.expander("Incoming size distribution", expanded=False):
+                st.caption(
+                    "The incoming dark-pool size is modeled as zero-truncated Poisson: "
+                    "K ~ Poisson(size_lambda) conditional on K ≥ 1. "
+                    "Executed size is min(posted size, K)."
+                )
+                st.plotly_chart(
+                    make_dark_pool_size_distribution_figure(venue),
+                    use_container_width=True,
+                )
 
 with st.expander("What this app is solving"):
     st.markdown(
@@ -1393,8 +1464,9 @@ ECN tiers are one-size hedge channels:
 Dark-pool venue:
 - execution price is the mid
 - there is no quote-price optimization
-- arrival intensity is constant
-- incoming order size is geometric
+- opportunity arrivals are controlled by `arrival_lambda_bid` and `arrival_lambda_ask`
+- conditional incoming order size is zero-truncated Poisson
+- the size distribution is controlled by `size_lambda_bid` and `size_lambda_ask`
 - if posted size is $u$ and incoming size is $Z$, then executed size is $\min(u, Z)$
 - the optimizer chooses posted bid size, ask size, or both depending on the venue mode
 

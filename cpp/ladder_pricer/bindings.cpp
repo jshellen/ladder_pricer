@@ -2,6 +2,7 @@
 #include <pybind11/stl.h>
 
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -43,13 +44,10 @@ inline void validate_h_vec_against_solver(
     }
 }
 
-inline OptionalDeltaRow make_optional_delta_row(
-    const std::optional<std::vector<double>>& prev_delta
+inline const std::vector<double>* optional_vector_ptr(
+    const std::optional<std::vector<double>>& v
 ) {
-    if (prev_delta) {
-        return std::cref(*prev_delta);
-    }
-    return std::nullopt;
+    return v ? &(*v) : nullptr;
 }
 
 } // namespace
@@ -273,7 +271,6 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("spread")
         );
 
-
     py::class_<DarkPoolPolicy>(m, "DarkPoolPolicy")
         .def(py::init<>())
         .def(py::init<std::vector<double>>(), py::arg("q_grid"))
@@ -302,7 +299,11 @@ PYBIND11_MODULE(ladder_pricer, m) {
         )
         .def(
             "set_posted_size",
-            [](DarkPoolPolicy& self, std::size_t q_index, const py::object& side, double size, bool active) {
+            [](DarkPoolPolicy& self,
+               std::size_t q_index,
+               const py::object& side,
+               double size,
+               bool active) {
                 self.set_posted_size(q_index, parse_side_object(side), size, active);
             },
             py::arg("q_index"),
@@ -496,7 +497,6 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("active")
         );
 
-
     py::class_<DarkPoolVenue>(m, "DarkPoolVenue")
         .def(py::init<>())
         .def(
@@ -510,19 +510,19 @@ PYBIND11_MODULE(ladder_pricer, m) {
                 std::vector<double>,
                 bool
             >(),
-            py::arg("lambda_bid"),
-            py::arg("lambda_ask"),
-            py::arg("p_bid"),
-            py::arg("p_ask"),
+            py::arg("arrival_lambda_bid"),
+            py::arg("arrival_lambda_ask"),
+            py::arg("size_lambda_bid"),
+            py::arg("size_lambda_ask"),
             py::arg("fee_per_unit_bid"),
             py::arg("fee_per_unit_ask"),
             py::arg("posted_sizes"),
             py::arg("allow_both_sides") = false
         )
-        .def_readwrite("lambda_bid", &DarkPoolVenue::lambda_bid)
-        .def_readwrite("lambda_ask", &DarkPoolVenue::lambda_ask)
-        .def_readwrite("p_bid", &DarkPoolVenue::p_bid)
-        .def_readwrite("p_ask", &DarkPoolVenue::p_ask)
+        .def_readwrite("arrival_lambda_bid", &DarkPoolVenue::arrival_lambda_bid)
+        .def_readwrite("arrival_lambda_ask", &DarkPoolVenue::arrival_lambda_ask)
+        .def_readwrite("size_lambda_bid", &DarkPoolVenue::size_lambda_bid)
+        .def_readwrite("size_lambda_ask", &DarkPoolVenue::size_lambda_ask)
         .def_readwrite("fee_per_unit_bid", &DarkPoolVenue::fee_per_unit_bid)
         .def_readwrite("fee_per_unit_ask", &DarkPoolVenue::fee_per_unit_ask)
         .def_readwrite("posted_sizes", &DarkPoolVenue::posted_sizes)
@@ -530,7 +530,12 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("policy", &DarkPoolVenue::policy)
         .def("validate", &DarkPoolVenue::validate)
         .def("reset_policy_shape", &DarkPoolVenue::reset_policy_shape, py::arg("q_grid"))
-        .def_static("is_integer_like", &DarkPoolVenue::is_integer_like, py::arg("x"), py::arg("tol") = 1e-10)
+        .def_static(
+            "is_integer_like",
+            &DarkPoolVenue::is_integer_like,
+            py::arg("x"),
+            py::arg("tol") = 1e-10
+        )
         .def(
             "is_admissible",
             [](const DarkPoolVenue& self, double q, const py::object& side, double tol) {
@@ -599,27 +604,24 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("optimizer", &HJBLadderSolver::optimizer)
         .def_readwrite("grid_meta_", &HJBLadderSolver::grid_meta_)
         .def_static(
-            "validate_mdp_bounds_request",
-            [](std::size_t rung_idx,
-               const std::vector<double>& current_delta,
-               const std::optional<std::vector<double>>& prev_delta) {
-                HJBLadderSolver::validate_mdp_bounds_request(
-                    rung_idx,
-                    current_delta,
-                    make_optional_delta_row(prev_delta)
-                );
+            "side_name",
+            [](const py::object& side) {
+                return std::string(HJBLadderSolver::side_name(parse_side_object(side)));
             },
-            py::arg("rung_idx"),
-            py::arg("current_delta"),
-            py::arg("prev_delta") = std::nullopt
+            py::arg("side")
         )
         .def_static(
             "repair_or_throw_bounds",
             [](double lower,
                double upper,
                const std::string& tier_name,
-               const char* side_name) {
-                HJBLadderSolver::repair_or_throw_bounds(lower, upper, tier_name, side_name);
+               const std::string& side_name) {
+                HJBLadderSolver::repair_or_throw_bounds(
+                    lower,
+                    upper,
+                    tier_name,
+                    side_name.c_str()
+                );
                 return std::make_pair(lower, upper);
             },
             py::arg("lower"),
@@ -631,26 +633,52 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def("initialize_policy_shapes", &HJBLadderSolver::initialize_policy_shapes)
         .def("prepare_solve_context", &HJBLadderSolver::prepare_solve_context)
         .def(
-            "mdp_bid_bounds_for_rung",
+            "mdp_bounds_for_rung",
             [](const HJBLadderSolver& self,
                const MDPTier& tier,
                std::size_t rung_idx,
                const std::vector<double>& current_delta,
                double q,
-               const std::optional<std::vector<double>>& prev_delta) {
-                return self.mdp_bid_bounds_for_rung(
+               const py::object& side,
+               const std::optional<std::vector<double>>& prev_delta_row) {
+                return self.mdp_bounds_for_rung(
                     tier,
                     rung_idx,
                     current_delta,
+                    optional_vector_ptr(prev_delta_row),
                     q,
-                    make_optional_delta_row(prev_delta)
+                    parse_side_object(side)
                 );
             },
             py::arg("tier"),
             py::arg("rung_idx"),
             py::arg("current_delta"),
             py::arg("q"),
-            py::arg("prev_delta") = std::nullopt
+            py::arg("side"),
+            py::arg("prev_delta_row") = std::nullopt
+        )
+        .def(
+            "mdp_bid_bounds_for_rung",
+            [](const HJBLadderSolver& self,
+               const MDPTier& tier,
+               std::size_t rung_idx,
+               const std::vector<double>& current_delta,
+               double q,
+               const std::optional<std::vector<double>>& prev_delta_row) {
+                return self.mdp_bounds_for_rung(
+                    tier,
+                    rung_idx,
+                    current_delta,
+                    optional_vector_ptr(prev_delta_row),
+                    q,
+                    Side::Bid
+                );
+            },
+            py::arg("tier"),
+            py::arg("rung_idx"),
+            py::arg("current_delta"),
+            py::arg("q"),
+            py::arg("prev_delta_row") = std::nullopt
         )
         .def(
             "mdp_ask_bounds_for_rung",
@@ -659,20 +687,100 @@ PYBIND11_MODULE(ladder_pricer, m) {
                std::size_t rung_idx,
                const std::vector<double>& current_delta,
                double q,
-               const std::optional<std::vector<double>>& prev_delta) {
-                return self.mdp_ask_bounds_for_rung(
+               const std::optional<std::vector<double>>& prev_delta_row) {
+                return self.mdp_bounds_for_rung(
                     tier,
                     rung_idx,
                     current_delta,
+                    optional_vector_ptr(prev_delta_row),
                     q,
-                    make_optional_delta_row(prev_delta)
+                    Side::Ask
                 );
             },
             py::arg("tier"),
             py::arg("rung_idx"),
             py::arg("current_delta"),
             py::arg("q"),
-            py::arg("prev_delta") = std::nullopt
+            py::arg("prev_delta_row") = std::nullopt
+        )
+        .def(
+            "optimize_mdp_rung",
+            [](const HJBLadderSolver& self,
+               const MDPTier& tier,
+               const std::vector<double>& h_vec,
+               double q,
+               double z,
+               const py::object& side,
+               double lower,
+               double upper) {
+                validate_h_vec_against_solver(self, h_vec, "optimize_mdp_rung");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+                return self.optimize_mdp_rung(
+                    tier,
+                    h,
+                    q,
+                    z,
+                    parse_side_object(side),
+                    lower,
+                    upper
+                );
+            },
+            py::arg("tier"),
+            py::arg("h_vec"),
+            py::arg("q"),
+            py::arg("z"),
+            py::arg("side"),
+            py::arg("lower"),
+            py::arg("upper")
+        )
+        .def(
+            "build_mdp_ladder_row",
+            [](const HJBLadderSolver& self,
+               const MDPTier& tier,
+               const std::vector<double>& h_vec,
+               double q,
+               const py::object& side,
+               const std::optional<std::vector<double>>& prev_delta_row) {
+                validate_h_vec_against_solver(self, h_vec, "build_mdp_ladder_row");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+
+                std::vector<double> delta_row;
+                self.build_mdp_ladder_row(
+                    tier,
+                    h,
+                    delta_row,
+                    optional_vector_ptr(prev_delta_row),
+                    q,
+                    parse_side_object(side)
+                );
+
+                return delta_row;
+            },
+            py::arg("tier"),
+            py::arg("h_vec"),
+            py::arg("q"),
+            py::arg("side"),
+            py::arg("prev_delta_row") = std::nullopt
+        )
+        .def(
+            "build_mdp_bid_policy",
+            [](const HJBLadderSolver& self, MDPTier& tier, const std::vector<double>& h_vec) {
+                validate_h_vec_against_solver(self, h_vec, "build_mdp_bid_policy");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+                self.build_mdp_bid_policy(tier, h);
+            },
+            py::arg("tier"),
+            py::arg("h_vec")
+        )
+        .def(
+            "build_mdp_ask_policy",
+            [](const HJBLadderSolver& self, MDPTier& tier, const std::vector<double>& h_vec) {
+                validate_h_vec_against_solver(self, h_vec, "build_mdp_ask_policy");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+                self.build_mdp_ask_policy(tier, h);
+            },
+            py::arg("tier"),
+            py::arg("h_vec")
         )
         .def(
             "optimize_ecn_quote_for_state",
@@ -707,6 +815,40 @@ PYBIND11_MODULE(ladder_pricer, m) {
                 self.build_ecn_policy(tier, h);
             },
             py::arg("tier"),
+            py::arg("h_vec")
+        )
+        .def(
+            "optimize_dark_pool_size_for_state",
+            [](const HJBLadderSolver& self,
+               const DarkPoolVenue& venue,
+               const std::vector<double>& h_vec,
+               double q,
+               const py::object& side) {
+                validate_h_vec_against_solver(self, h_vec, "optimize_dark_pool_size_for_state");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+                return self.optimize_dark_pool_size_for_state(
+                    venue,
+                    h,
+                    q,
+                    parse_side_object(side)
+                );
+            },
+            py::arg("venue"),
+            py::arg("h_vec"),
+            py::arg("q"),
+            py::arg("side")
+        )
+        .def("clear_dark_pool_policy", &HJBLadderSolver::clear_dark_pool_policy, py::arg("venue"))
+        .def(
+            "build_dark_pool_policy",
+            [](const HJBLadderSolver& self,
+               DarkPoolVenue& venue,
+               const std::vector<double>& h_vec) {
+                validate_h_vec_against_solver(self, h_vec, "build_dark_pool_policy");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+                self.build_dark_pool_policy(venue, h);
+            },
+            py::arg("venue"),
             py::arg("h_vec")
         )
         .def(
@@ -757,39 +899,6 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("q_index"),
             py::arg("h_vec")
         )
-
-        .def(
-            "optimize_dark_pool_size_for_state",
-            [](const HJBLadderSolver& self,
-               const DarkPoolVenue& venue,
-               const std::vector<double>& h_vec,
-               double q,
-               const py::object& side) {
-                validate_h_vec_against_solver(self, h_vec, "optimize_dark_pool_size_for_state");
-                const LinearInterpolator1D h{self.config.q_grid, h_vec};
-                return self.optimize_dark_pool_size_for_state(
-                    venue,
-                    h,
-                    q,
-                    parse_side_object(side)
-                );
-            },
-            py::arg("venue"),
-            py::arg("h_vec"),
-            py::arg("q"),
-            py::arg("side")
-        )
-        .def("clear_dark_pool_policy", &HJBLadderSolver::clear_dark_pool_policy, py::arg("venue"))
-        .def(
-            "build_dark_pool_policy",
-            [](const HJBLadderSolver& self, DarkPoolVenue& venue, const std::vector<double>& h_vec) {
-                validate_h_vec_against_solver(self, h_vec, "build_dark_pool_policy");
-                const LinearInterpolator1D h{self.config.q_grid, h_vec};
-                self.build_dark_pool_policy(venue, h);
-            },
-            py::arg("venue"),
-            py::arg("h_vec")
-        )
         .def(
             "dark_pool_bellman_contribution",
             [](const HJBLadderSolver& self,
@@ -806,7 +915,6 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("q_index"),
             py::arg("h_vec")
         )
-
         .def(
             "update_policies",
             [](HJBLadderSolver& self, const std::vector<double>& h_vec) {
