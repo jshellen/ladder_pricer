@@ -55,10 +55,18 @@ inline const std::vector<double>* optional_vector_ptr(
 PYBIND11_MODULE(ladder_pricer, m) {
     m.doc() = "Pybind11 bindings for hjb ladder solver";
 
+    // ============================================================
+    // Enum
+    // ============================================================
+
     py::enum_<Side>(m, "Side")
         .value("Bid", Side::Bid)
         .value("Ask", Side::Ask)
         .export_values();
+
+    // ============================================================
+    // Concrete model components
+    // ============================================================
 
     py::class_<LogisticFlowCurve>(m, "LogisticFlowCurve")
         .def(py::init<>())
@@ -117,6 +125,20 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("z")
         );
 
+    py::class_<ECNPassiveImpactModel>(m, "ECNPassiveImpactModel")
+        .def(py::init<>())
+        .def(
+            py::init<bool, double, double>(),
+            py::arg("enabled"),
+            py::arg("eta"),
+            py::arg("pressure_scale")
+        )
+        .def_readwrite("enabled", &ECNPassiveImpactModel::enabled)
+        .def_readwrite("eta", &ECNPassiveImpactModel::eta)
+        .def_readwrite("pressure_scale", &ECNPassiveImpactModel::pressure_scale)
+        .def("validate", &ECNPassiveImpactModel::validate)
+        .def("drift", &ECNPassiveImpactModel::drift, py::arg("net_ecn_pressure"));
+
     py::class_<PolynomialInventoryPenalty>(m, "PolynomialInventoryPenalty")
         .def(py::init<>())
         .def(
@@ -134,6 +156,10 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("tau2", &PolynomialInventoryPenalty::tau2)
         .def("value", &PolynomialInventoryPenalty::value, py::arg("q"));
 
+    // ============================================================
+    // Decisions
+    // ============================================================
+
     py::class_<ECNQuoteDecision>(m, "ECNQuoteDecision")
         .def(py::init<>())
         .def_readwrite("delta", &ECNQuoteDecision::delta)
@@ -145,6 +171,10 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("posted_size", &DarkPoolSizeDecision::posted_size)
         .def_readwrite("contribution", &DarkPoolSizeDecision::contribution)
         .def_readwrite("active", &DarkPoolSizeDecision::active);
+
+    // ============================================================
+    // Quote analytics
+    // ============================================================
 
     py::class_<QuoteSummary>(m, "QuoteSummary")
         .def(py::init<>())
@@ -165,7 +195,12 @@ PYBIND11_MODULE(ladder_pricer, m) {
 
     py::class_<QuoteMetrics>(m, "QuoteMetrics")
         .def(py::init<>())
-        .def_readonly_static("pips_per_unit", &QuoteMetrics::pips_per_unit)
+        .def_property_readonly_static(
+            "pips_per_unit",
+            [](py::object) {
+                return QuoteMetrics::pips_per_unit;
+            }
+        )
         .def_static(
             "price_improvement",
             &QuoteMetrics::price_improvement,
@@ -185,14 +220,26 @@ PYBIND11_MODULE(ladder_pricer, m) {
         )
         .def_static(
             "quote_relative_to_mid",
-            &QuoteMetrics::quote_relative_to_mid,
+            [](double delta, const py::object& side, double spread) {
+                return QuoteMetrics::quote_relative_to_mid(
+                    delta,
+                    parse_side_object(side),
+                    spread
+                );
+            },
             py::arg("delta"),
             py::arg("side"),
             py::arg("spread")
         )
         .def_static(
             "quote_relative_to_mid_pips",
-            &QuoteMetrics::quote_relative_to_mid_pips,
+            [](double delta, const py::object& side, double spread) {
+                return QuoteMetrics::quote_relative_to_mid_pips(
+                    delta,
+                    parse_side_object(side),
+                    spread
+                );
+            },
             py::arg("delta"),
             py::arg("side"),
             py::arg("spread")
@@ -218,7 +265,14 @@ PYBIND11_MODULE(ladder_pricer, m) {
         )
         .def_static(
             "quote_price",
-            &QuoteMetrics::quote_price,
+            [](double mid, double delta, const py::object& side, double spread) {
+                return QuoteMetrics::quote_price(
+                    mid,
+                    delta,
+                    parse_side_object(side),
+                    spread
+                );
+            },
             py::arg("mid"),
             py::arg("delta"),
             py::arg("side"),
@@ -226,13 +280,29 @@ PYBIND11_MODULE(ladder_pricer, m) {
         )
         .def_static(
             "make_summary",
-            &QuoteMetrics::make_summary,
+            [](double delta,
+               double delta_ref,
+               const py::object& side,
+               double mid,
+               double spread) {
+                return QuoteMetrics::make_summary(
+                    delta,
+                    delta_ref,
+                    parse_side_object(side),
+                    mid,
+                    spread
+                );
+            },
             py::arg("delta"),
             py::arg("delta_ref"),
             py::arg("side"),
             py::arg("mid"),
             py::arg("spread")
         );
+
+    // ============================================================
+    // Policies
+    // ============================================================
 
     py::class_<QuotePolicy>(m, "QuotePolicy")
         .def(py::init<>())
@@ -259,11 +329,39 @@ PYBIND11_MODULE(ladder_pricer, m) {
         )
         .def("reset_shape", &QuotePolicy::reset_shape, py::arg("q_grid"), py::arg("sizes"))
         .def("validate", &QuotePolicy::validate)
-        .def("delta", &QuotePolicy::delta, py::arg("q"), py::arg("z"), py::arg("side"))
-        .def("reference_delta", &QuotePolicy::reference_delta, py::arg("q"), py::arg("side"))
+        .def(
+            "delta",
+            [](const QuotePolicy& self, double q, double z, const py::object& side) {
+                return self.delta(q, z, parse_side_object(side));
+            },
+            py::arg("q"),
+            py::arg("z"),
+            py::arg("side")
+        )
+        .def(
+            "reference_delta",
+            [](const QuotePolicy& self, double q, const py::object& side) {
+                return self.reference_delta(q, parse_side_object(side));
+            },
+            py::arg("q"),
+            py::arg("side")
+        )
         .def(
             "quote_summary",
-            &QuotePolicy::quote_summary,
+            [](const QuotePolicy& self,
+               double q,
+               double z,
+               const py::object& side,
+               double mid,
+               double spread) {
+                return self.quote_summary(
+                    q,
+                    z,
+                    parse_side_object(side),
+                    mid,
+                    spread
+                );
+            },
             py::arg("q"),
             py::arg("z"),
             py::arg("side"),
@@ -304,13 +402,22 @@ PYBIND11_MODULE(ladder_pricer, m) {
                const py::object& side,
                double size,
                bool active) {
-                self.set_posted_size(q_index, parse_side_object(side), size, active);
+                self.set_posted_size(
+                    q_index,
+                    parse_side_object(side),
+                    size,
+                    active
+                );
             },
             py::arg("q_index"),
             py::arg("side"),
             py::arg("size"),
             py::arg("active")
         );
+
+    // ============================================================
+    // Solver config and metadata
+    // ============================================================
 
     py::class_<SolverConfig>(m, "SolverConfig")
         .def(py::init<>())
@@ -346,6 +453,10 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("tol", &GoldenSectionSearch::tol)
         .def_readwrite("max_iter", &GoldenSectionSearch::max_iter)
         .def("validate", &GoldenSectionSearch::validate);
+
+    // ============================================================
+    // Tier hierarchy
+    // ============================================================
 
     py::class_<Tier>(m, "Tier")
         .def_readwrite("name", &Tier::name)
@@ -412,7 +523,13 @@ PYBIND11_MODULE(ladder_pricer, m) {
                const py::object& side,
                double mid,
                double spread) {
-                return self.quote_summary(q, z, parse_side_object(side), mid, spread);
+                return self.quote_summary(
+                    q,
+                    z,
+                    parse_side_object(side),
+                    mid,
+                    spread
+                );
             },
             py::arg("q"),
             py::arg("z"),
@@ -448,6 +565,7 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def(
             py::init<
                 std::string,
+                std::vector<double>,
                 LogisticFlowCurve,
                 SqrtMarkoutModel,
                 double,
@@ -455,47 +573,17 @@ PYBIND11_MODULE(ladder_pricer, m) {
                 ECNAdverseSelectionModel
             >(),
             py::arg("name"),
+            py::arg("sizes"),
             py::arg("flow_curve"),
             py::arg("markout_model"),
             py::arg("delta_min") = -5.0,
             py::arg("delta_max") = 5.0,
             py::arg("adverse_selection_model") = ECNAdverseSelectionModel{}
         )
+        .def_readwrite("sizes_", &ECNTier::sizes_)
         .def_readwrite("delta_min", &ECNTier::delta_min)
         .def_readwrite("delta_max", &ECNTier::delta_max)
-        .def_readwrite("adverse_selection_model", &ECNTier::adverse_selection_model)
-        .def_readwrite("bid_active", &ECNTier::bid_active)
-        .def_readwrite("ask_active", &ECNTier::ask_active)
-        .def("delta_mid_cap", &ECNTier::delta_mid_cap)
-        .def("delta_profile", &ECNTier::delta_profile, py::arg("q_abs"))
-        .def("delta_cap", &ECNTier::delta_cap, py::arg("q_abs"))
-        .def("reset_activity_shape", &ECNTier::reset_activity_shape, py::arg("nq"))
-        .def_static(
-            "is_active_side",
-            [](double q, const py::object& side, double tol) {
-                return ECNTier::is_active_side(q, parse_side_object(side), tol);
-            },
-            py::arg("q"),
-            py::arg("side"),
-            py::arg("tol") = 1e-12
-        )
-        .def(
-            "is_policy_active",
-            [](const ECNTier& self, std::size_t q_index, const py::object& side) {
-                return self.is_policy_active(q_index, parse_side_object(side));
-            },
-            py::arg("q_index"),
-            py::arg("side")
-        )
-        .def(
-            "set_policy_active",
-            [](ECNTier& self, std::size_t q_index, const py::object& side, bool active) {
-                self.set_policy_active(q_index, parse_side_object(side), active);
-            },
-            py::arg("q_index"),
-            py::arg("side"),
-            py::arg("active")
-        );
+        .def_readwrite("adverse_selection_model", &ECNTier::adverse_selection_model);
 
     py::class_<DarkPoolVenue>(m, "DarkPoolVenue")
         .def(py::init<>())
@@ -546,6 +634,10 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("tol") = 1e-12
         );
 
+    // ============================================================
+    // Diagnostics and solution
+    // ============================================================
+
     py::class_<SolverDiagnostics>(m, "SolverDiagnostics")
         .def(py::init<>())
         .def(py::init<int>(), py::arg("n_iter"))
@@ -579,7 +671,12 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("mdp_tiers", &HJBSolution::mdp_tiers)
         .def_readwrite("ecn_tiers", &HJBSolution::ecn_tiers)
         .def_readwrite("dark_pool", &HJBSolution::dark_pool)
+        .def_readwrite("ecn_passive_impact", &HJBSolution::ecn_passive_impact)
         .def_readwrite("diagnostics", &HJBSolution::diagnostics);
+
+    // ============================================================
+    // Solver
+    // ============================================================
 
     py::class_<HJBLadderSolver>(m, "HJBLadderSolver")
         .def(
@@ -588,21 +685,25 @@ PYBIND11_MODULE(ladder_pricer, m) {
                 PolynomialInventoryPenalty,
                 std::vector<MDPTier>,
                 std::vector<ECNTier>,
-                std::optional<DarkPoolVenue>
+                std::optional<DarkPoolVenue>,
+                ECNPassiveImpactModel
             >(),
             py::arg("config"),
             py::arg("penalty"),
             py::arg("mdp_tiers") = std::vector<MDPTier>{},
             py::arg("ecn_tiers") = std::vector<ECNTier>{},
-            py::arg("dark_pool") = std::nullopt
+            py::arg("dark_pool") = std::nullopt,
+            py::arg("ecn_passive_impact") = ECNPassiveImpactModel{}
         )
         .def_readwrite("config", &HJBLadderSolver::config)
         .def_readwrite("penalty", &HJBLadderSolver::penalty)
         .def_readwrite("mdp_tiers", &HJBLadderSolver::mdp_tiers)
         .def_readwrite("ecn_tiers", &HJBLadderSolver::ecn_tiers)
         .def_readwrite("dark_pool", &HJBLadderSolver::dark_pool)
+        .def_readwrite("ecn_passive_impact", &HJBLadderSolver::ecn_passive_impact)
         .def_readwrite("optimizer", &HJBLadderSolver::optimizer)
         .def_readwrite("grid_meta_", &HJBLadderSolver::grid_meta_)
+
         .def_static(
             "side_name",
             [](const py::object& side) {
@@ -629,9 +730,51 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("tier_name"),
             py::arg("side_name")
         )
+
         .def("validate_problem_definition", &HJBLadderSolver::validate_problem_definition)
         .def("initialize_policy_shapes", &HJBLadderSolver::initialize_policy_shapes)
         .def("prepare_solve_context", &HJBLadderSolver::prepare_solve_context)
+
+        // --------------------------------------------------------
+        // Generic ladder bounds
+        // --------------------------------------------------------
+
+        .def(
+            "ladder_bounds_for_rung",
+            [](const HJBLadderSolver& self,
+               const std::string& tier_name,
+               double delta_min,
+               double delta_max,
+               std::size_t rung_idx,
+               const std::vector<double>& current_delta,
+               double q,
+               const py::object& side,
+               const std::optional<std::vector<double>>& prev_delta_row) {
+                return self.ladder_bounds_for_rung(
+                    tier_name,
+                    delta_min,
+                    delta_max,
+                    rung_idx,
+                    current_delta,
+                    optional_vector_ptr(prev_delta_row),
+                    q,
+                    parse_side_object(side)
+                );
+            },
+            py::arg("tier_name"),
+            py::arg("delta_min"),
+            py::arg("delta_max"),
+            py::arg("rung_idx"),
+            py::arg("current_delta"),
+            py::arg("q"),
+            py::arg("side"),
+            py::arg("prev_delta_row") = std::nullopt
+        )
+
+        // --------------------------------------------------------
+        // MDP helpers
+        // --------------------------------------------------------
+
         .def(
             "mdp_bounds_for_rung",
             [](const HJBLadderSolver& self,
@@ -782,12 +925,133 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("tier"),
             py::arg("h_vec")
         )
+
+        // --------------------------------------------------------
+        // ECN helpers
+        // --------------------------------------------------------
+
+        .def(
+            "ecn_bounds_for_rung",
+            [](const HJBLadderSolver& self,
+               const ECNTier& tier,
+               std::size_t rung_idx,
+               const std::vector<double>& current_delta,
+               double q,
+               const py::object& side,
+               const std::optional<std::vector<double>>& prev_delta_row) {
+                return self.ecn_bounds_for_rung(
+                    tier,
+                    rung_idx,
+                    current_delta,
+                    optional_vector_ptr(prev_delta_row),
+                    q,
+                    parse_side_object(side)
+                );
+            },
+            py::arg("tier"),
+            py::arg("rung_idx"),
+            py::arg("current_delta"),
+            py::arg("q"),
+            py::arg("side"),
+            py::arg("prev_delta_row") = std::nullopt
+        )
+        .def(
+            "ecn_candidate_net_pressure",
+            [](const HJBLadderSolver& self,
+               const ECNTier& tier,
+               double delta,
+               double z,
+               const py::object& side) {
+                return self.ecn_candidate_net_pressure(
+                    tier,
+                    delta,
+                    z,
+                    parse_side_object(side)
+                );
+            },
+            py::arg("tier"),
+            py::arg("delta"),
+            py::arg("z"),
+            py::arg("side")
+        )
+        .def(
+            "ecn_candidate_passive_impact_drift",
+            [](const HJBLadderSolver& self,
+               const ECNTier& tier,
+               double delta,
+               double z,
+               const py::object& side) {
+                return self.ecn_candidate_passive_impact_drift(
+                    tier,
+                    delta,
+                    z,
+                    parse_side_object(side)
+                );
+            },
+            py::arg("tier"),
+            py::arg("delta"),
+            py::arg("z"),
+            py::arg("side")
+        )
+        .def(
+            "ecn_candidate_passive_impact_value",
+            [](const HJBLadderSolver& self,
+               const ECNTier& tier,
+               double q,
+               double delta,
+               double z,
+               const py::object& side) {
+                return self.ecn_candidate_passive_impact_value(
+                    tier,
+                    q,
+                    delta,
+                    z,
+                    parse_side_object(side)
+                );
+            },
+            py::arg("tier"),
+            py::arg("q"),
+            py::arg("delta"),
+            py::arg("z"),
+            py::arg("side")
+        )
+        .def(
+            "optimize_ecn_rung",
+            [](const HJBLadderSolver& self,
+               const ECNTier& tier,
+               const std::vector<double>& h_vec,
+               double q,
+               double z,
+               const py::object& side,
+               double lower,
+               double upper) {
+                validate_h_vec_against_solver(self, h_vec, "optimize_ecn_rung");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+                return self.optimize_ecn_rung(
+                    tier,
+                    h,
+                    q,
+                    z,
+                    parse_side_object(side),
+                    lower,
+                    upper
+                );
+            },
+            py::arg("tier"),
+            py::arg("h_vec"),
+            py::arg("q"),
+            py::arg("z"),
+            py::arg("side"),
+            py::arg("lower"),
+            py::arg("upper")
+        )
         .def(
             "optimize_ecn_quote_for_state",
             [](const HJBLadderSolver& self,
                const ECNTier& tier,
                const std::vector<double>& h_vec,
                double q,
+               double z,
                const py::object& side,
                const std::optional<double>& lower_bound) {
                 validate_h_vec_against_solver(self, h_vec, "optimize_ecn_quote_for_state");
@@ -796,6 +1060,7 @@ PYBIND11_MODULE(ladder_pricer, m) {
                     tier,
                     h,
                     q,
+                    z,
                     parse_side_object(side),
                     lower_bound
                 );
@@ -803,8 +1068,58 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("tier"),
             py::arg("h_vec"),
             py::arg("q"),
+            py::arg("z"),
             py::arg("side"),
             py::arg("lower_bound") = std::nullopt
+        )
+        .def(
+            "build_ecn_ladder_row",
+            [](const HJBLadderSolver& self,
+               const ECNTier& tier,
+               const std::vector<double>& h_vec,
+               double q,
+               const py::object& side,
+               const std::optional<std::vector<double>>& prev_delta_row) {
+                validate_h_vec_against_solver(self, h_vec, "build_ecn_ladder_row");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+
+                std::vector<double> delta_row;
+                self.build_ecn_ladder_row(
+                    tier,
+                    h,
+                    delta_row,
+                    optional_vector_ptr(prev_delta_row),
+                    q,
+                    parse_side_object(side)
+                );
+
+                return delta_row;
+            },
+            py::arg("tier"),
+            py::arg("h_vec"),
+            py::arg("q"),
+            py::arg("side"),
+            py::arg("prev_delta_row") = std::nullopt
+        )
+        .def(
+            "build_ecn_bid_policy",
+            [](const HJBLadderSolver& self, ECNTier& tier, const std::vector<double>& h_vec) {
+                validate_h_vec_against_solver(self, h_vec, "build_ecn_bid_policy");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+                self.build_ecn_bid_policy(tier, h);
+            },
+            py::arg("tier"),
+            py::arg("h_vec")
+        )
+        .def(
+            "build_ecn_ask_policy",
+            [](const HJBLadderSolver& self, ECNTier& tier, const std::vector<double>& h_vec) {
+                validate_h_vec_against_solver(self, h_vec, "build_ecn_ask_policy");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+                self.build_ecn_ask_policy(tier, h);
+            },
+            py::arg("tier"),
+            py::arg("h_vec")
         )
         .def("clear_ecn_policy", &HJBLadderSolver::clear_ecn_policy, py::arg("tier"))
         .def(
@@ -817,6 +1132,73 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("tier"),
             py::arg("h_vec")
         )
+        .def(
+            "ecn_fill_value",
+            [](const HJBLadderSolver& self,
+               const ECNTier& tier,
+               const std::vector<double>& h_vec,
+               double q,
+               const py::object& side,
+               double delta,
+               double z) {
+                validate_h_vec_against_solver(self, h_vec, "ecn_fill_value");
+                return self.ecn_fill_value(
+                    tier,
+                    h_vec,
+                    q,
+                    parse_side_object(side),
+                    delta,
+                    z
+                );
+            },
+            py::arg("tier"),
+            py::arg("h_vec"),
+            py::arg("q"),
+            py::arg("side"),
+            py::arg("delta"),
+            py::arg("z")
+        )
+        .def(
+            "ecn_total_candidate_value",
+            [](const HJBLadderSolver& self,
+               const ECNTier& tier,
+               const std::vector<double>& h_vec,
+               double q,
+               const py::object& side,
+               double delta,
+               double z) {
+                validate_h_vec_against_solver(self, h_vec, "ecn_total_candidate_value");
+                return self.ecn_total_candidate_value(
+                    tier,
+                    h_vec,
+                    q,
+                    parse_side_object(side),
+                    delta,
+                    z
+                );
+            },
+            py::arg("tier"),
+            py::arg("h_vec"),
+            py::arg("q"),
+            py::arg("side"),
+            py::arg("delta"),
+            py::arg("z")
+        )
+        .def(
+            "ecn_pressure_at_state",
+            &HJBLadderSolver::ecn_pressure_at_state,
+            py::arg("q_index")
+        )
+        .def(
+            "ecn_passive_impact_drift",
+            &HJBLadderSolver::ecn_passive_impact_drift,
+            py::arg("q_index")
+        )
+
+        // --------------------------------------------------------
+        // Dark-pool helpers
+        // --------------------------------------------------------
+
         .def(
             "optimize_dark_pool_size_for_state",
             [](const HJBLadderSolver& self,
@@ -851,6 +1233,11 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("venue"),
             py::arg("h_vec")
         )
+
+        // --------------------------------------------------------
+        // Bellman contributions
+        // --------------------------------------------------------
+
         .def(
             "mdp_bid_bellman_contribution",
             [](const HJBLadderSolver& self,
@@ -877,6 +1264,38 @@ PYBIND11_MODULE(ladder_pricer, m) {
                 validate_h_vec_against_solver(self, h_vec, "mdp_ask_bellman_contribution");
                 const LinearInterpolator1D h{self.config.q_grid, h_vec};
                 return self.mdp_ask_bellman_contribution(tier, q, q_index, h);
+            },
+            py::arg("tier"),
+            py::arg("q"),
+            py::arg("q_index"),
+            py::arg("h_vec")
+        )
+        .def(
+            "ecn_bid_bellman_contribution",
+            [](const HJBLadderSolver& self,
+               const ECNTier& tier,
+               double q,
+               std::size_t q_index,
+               const std::vector<double>& h_vec) {
+                validate_h_vec_against_solver(self, h_vec, "ecn_bid_bellman_contribution");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+                return self.ecn_bid_bellman_contribution(tier, q, q_index, h);
+            },
+            py::arg("tier"),
+            py::arg("q"),
+            py::arg("q_index"),
+            py::arg("h_vec")
+        )
+        .def(
+            "ecn_ask_bellman_contribution",
+            [](const HJBLadderSolver& self,
+               const ECNTier& tier,
+               double q,
+               std::size_t q_index,
+               const std::vector<double>& h_vec) {
+                validate_h_vec_against_solver(self, h_vec, "ecn_ask_bellman_contribution");
+                const LinearInterpolator1D h{self.config.q_grid, h_vec};
+                return self.ecn_ask_bellman_contribution(tier, q, q_index, h);
             },
             py::arg("tier"),
             py::arg("q"),
@@ -915,6 +1334,11 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("q_index"),
             py::arg("h_vec")
         )
+
+        // --------------------------------------------------------
+        // Solver steps
+        // --------------------------------------------------------
+
         .def(
             "update_policies",
             [](HJBLadderSolver& self, const std::vector<double>& h_vec) {

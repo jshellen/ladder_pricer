@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -95,15 +96,22 @@ def validate_centered_q_grid(q_grid: np.ndarray) -> list[str]:
 
 
 # ============================================================
-# Specifications
+# Defaults
 # ============================================================
 
 DEFAULT_MDP_SIZES = "1, 2, 3, 5, 10, 20"
+DEFAULT_ECN_SIZES = "1"
 
 DEFAULT_ECN_SETTINGS = {
     "ecn_toxicity": 0.0040,
     "ecn_fee": 0.0,
     "ecn_convergence_inventory": 10.0,
+}
+
+DEFAULT_ECN_PASSIVE_IMPACT_SETTINGS = {
+    "enabled": False,
+    "eta": 0.0,
+    "pressure_scale": 1.0,
 }
 
 DEFAULT_DARK_POOL_SETTINGS = {
@@ -119,10 +127,15 @@ DEFAULT_DARK_POOL_SETTINGS = {
 }
 
 
+# ============================================================
+# Specifications
+# ============================================================
+
 @dataclass
 class CommonTierSpec:
     enabled: bool
     name: str
+    sizes: list[float]
     flow_A0: float
     flow_theta: float
     flow_steepness: float
@@ -133,7 +146,7 @@ class CommonTierSpec:
     delta_min: float
     delta_max: float
 
-    def build_models(self) -> tuple[lp.LogisticFlowCurve, lp.SqrtMarkoutModel]:
+    def build_models(self) -> tuple[Any, Any]:
         flow = lp.LogisticFlowCurve(
             A0=float(self.flow_A0),
             theta=float(self.flow_theta),
@@ -150,9 +163,7 @@ class CommonTierSpec:
 
 @dataclass
 class MDPTierSpec(CommonTierSpec):
-    sizes: list[float]
-
-    def build_cpp_tier(self) -> lp.MDPTier:
+    def build_cpp_tier(self) -> Any:
         flow, markout = self.build_models()
         return lp.MDPTier(
             name=self.name,
@@ -170,7 +181,7 @@ class ECNTierSpec(CommonTierSpec):
     ecn_fee: float
     ecn_convergence_inventory: float
 
-    def build_cpp_tier(self) -> lp.ECNTier:
+    def build_cpp_tier(self) -> Any:
         flow, markout = self.build_models()
         adverse_selection = lp.ECNAdverseSelectionModel(
             ecn_toxicity=float(self.ecn_toxicity),
@@ -179,6 +190,7 @@ class ECNTierSpec(CommonTierSpec):
         )
         return lp.ECNTier(
             name=self.name,
+            sizes=[float(z) for z in self.sizes],
             flow_curve=flow,
             markout_model=markout,
             delta_min=float(self.delta_min),
@@ -198,7 +210,7 @@ class DarkPoolSpec:
     posted_sizes: list[float]
     allow_both_sides: bool
 
-    def build_cpp_venue(self) -> lp.DarkPoolVenue:
+    def build_cpp_venue(self) -> Any:
         return lp.DarkPoolVenue(
             arrival_lambda_bid=float(self.arrival_lambda_bid),
             arrival_lambda_ask=float(self.arrival_lambda_ask),
@@ -211,16 +223,33 @@ class DarkPoolSpec:
         )
 
 
-TierSpec = MDPTierSpec | ECNTierSpec
-CppTier = lp.MDPTier | lp.ECNTier
+@dataclass
+class ECNPassiveImpactSpec:
+    enabled: bool
+    eta: float
+    pressure_scale: float
 
+    def build_cpp_model(self) -> Any:
+        return lp.ECNPassiveImpactModel(
+            enabled=bool(self.enabled),
+            eta=float(self.eta),
+            pressure_scale=float(self.pressure_scale),
+        )
+
+
+TierSpec = MDPTierSpec | ECNTierSpec
+
+
+# ============================================================
+# Parsing / validation helpers
+# ============================================================
 
 def tier_kind_label(spec: TierSpec) -> str:
     return "ECN" if isinstance(spec, ECNTierSpec) else "MDP"
 
 
 def tier_sizes(spec: TierSpec) -> list[float]:
-    return [1.0] if isinstance(spec, ECNTierSpec) else spec.sizes
+    return [float(z) for z in spec.sizes]
 
 
 def parse_float_list(raw: str, field_name: str) -> list[float]:
@@ -248,6 +277,13 @@ def parse_integer_like_list(raw: str, field_name: str) -> list[float]:
         if abs(v - round(v)) > 1e-10:
             raise ValueError(f"{field_name} must contain integer-valued sizes only.")
     return vals
+
+
+def validate_positive_strictly_increasing(vals: list[float], field_name: str) -> None:
+    if any(v <= 0.0 for v in vals):
+        raise ValueError(f"{field_name}: all values must be positive.")
+    if any(vals[k] >= vals[k + 1] for k in range(len(vals) - 1)):
+        raise ValueError(f"{field_name}: values must be strictly increasing.")
 
 
 def zero_truncated_poisson_mean(size_lambda: float) -> float:
@@ -284,13 +320,17 @@ def zero_truncated_poisson_pmf(size_lambda: float, k_max: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# ============================================================
+# UI specs
+# ============================================================
+
 def default_tier_values(i: int) -> dict:
     presets = [
         {
             "enabled": True,
             "kind": "mdp",
             "name": "Tier 1",
-            "sizes": "1, 2, 3, 5, 10, 20",
+            "sizes": DEFAULT_MDP_SIZES,
             "flow_A0": 1.00,
             "flow_theta": 0.0,
             "flow_steepness": 10.00,
@@ -305,7 +345,7 @@ def default_tier_values(i: int) -> dict:
             "enabled": True,
             "kind": "mdp",
             "name": "Tier 2",
-            "sizes": "1, 2, 3, 5, 10, 20",
+            "sizes": DEFAULT_MDP_SIZES,
             "flow_A0": 1.0,
             "flow_theta": 0.0,
             "flow_steepness": 10.0,
@@ -320,6 +360,7 @@ def default_tier_values(i: int) -> dict:
             "enabled": False,
             "kind": "ecn",
             "name": "ecn",
+            "sizes": DEFAULT_ECN_SIZES,
             "flow_A0": 0.70,
             "flow_theta": 0.10,
             "flow_steepness": 12.0,
@@ -372,20 +413,17 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
             key=f"kind_{i}",
         )
 
-        sizes: list[float] | None = None
-        if kind == "mdp":
-            sizes_raw = st.text_input(
-                f"Sizes {i + 1}",
-                value=defaults.get("sizes", DEFAULT_MDP_SIZES),
-                key=f"sizes_{i}",
-            )
-            if enabled:
-                sizes = parse_float_list(sizes_raw, f"sizes for tier {i + 1}")
-            else:
-                sizes = try_parse_float_list(sizes_raw) or [1.0]
+        sizes_raw = st.text_input(
+            f"Sizes {i + 1}",
+            value=defaults.get("sizes", DEFAULT_MDP_SIZES if kind == "mdp" else DEFAULT_ECN_SIZES),
+            key=f"sizes_{i}",
+            help="ECN now uses the same ladder-style size vector as MDP, according to the current bindings.",
+        )
+
+        if enabled:
+            sizes = parse_float_list(sizes_raw, f"sizes for tier {i + 1}")
         else:
-            st.text_input(f"Sizes {i + 1}", value="1", key=f"sizes_{i}", disabled=True)
-            st.caption("ECN quoted size is fixed to z = 1.")
+            sizes = try_parse_float_list(sizes_raw) or [1.0]
 
         st.markdown("**Flow curve parameters**")
         c1, c2 = st.columns(2)
@@ -468,6 +506,7 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
                 key: float(defaults.get(key, DEFAULT_ECN_SETTINGS[key]))
                 for key in DEFAULT_ECN_SETTINGS
             }
+
             st.markdown("**ECN controls**")
             c9, c10 = st.columns(2)
             ecn_toxicity = c9.number_input(
@@ -485,16 +524,16 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
                 key=f"ecn_fee_{i}",
             )
             ecn_convergence_inventory = st.number_input(
-                f"ECN convergence inventory {i + 1}",
+                f"ECN inventory scale {i + 1}",
                 value=ecn_defaults["ecn_convergence_inventory"],
                 step=0.25,
                 format="%.4f",
                 key=f"ecn_convergence_inventory_{i}",
             )
+
             st.caption(
-                "ECN stays one-sided and passive. The quote follows a smooth built-in inventory profile: "
-                "it starts at delta_min and reaches the passive mid cap exactly when |q| reaches the "
-                "convergence inventory."
+                "ECN now uses the same ladder-shape policy interface as MDP, with ECN-specific "
+                "adverse-selection costs and optional passive market impact."
             )
 
         if not enabled:
@@ -503,6 +542,7 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
     common = dict(
         enabled=bool(enabled),
         name=name,
+        sizes=[float(z) for z in sizes],
         flow_A0=float(flow_A0),
         flow_theta=float(flow_theta),
         flow_steepness=float(flow_steepness),
@@ -516,8 +556,7 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
 
     if not enabled:
         if kind == "mdp":
-            assert sizes is not None
-            return MDPTierSpec(sizes=sizes, **common)
+            return MDPTierSpec(**common)
 
         return ECNTierSpec(
             ecn_toxicity=float(ecn_toxicity or 0.0),
@@ -533,29 +572,67 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
     if tier_delta_max <= tier_delta_min:
         raise ValueError(f"Tier {i + 1}: delta_max must be greater than delta_min.")
 
-    if kind == "mdp":
-        assert sizes is not None
-        if any(z <= 0.0 for z in sizes):
-            raise ValueError(f"Tier {i + 1}: all sizes must be positive.")
-        if any(sizes[k] >= sizes[k + 1] for k in range(len(sizes) - 1)):
-            raise ValueError(f"Tier {i + 1}: sizes must be strictly increasing.")
-        return MDPTierSpec(sizes=sizes, **common)
+    validate_positive_strictly_increasing(sizes, f"Tier {i + 1} sizes")
 
-    assert ecn_toxicity is not None and ecn_fee is not None and ecn_convergence_inventory is not None
+    if kind == "mdp":
+        return MDPTierSpec(**common)
+
+    assert ecn_toxicity is not None
+    assert ecn_fee is not None
+    assert ecn_convergence_inventory is not None
+
     if ecn_toxicity < 0.0:
         raise ValueError(f"Tier {i + 1}: ECN toxicity must be nonnegative.")
     if ecn_fee < 0.0:
         raise ValueError(f"Tier {i + 1}: ECN fee must be nonnegative.")
     if ecn_convergence_inventory <= 0.0:
-        raise ValueError(f"Tier {i + 1}: ECN convergence inventory must be positive.")
-    if tier_delta_min >= min(tier_delta_max, 0.5):
-        raise ValueError(f"Tier {i + 1}: ECN delta_min must be below min(delta_max, 0.5).")
+        raise ValueError(f"Tier {i + 1}: ECN inventory scale must be positive.")
 
     return ECNTierSpec(
         ecn_toxicity=float(ecn_toxicity),
         ecn_fee=float(ecn_fee),
         ecn_convergence_inventory=float(ecn_convergence_inventory),
         **common,
+    )
+
+
+def build_ecn_passive_impact_spec_from_ui() -> ECNPassiveImpactSpec:
+    defaults = DEFAULT_ECN_PASSIVE_IMPACT_SETTINGS
+
+    with st.sidebar.expander("ECN passive market impact", expanded=False):
+        enabled = st.checkbox(
+            "Enable ECN passive impact",
+            value=bool(defaults["enabled"]),
+            help="Only active ECN quotes create passive market pressure. MDP tiers and dark pool are excluded.",
+        )
+
+        eta = st.number_input(
+            "Impact drift cap η",
+            value=float(defaults["eta"]),
+            min_value=0.0,
+            step=0.0001,
+            format="%.6f",
+            help="Maximum absolute passive drift contribution from ECN pressure.",
+        )
+
+        pressure_scale = st.number_input(
+            "Pressure scale",
+            value=float(defaults["pressure_scale"]),
+            min_value=1e-8,
+            step=0.10,
+            format="%.6f",
+            help="Net ECN pressure scale used in η * tanh(net_pressure / pressure_scale).",
+        )
+
+        st.caption(
+            "Passive impact drift is η · tanh((ECN bid pressure − ECN ask pressure) / pressure_scale). "
+            "This drift is caused only by ECN quotes. MDP customer tiers and dark pool are excluded."
+        )
+
+    return ECNPassiveImpactSpec(
+        enabled=bool(enabled),
+        eta=float(eta),
+        pressure_scale=float(pressure_scale),
     )
 
 
@@ -635,10 +712,7 @@ def build_dark_pool_spec_from_ui() -> DarkPoolSpec | None:
         )
         posted_sizes = parse_integer_like_list(posted_sizes_raw, "dark-pool posted sizes")
 
-        if any(u <= 0.0 for u in posted_sizes):
-            raise ValueError("Dark pool posted sizes must be positive.")
-        if any(posted_sizes[k] >= posted_sizes[k + 1] for k in range(len(posted_sizes) - 1)):
-            raise ValueError("Dark pool posted sizes must be strictly increasing.")
+        validate_positive_strictly_increasing(posted_sizes, "Dark-pool posted sizes")
 
         st.caption(
             "Dark-pool fills occur at mid. Opportunity arrivals are Poisson. "
@@ -675,7 +749,7 @@ def build_solver_config(
     tol_rhs: float,
     min_iter: int,
     consecutive_passes_required: int,
-) -> lp.SolverConfig:
+) -> Any:
     config = lp.SolverConfig()
     config.q_grid = [float(q) for q in q_grid]
     config.dt = float(dt)
@@ -692,9 +766,9 @@ def build_solver_config(
     return config
 
 
-def build_cpp_tiers(specs: list[TierSpec]) -> tuple[list[lp.MDPTier], list[lp.ECNTier]]:
-    mdp_tiers: list[lp.MDPTier] = []
-    ecn_tiers: list[lp.ECNTier] = []
+def build_cpp_tiers(specs: list[TierSpec]) -> tuple[list[Any], list[Any]]:
+    mdp_tiers: list[Any] = []
+    ecn_tiers: list[Any] = []
 
     for spec in specs:
         if not spec.enabled:
@@ -709,17 +783,17 @@ def build_cpp_tiers(specs: list[TierSpec]) -> tuple[list[lp.MDPTier], list[lp.EC
     return mdp_tiers, ecn_tiers
 
 
-def ordered_solution_tiers(specs: list[TierSpec], solution: lp.HJBSolution) -> list[CppTier]:
+def ordered_solution_tiers(specs: list[TierSpec], solution: Any) -> list[Any]:
     mdp_iter = iter(solution.mdp_tiers)
     ecn_iter = iter(solution.ecn_tiers)
 
-    out: list[CppTier] = []
+    out: list[Any] = []
     for spec in specs:
         out.append(next(ecn_iter) if isinstance(spec, ECNTierSpec) else next(mdp_iter))
     return out
 
 
-def total_venue_count(solution: lp.HJBSolution) -> int:
+def total_venue_count(solution: Any) -> int:
     return len(solution.mdp_tiers) + len(solution.ecn_tiers) + (0 if solution.dark_pool is None else 1)
 
 
@@ -730,45 +804,42 @@ def q_index_for_policy_qgrid(q_grid: list[float] | np.ndarray, q: float) -> int:
     return int(np.argmin(np.abs(q_arr - float(q))))
 
 
-def q_index_for_tier_policy(cpp_tier: CppTier, q: float) -> int:
+def q_index_for_tier_policy(cpp_tier: Any, q: float) -> int:
     return q_index_for_policy_qgrid(cpp_tier.policy.q_grid, q)
 
 
-def is_admissible(cpp_tier: CppTier, q: float, z: float, side: str) -> bool:
+def is_admissible(cpp_tier: Any, q: float, z: float, side: str) -> bool:
     return bool(cpp_tier.is_admissible(float(q), float(z), side))
 
 
-def is_policy_active(cpp_tier: CppTier, q: float, side: str) -> bool:
-    if not isinstance(cpp_tier, lp.ECNTier):
-        return True
-    idx = q_index_for_tier_policy(cpp_tier, q)
-    return bool(cpp_tier.is_policy_active(idx, side))
+def is_active(cpp_tier: Any, q: float, z: float, side: str) -> bool:
+    # Current bindings no longer expose ECNTier::is_policy_active.
+    # Activity is therefore represented by admissibility.
+    return is_admissible(cpp_tier, q, z, side)
 
 
 def masked_quote_summary(
-    cpp_tier: CppTier,
+    cpp_tier: Any,
     q: float,
     z: float,
     side: str,
     mid_price: float,
     spread: float,
 ):
-    if not is_admissible(cpp_tier, q, z, side):
-        return None
-    if isinstance(cpp_tier, lp.ECNTier) and not is_policy_active(cpp_tier, q, side):
+    if not is_active(cpp_tier, q, z, side):
         return None
     return cpp_tier.quote_summary(float(q), float(z), side, float(mid_price), float(spread))
 
 
-def is_ecn_tier(cpp_tier: CppTier) -> bool:
+def is_ecn_tier(cpp_tier: Any) -> bool:
     return isinstance(cpp_tier, lp.ECNTier)
 
 
 # ============================================================
-# Plots and tables
+# Tables and figures
 # ============================================================
 
-def make_flow_parameter_table(spec: TierSpec, cpp_tier: CppTier) -> pd.DataFrame:
+def make_flow_parameter_table(spec: TierSpec, cpp_tier: Any) -> pd.DataFrame:
     rows = []
     for z in tier_sizes(spec):
         zf = float(z)
@@ -781,11 +852,11 @@ def make_flow_parameter_table(spec: TierSpec, cpp_tier: CppTier) -> pd.DataFrame
             "steepness": spec.flow_steepness,
             "base_mu(z)": cpp_tier.expected_markout(zf),
         }
-        if isinstance(spec, ECNTierSpec) and is_ecn_tier(cpp_tier):
+        if isinstance(spec, ECNTierSpec):
             row |= {
                 "ecn_toxicity": float(cpp_tier.adverse_selection_model.ecn_toxicity),
                 "ecn_fee": float(cpp_tier.adverse_selection_model.ecn_fee),
-                "ecn_convergence_inventory": float(
+                "ecn_inventory_scale": float(
                     cpp_tier.adverse_selection_model.ecn_convergence_inventory
                 ),
             }
@@ -793,7 +864,7 @@ def make_flow_parameter_table(spec: TierSpec, cpp_tier: CppTier) -> pd.DataFrame
     return pd.DataFrame(rows)
 
 
-def make_flow_curve_figure(cpp_tier: CppTier, spec: TierSpec) -> go.Figure:
+def make_flow_curve_figure(cpp_tier: Any, spec: TierSpec) -> go.Figure:
     grid = np.linspace(-1.0, 1.0, 160)
     fig = go.Figure()
 
@@ -811,8 +882,88 @@ def make_flow_curve_figure(cpp_tier: CppTier, spec: TierSpec) -> go.Figure:
     return fig
 
 
+def make_delta_implied_flow_table(cpp_tier: Any, spec: TierSpec) -> pd.DataFrame:
+    rows = []
+    q_grid = [float(q) for q in cpp_tier.policy.q_grid]
+    sizes = [float(z) for z in tier_sizes(spec)]
+
+    for i, q in enumerate(q_grid):
+        for j, z in enumerate(sizes):
+            for side in ["bid", "ask"]:
+                admissible = is_admissible(cpp_tier, q, z, side)
+                active = is_active(cpp_tier, q, z, side)
+
+                delta = float(cpp_tier.policy.bid[i][j]) if side == "bid" else float(cpp_tier.policy.ask[i][j])
+
+                if active:
+                    a_z = float(cpp_tier.A(z))
+                    hit_ratio = float(cpp_tier.hit_ratio(delta, z))
+                    arrival_rate = float(cpp_tier.arrival_rate(delta, z))
+                    pressure = z * arrival_rate
+                else:
+                    delta = np.nan
+                    a_z = np.nan
+                    hit_ratio = np.nan
+                    arrival_rate = np.nan
+                    pressure = np.nan
+
+                rows.append(
+                    {
+                        "type": tier_kind_label(spec),
+                        "q": q,
+                        "z": z,
+                        "side": side,
+                        "admissible": admissible,
+                        "active": active,
+                        "delta": delta,
+                        "A(z)": a_z,
+                        "hit_ratio": hit_ratio,
+                        "arrival_rate": arrival_rate,
+                        "size_weighted_pressure": pressure,
+                    }
+                )
+
+    return pd.DataFrame(rows)
+
+
+def make_delta_implied_flow_figure(cpp_tier: Any, spec: TierSpec) -> go.Figure:
+    df = make_delta_implied_flow_table(cpp_tier, spec)
+    fig = go.Figure()
+
+    for z in tier_sizes(spec):
+        zf = float(z)
+        bid_df = df[(df["z"] == zf) & (df["side"] == "bid")]
+        ask_df = df[(df["z"] == zf) & (df["side"] == "ask")]
+
+        fig.add_trace(
+            go.Scatter(
+                x=bid_df["q"],
+                y=bid_df["arrival_rate"],
+                mode="lines",
+                name=f"{zf:g} bid λ(δ*)",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=ask_df["q"],
+                y=ask_df["arrival_rate"],
+                mode="lines",
+                line=dict(dash="dash"),
+                name=f"{zf:g} ask λ(δ*)",
+            )
+        )
+
+    fig.update_layout(
+        title=f"Delta-implied flow rates — {spec.name} ({tier_kind_label(spec)})",
+        xaxis_title="Inventory q",
+        yaxis_title="Arrival rate λ(δ*(q, z), z)",
+        height=500,
+    )
+    return fig
+
+
 def make_quote_inventory_figure(
-    cpp_tier: CppTier,
+    cpp_tier: Any,
     spec: TierSpec,
     spread: float,
     mid_price: float,
@@ -854,7 +1005,7 @@ def make_quote_inventory_figure(
 
 
 def make_ladder_figure(
-    cpp_tier: CppTier,
+    cpp_tier: Any,
     spec: TierSpec,
     q: float,
     spread: float,
@@ -884,14 +1035,14 @@ def make_ladder_figure(
     fig.update_layout(
         title=f"Volume premium — {spec.name} ({tier_kind_label(spec)}) at q = {q:g}",
         xaxis_title="Trade size z",
-        yaxis_title="Premium vs 1M quote (pips)",
+        yaxis_title="Premium vs first-rung quote (pips)",
         height=500,
     )
     return fig
 
 
 def make_q_ladder_table(
-    cpp_tier: CppTier,
+    cpp_tier: Any,
     spec: TierSpec,
     q: float,
     spread: float,
@@ -903,8 +1054,8 @@ def make_q_ladder_table(
         zf = float(z)
         bid_adm = is_admissible(cpp_tier, q, zf, "bid")
         ask_adm = is_admissible(cpp_tier, q, zf, "ask")
-        bid_active = bid_adm and is_policy_active(cpp_tier, q, "bid")
-        ask_active = ask_adm and is_policy_active(cpp_tier, q, "ask")
+        bid_active = is_active(cpp_tier, q, zf, "bid")
+        ask_active = is_active(cpp_tier, q, zf, "ask")
 
         bid = masked_quote_summary(cpp_tier, q, zf, "bid", mid_price, spread)
         ask = masked_quote_summary(cpp_tier, q, zf, "ask", mid_price, spread)
@@ -931,91 +1082,29 @@ def make_q_ladder_table(
     return pd.DataFrame(rows)
 
 
-def make_ecn_cap_figure(cpp_tier: lp.ECNTier, spread: float) -> go.Figure:
-    q_grid = [float(q) for q in cpp_tier.policy.q_grid]
-    bid_cap, ask_cap, bid_actual, ask_actual = [], [], [], []
-
-    for q in q_grid:
-        q_abs = abs(q)
-        cap = float(cpp_tier.delta_cap(q_abs))
-        bid_cap_pips = 10000.0 * spread * (cap - 0.5)
-        ask_cap_pips = 10000.0 * spread * (0.5 - cap)
-
-        if q < 0.0:
-            bid_cap.append(bid_cap_pips)
-            bid_quote = masked_quote_summary(cpp_tier, q, 1.0, "bid", 1.0, spread)
-            bid_actual.append(np.nan if bid_quote is None else float(bid_quote.quote_relative_to_mid_pips))
-            ask_cap.append(np.nan)
-            ask_actual.append(np.nan)
-        elif q > 0.0:
-            ask_cap.append(ask_cap_pips)
-            ask_quote = masked_quote_summary(cpp_tier, q, 1.0, "ask", 1.0, spread)
-            ask_actual.append(np.nan if ask_quote is None else float(ask_quote.quote_relative_to_mid_pips))
-            bid_cap.append(np.nan)
-            bid_actual.append(np.nan)
-        else:
-            bid_cap.append(np.nan)
-            ask_cap.append(np.nan)
-            bid_actual.append(np.nan)
-            ask_actual.append(np.nan)
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=q_grid, y=bid_cap, mode="lines", line=dict(dash="dot"), name="Bid profile"))
-    fig.add_trace(go.Scatter(x=q_grid, y=ask_cap, mode="lines", line=dict(dash="dot"), name="Ask profile"))
-    fig.add_trace(go.Scatter(x=q_grid, y=bid_actual, mode="lines+markers", name="Bid quote"))
-    fig.add_trace(go.Scatter(x=q_grid, y=ask_actual, mode="lines+markers", name="Ask quote"))
-    fig.add_hline(y=0.0)
-    fig.update_layout(
-        title="ECN profile and quote vs inventory",
-        xaxis_title="Inventory q",
-        yaxis_title="Quote relative to mid (pips)",
-        height=480,
-    )
-    return fig
-
-
-def make_ecn_activity_figure(cpp_tier: lp.ECNTier) -> go.Figure:
-    q_grid = [float(q) for q in cpp_tier.policy.q_grid]
-    bid_active = [1.0 if cpp_tier.is_policy_active(i, "bid") else 0.0 for i in range(len(q_grid))]
-    ask_active = [1.0 if cpp_tier.is_policy_active(i, "ask") else 0.0 for i in range(len(q_grid))]
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=q_grid, y=bid_active, mode="lines", name="bid active"))
-    fig.add_trace(
-        go.Scatter(x=q_grid, y=ask_active, mode="lines", line=dict(dash="dash"), name="ask active")
-    )
-    fig.update_layout(
-        title="ECN activation map",
-        xaxis_title="Inventory q",
-        yaxis_title="Active (1=yes, 0=no)",
-        height=320,
-        yaxis=dict(range=[-0.05, 1.05]),
-    )
-    return fig
-
-
-def make_ecn_cost_curve_figure(cpp_tier: lp.ECNTier) -> go.Figure:
+def make_ecn_cost_curve_figure(cpp_tier: Any, spec: ECNTierSpec) -> go.Figure:
     delta_grid = np.linspace(float(cpp_tier.delta_min), float(cpp_tier.delta_max), 220)
-    z = 1.0
-
-    base_mu = [float(cpp_tier.markout_model.expected_markout(z))] * len(delta_grid)
-    tox_mu = [
-        float(cpp_tier.adverse_selection_model.toxicity_cost(float(d), z))
-        for d in delta_grid
-    ]
-    total_cost = [
-        float(cpp_tier.adverse_selection_model.expected_cost(cpp_tier.markout_model, float(d), z))
-        for d in delta_grid
-    ]
-
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=delta_grid, y=base_mu, mode="lines", name="base markout"))
-    fig.add_trace(go.Scatter(x=delta_grid, y=tox_mu, mode="lines", name="toxicity cost"))
-    fig.add_trace(
-        go.Scatter(x=delta_grid, y=total_cost, mode="lines", line=dict(dash="dash"), name="total cost")
-    )
+
+    for z in tier_sizes(spec):
+        zf = float(z)
+
+        total_cost = [
+            float(cpp_tier.adverse_selection_model.expected_cost(cpp_tier.markout_model, float(d), zf))
+            for d in delta_grid
+        ]
+
+        fig.add_trace(
+            go.Scatter(
+                x=delta_grid,
+                y=total_cost,
+                mode="lines",
+                name=f"total cost z={zf:g}",
+            )
+        )
+
     fig.update_layout(
-        title="ECN cost components vs delta (z = 1)",
+        title="ECN total cost vs delta",
         xaxis_title="delta",
         yaxis_title="Cost per fill",
         height=360,
@@ -1023,7 +1112,180 @@ def make_ecn_cost_curve_figure(cpp_tier: lp.ECNTier) -> go.Figure:
     return fig
 
 
-def make_dark_pool_parameter_table(venue: lp.DarkPoolVenue) -> pd.DataFrame:
+def make_ecn_optimization_table(
+    solver: Any,
+    cpp_tier: Any,
+    spec: ECNTierSpec,
+    solution: Any,
+    spread: float,
+    mid_price: float,
+) -> pd.DataFrame:
+    rows = []
+    h_vec = [float(x) for x in solution.h]
+
+    for i, q_raw in enumerate(solution.q_grid):
+        q = float(q_raw)
+
+        for j, z in enumerate(tier_sizes(spec)):
+            zf = float(z)
+
+            for side in ["bid", "ask"]:
+                active = is_active(cpp_tier, q, zf, side)
+
+                delta = np.nan
+                arrival_rate = np.nan
+                quote_pips = np.nan
+                fill_value = np.nan
+                impact_drift = np.nan
+                impact_value = np.nan
+                total_value = np.nan
+                candidate_pressure = np.nan
+
+                if active:
+                    delta = float(cpp_tier.policy.bid[i][j]) if side == "bid" else float(cpp_tier.policy.ask[i][j])
+                    arrival_rate = float(cpp_tier.arrival_rate(delta, zf))
+
+                    quote = masked_quote_summary(cpp_tier, q, zf, side, mid_price, spread)
+                    if quote is not None:
+                        quote_pips = float(quote.quote_relative_to_mid_pips)
+
+                    candidate_pressure = float(
+                        solver.ecn_candidate_net_pressure(cpp_tier, delta, zf, side)
+                    )
+                    impact_drift = float(
+                        solver.ecn_candidate_passive_impact_drift(cpp_tier, delta, zf, side)
+                    )
+                    impact_value = float(
+                        solver.ecn_candidate_passive_impact_value(cpp_tier, q, delta, zf, side)
+                    )
+                    fill_value = float(
+                        solver.ecn_fill_value(cpp_tier, h_vec, q, side, delta, zf)
+                    )
+                    total_value = float(
+                        solver.ecn_total_candidate_value(cpp_tier, h_vec, q, side, delta, zf)
+                    )
+
+                rows.append(
+                    {
+                        "q": q,
+                        "z": zf,
+                        "side": side,
+                        "active": active,
+                        "delta": delta,
+                        "arrival_rate": arrival_rate,
+                        "quote_vs_mid_pips": quote_pips,
+                        "candidate_pressure": candidate_pressure,
+                        "candidate_impact_drift": impact_drift,
+                        "passive_impact_value": impact_value,
+                        "fill_value": fill_value,
+                        "total_candidate_value": total_value,
+                    }
+                )
+
+    return pd.DataFrame(rows)
+
+
+def ecn_pressure_rows(solution: Any) -> pd.DataFrame:
+    rows = []
+
+    for i, q_raw in enumerate(solution.q_grid):
+        q = float(q_raw)
+        bid_pressure = 0.0
+        ask_pressure = 0.0
+
+        for tier in solution.ecn_tiers:
+            sizes = [float(z) for z in tier.sizes_]
+
+            for j, z in enumerate(sizes):
+                if is_admissible(tier, q, z, "bid"):
+                    d = float(tier.policy.bid[i][j])
+                    bid_pressure += z * float(tier.arrival_rate(d, z))
+
+                if is_admissible(tier, q, z, "ask"):
+                    d = float(tier.policy.ask[i][j])
+                    ask_pressure += z * float(tier.arrival_rate(d, z))
+
+        net_pressure = bid_pressure - ask_pressure
+        passive_drift = float(solution.ecn_passive_impact.drift(net_pressure))
+
+        rows.append(
+            {
+                "q": q,
+                "bid_pressure": bid_pressure,
+                "ask_pressure": ask_pressure,
+                "net_pressure": net_pressure,
+                "passive_drift": passive_drift,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def make_ecn_passive_impact_parameter_table(model: Any) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "enabled": bool(model.enabled),
+                "eta": float(model.eta),
+                "pressure_scale": float(model.pressure_scale),
+                "formula": "eta * tanh((bid_pressure - ask_pressure) / pressure_scale)",
+                "included venues": "ECN only",
+                "excluded venues": "MDP tiers, dark pool",
+            }
+        ]
+    )
+
+
+def make_ecn_passive_impact_figure(solution: Any) -> go.Figure:
+    df = ecn_pressure_rows(solution)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df["q"], y=df["bid_pressure"], mode="lines", name="ECN bid pressure"))
+    fig.add_trace(
+        go.Scatter(
+            x=df["q"],
+            y=df["ask_pressure"],
+            mode="lines",
+            line=dict(dash="dash"),
+            name="ECN ask pressure",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df["q"],
+            y=df["net_pressure"],
+            mode="lines",
+            line=dict(dash="dot"),
+            name="net pressure",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df["q"],
+            y=df["passive_drift"],
+            mode="lines+markers",
+            name="passive drift",
+            yaxis="y2",
+        )
+    )
+
+    fig.add_hline(y=0.0)
+    fig.update_layout(
+        title="ECN passive impact: pressure and induced drift",
+        xaxis_title="Inventory q",
+        yaxis_title="ECN pressure",
+        yaxis2=dict(
+            title="passive drift",
+            overlaying="y",
+            side="right",
+            showgrid=False,
+        ),
+        height=460,
+    )
+    return fig
+
+
+def make_dark_pool_parameter_table(venue: Any) -> pd.DataFrame:
     return pd.DataFrame(
         [
             {
@@ -1042,7 +1304,7 @@ def make_dark_pool_parameter_table(venue: lp.DarkPoolVenue) -> pd.DataFrame:
     )
 
 
-def make_dark_pool_size_figure(venue: lp.DarkPoolVenue) -> go.Figure:
+def make_dark_pool_size_figure(venue: Any) -> go.Figure:
     q_grid = [float(q) for q in venue.policy.q_grid]
     bid_vals = [
         np.nan if not venue.policy.is_active(i, "bid") else float(venue.policy.bid_size[i])
@@ -1073,7 +1335,7 @@ def make_dark_pool_size_figure(venue: lp.DarkPoolVenue) -> go.Figure:
     return fig
 
 
-def make_dark_pool_size_distribution_figure(venue: lp.DarkPoolVenue) -> go.Figure:
+def make_dark_pool_size_distribution_figure(venue: Any) -> go.Figure:
     max_posted_size = max(float(u) for u in venue.posted_sizes)
     max_size_lambda = max(float(venue.size_lambda_bid), float(venue.size_lambda_ask))
 
@@ -1089,7 +1351,6 @@ def make_dark_pool_size_distribution_figure(venue: lp.DarkPoolVenue) -> go.Figur
     ask_df = zero_truncated_poisson_pmf(float(venue.size_lambda_ask), k_max)
 
     fig = go.Figure()
-
     fig.add_trace(
         go.Bar(
             x=bid_df["k"],
@@ -1125,7 +1386,7 @@ def make_dark_pool_size_distribution_figure(venue: lp.DarkPoolVenue) -> go.Figur
     return fig
 
 
-def make_h_figure(solution: lp.HJBSolution) -> go.Figure:
+def make_h_figure(solution: Any) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=list(solution.q_grid), y=list(solution.h), mode="lines+markers", name="h(q)"))
     fig.update_layout(title="Value function h(q)", xaxis_title="Inventory q", yaxis_title="h(q)", height=420)
@@ -1154,9 +1415,9 @@ st.set_page_config(page_title="Trinity 2.0 Pricer", layout="wide")
 st.title("Trinity 2.0 Pricer")
 st.markdown(
     "MDP tiers use rung-by-rung two-sided ladder controls. "
-    "ECN tiers are one-size hedge channels. "
+    "ECN tiers now use the same ladder-style size interface as MDP, with ECN-specific costs. "
     "The dark pool trades at mid with a posted-size control. "
-    "Dark-pool opportunity arrivals and incoming sizes are both Poisson-driven."
+    "Only ECN quotes can create passive market-impact drift."
 )
 
 with st.sidebar:
@@ -1212,6 +1473,12 @@ for i in range(num_tiers):
         errors.append(str(exc))
 
 try:
+    ecn_passive_impact_spec = build_ecn_passive_impact_spec_from_ui()
+except ValueError as exc:
+    errors.append(str(exc))
+    ecn_passive_impact_spec = ECNPassiveImpactSpec(enabled=False, eta=0.0, pressure_scale=1.0)
+
+try:
     dark_pool_spec = build_dark_pool_spec_from_ui()
 except ValueError as exc:
     errors.append(str(exc))
@@ -1226,6 +1493,10 @@ if spread <= 0.0:
     errors.append("spread must be positive.")
 if golden_tol <= 0.0:
     errors.append("golden_tol must be positive.")
+if ecn_passive_impact_spec.eta < 0.0:
+    errors.append("ECN passive impact eta must be nonnegative.")
+if ecn_passive_impact_spec.pressure_scale <= 0.0:
+    errors.append("ECN passive impact pressure_scale must be positive.")
 
 try:
     q_grid = (
@@ -1252,8 +1523,12 @@ if errors:
         st.error(error)
     st.stop()
 
+if ecn_passive_impact_spec.enabled and active_ecn_count == 0:
+    st.warning("ECN passive impact is enabled, but there are no active ECN tiers.")
+
 mdp_cpp_tiers, ecn_cpp_tiers = build_cpp_tiers(active_tier_specs)
 dark_pool_cpp = None if dark_pool_spec is None else dark_pool_spec.build_cpp_venue()
+ecn_passive_impact_cpp = ecn_passive_impact_spec.build_cpp_model()
 
 penalty = lp.PolynomialInventoryPenalty(
     risk_aversion=float(risk_aversion),
@@ -1285,20 +1560,22 @@ with st.spinner("Solving HJB in C++ and building policies..."):
         mdp_tiers=mdp_cpp_tiers,
         ecn_tiers=ecn_cpp_tiers,
         dark_pool=dark_pool_cpp,
+        ecn_passive_impact=ecn_passive_impact_cpp,
     )
-    solution: lp.HJBSolution = solver.solve()
+    solution = solver.solve()
 
 diag = solution.diagnostics
 solution_tiers = ordered_solution_tiers(active_tier_specs, solution)
 
 st.success("Solver run complete.")
 
-summary_cols = st.columns(5)
+summary_cols = st.columns(6)
 summary_cols[0].metric("Configured tiers", len(tier_specs))
 summary_cols[1].metric("Active MDP tiers", active_mdp_count)
 summary_cols[2].metric("Active ECN tiers", active_ecn_count)
 summary_cols[3].metric("Dark pool", "on" if dark_pool_spec is not None else "off")
-summary_cols[4].metric("Disabled tiers", len(disabled_tier_names))
+summary_cols[4].metric("ECN impact", "on" if bool(solution.ecn_passive_impact.enabled) else "off")
+summary_cols[5].metric("Disabled tiers", len(disabled_tier_names))
 
 if disabled_tier_names:
     st.caption("Excluded from solve: " + ", ".join(disabled_tier_names))
@@ -1343,6 +1620,15 @@ with st.expander("Solver diagnostics", expanded=False):
         use_container_width=True,
     )
 
+with st.expander("ECN passive impact diagnostics", expanded=False):
+    st.dataframe(make_ecn_passive_impact_parameter_table(solution.ecn_passive_impact), use_container_width=True)
+
+    if active_ecn_count == 0:
+        st.info("No active ECN tiers. ECN passive pressure is zero.")
+    else:
+        st.plotly_chart(make_ecn_passive_impact_figure(solution), use_container_width=True)
+        st.dataframe(ecn_pressure_rows(solution).round(8), use_container_width=True)
+
 tab_names = [f"{spec.name} [{tier_kind_label(spec)}]" for spec in active_tier_specs]
 if solution.dark_pool is not None:
     tab_names.append("Dark Pool")
@@ -1357,60 +1643,81 @@ if tab_names:
             st.subheader(f"Tier: {spec.name}")
             st.caption(f"Type: {tier_kind_label(spec)}")
 
-            is_ecn = isinstance(spec, ECNTierSpec) and is_ecn_tier(cpp_tier)
+            is_ecn = isinstance(spec, ECNTierSpec)
 
             if is_ecn:
                 c1, c2, c3 = st.columns(3)
-                c1.metric("quoted size", "1.0")
-                c2.metric("ECN toxicity", f"{float(cpp_tier.adverse_selection_model.ecn_toxicity):.5f}")
-                c3.metric("ECN fee", f"{float(cpp_tier.adverse_selection_model.ecn_fee):.5f}")
+                c1.metric("ECN toxicity", f"{float(cpp_tier.adverse_selection_model.ecn_toxicity):.5f}")
+                c2.metric("ECN fee", f"{float(cpp_tier.adverse_selection_model.ecn_fee):.5f}")
+                c3.metric("inventory scale", f"{float(cpp_tier.adverse_selection_model.ecn_convergence_inventory):.4f}")
 
                 c4, c5, c6 = st.columns(3)
-                c4.metric(
-                    "convergence inventory",
-                    f"{float(cpp_tier.adverse_selection_model.ecn_convergence_inventory):.3f}",
+                c4.metric("delta_min", f"{float(cpp_tier.delta_min):.4f}")
+                c5.metric("delta_max", f"{float(cpp_tier.delta_max):.4f}")
+                c6.metric("sizes", ", ".join(f"{float(z):g}" for z in cpp_tier.sizes_))
+
+                st.caption(
+                    "This ECN tier uses the current ladder-style ECN binding: sizes_, bid/ask policy matrices, "
+                    "ECN adverse-selection costs, and optional passive impact."
                 )
-                c5.metric("delta_min", f"{float(cpp_tier.delta_min):.4f}")
-                c6.metric("mid cap", f"{float(cpp_tier.delta_mid_cap()):.4f}")
 
             with st.expander("Tier parameters", expanded=False):
                 st.dataframe(make_flow_parameter_table(spec, cpp_tier), use_container_width=True)
 
             st.plotly_chart(make_flow_curve_figure(cpp_tier, spec), use_container_width=True)
 
+            with st.expander("Delta-implied flow rates", expanded=False):
+                st.caption(
+                    "These are the realized flow rates implied by the optimized policy deltas: "
+                    "λ(δ*(q, z), z). The table also shows A(z), hit ratio, admissibility, and size-weighted pressure."
+                )
+                st.plotly_chart(make_delta_implied_flow_figure(cpp_tier, spec), use_container_width=True)
+                st.dataframe(make_delta_implied_flow_table(cpp_tier, spec).round(8), use_container_width=True)
+
+            st.plotly_chart(
+                make_quote_inventory_figure(cpp_tier, spec, float(config.spread), float(mid_price)),
+                use_container_width=True,
+            )
+
             if is_ecn:
-                st.plotly_chart(make_ecn_cap_figure(cpp_tier, float(config.spread)), use_container_width=True)
-                st.plotly_chart(make_ecn_activity_figure(cpp_tier), use_container_width=True)
-                st.plotly_chart(make_ecn_cost_curve_figure(cpp_tier), use_container_width=True)
-            else:
-                st.plotly_chart(
-                    make_quote_inventory_figure(cpp_tier, spec, float(config.spread), float(mid_price)),
-                    use_container_width=True,
-                )
+                st.plotly_chart(make_ecn_cost_curve_figure(cpp_tier, spec), use_container_width=True)
 
-                q_for_ladder = st.select_slider(
-                    f"Inventory level for ladder — {spec.name}",
-                    options=available_q,
-                    value=default_q,
-                    key=f"qslider_{idx}",
-                )
+                with st.expander("ECN optimization diagnostics", expanded=False):
+                    st.dataframe(
+                        make_ecn_optimization_table(
+                            solver,
+                            cpp_tier,
+                            spec,
+                            solution,
+                            float(config.spread),
+                            float(mid_price),
+                        ).round(8),
+                        use_container_width=True,
+                    )
 
-                st.plotly_chart(
-                    make_ladder_figure(cpp_tier, spec, float(q_for_ladder), float(config.spread), float(mid_price)),
-                    use_container_width=True,
-                )
+            q_for_ladder = st.select_slider(
+                f"Inventory level for ladder — {spec.name}",
+                options=available_q,
+                value=default_q,
+                key=f"qslider_{idx}",
+            )
 
-                q_for_table = st.selectbox(
-                    f"q for ladder table — {spec.name}",
-                    options=available_q,
-                    index=available_q.index(default_q),
-                    key=f"qtable_{idx}",
-                )
+            st.plotly_chart(
+                make_ladder_figure(cpp_tier, spec, float(q_for_ladder), float(config.spread), float(mid_price)),
+                use_container_width=True,
+            )
 
-                st.dataframe(
-                    make_q_ladder_table(cpp_tier, spec, float(q_for_table), float(config.spread), float(mid_price)),
-                    use_container_width=True,
-                )
+            q_for_table = st.selectbox(
+                f"q for ladder table — {spec.name}",
+                options=available_q,
+                index=available_q.index(default_q),
+                key=f"qtable_{idx}",
+            )
+
+            st.dataframe(
+                make_q_ladder_table(cpp_tier, spec, float(q_for_table), float(config.spread), float(mid_price)),
+                use_container_width=True,
+            )
 
     if solution.dark_pool is not None:
         venue = solution.dark_pool
@@ -1444,31 +1751,42 @@ if tab_names:
                     "K ~ Poisson(size_lambda) conditional on K ≥ 1. "
                     "Executed size is min(posted size, K)."
                 )
-                st.plotly_chart(
-                    make_dark_pool_size_distribution_figure(venue),
-                    use_container_width=True,
-                )
+                st.plotly_chart(make_dark_pool_size_distribution_figure(venue), use_container_width=True)
 
 with st.expander("What this app is solving"):
     st.markdown(
         r"""
-MDP tiers use rung-by-rung two-sided ladder optimization.
+MDP tiers:
+- use rung-by-rung two-sided ladder optimization
+- use the tier's `sizes_` / `sizes` vector
+- optimize deltas over `[delta_min, delta_max]`
 
-ECN tiers are one-size hedge channels:
-- quoted size is fixed to $z = 1$
-- only the inventory-reducing side is admissible
-- the quote follows a direct smooth inventory profile
-- it starts at `delta_min` and reaches the passive mid cap exactly at `ecn_convergence_inventory`
-- it never crosses mid
+ECN tiers:
+- now use the same ladder-style policy shape as MDP tiers
+- have their own `sizes_` vector
+- use ECN fill economics: spread capture, adverse selection, fees, continuation value
+- may contribute passive market-impact drift
+- no longer use `is_policy_active`, `bid_active`, `ask_active`, or `delta_mid_cap`
+
+Delta-implied flow diagnostics:
+- for each MDP and ECN tier, the app reports the realized arrival rate implied by the optimized delta
+- the displayed value is $\lambda(\delta^*(q,z), z)$
+- the table also shows $A(z)$, the logistic hit ratio, and size-weighted pressure
+
+ECN passive market impact:
+- only ECN quotes create passive price pressure
+- MDP customer tiers do not create passive price pressure
+- dark pool does not create passive price pressure
+- ECN bid pressure and ask pressure are computed from ECN policy-implied flow rates
+- passive drift is `eta * tanh((bid_pressure - ask_pressure) / pressure_scale)`
+- this drift enters the HJB through the reduced-form term `q * drift`
 
 Dark-pool venue:
 - execution price is the mid
 - there is no quote-price optimization
 - opportunity arrivals are controlled by `arrival_lambda_bid` and `arrival_lambda_ask`
 - conditional incoming order size is zero-truncated Poisson
-- the size distribution is controlled by `size_lambda_bid` and `size_lambda_ask`
 - if posted size is $u$ and incoming size is $Z$, then executed size is $\min(u, Z)$
-- the optimizer chooses posted bid size, ask size, or both depending on the venue mode
 
 The inventory grid must be:
 - strictly increasing
