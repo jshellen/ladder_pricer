@@ -134,13 +134,10 @@ Implemented by `PolynomialInternalizationTime`. Represents the expected number o
 
 ### 4.3 Inventory penalty
 
-The penalty decomposes into a **carry cost** and the internalization time:
-
-$$\Pi(q) = \underbrace{\gamma\sigma^2}_{\text{CarryCost}} \cdot\, q^2\, t(q)$$
+$$\Pi(q) = \underbrace{\gamma\sigma^2}_{\text{CarryCost}} \cdot q^2 \cdot t(q)$$
 
 - $\gamma$ (`risk_aversion`): risk-aversion coefficient
 - $\sigma$: one-minute volatility (pips / √min); carry cost per unit time = $\gamma\sigma^2$
-- $\tau_0, \tau_1, \tau_2$: internalization time coefficients (minutes)
 
 `PolynomialInventoryPenalty` composes `CarryCost` and `PolynomialInternalizationTime`.
 
@@ -281,7 +278,7 @@ By default (`allow_both_sides = False`):
 
 The full stationary Bellman RHS at inventory $q$ is
 
-$$\operatorname{RHS}(q) = -\Pi(q) + \text{spot\_drift}\cdot q + \sum_{k} H_k^{\text{MDP}}(q) + H^{\text{DP}}(q)$$
+$$\operatorname{RHS}(q) = -\Pi(q) + \operatorname{spot\_drift}\cdot q + \sum_{k} H_k^{\text{MDP}}(q) + H^{\text{DP}}(q)$$
 
 The pseudo-time fixed-point iteration is
 
@@ -449,7 +446,7 @@ $$\Pi(q)=\gamma\sigma^2\cdot q^2\cdot t(q)$$
 $$zs(0.5-\delta) + z\mu(z,\,t(q\pm z)) + h(q\pm z) - h(q)$$
 
 **Bellman RHS**
-$$\operatorname{RHS}(q) = -\Pi(q) - c(\sigma)\cdot m\cdot|q| + \text{spot\_drift}\cdot q + \sum_k H_k^{\text{MDP}}(q) + H^{\text{DP}}(q)$$
+$$\operatorname{RHS}(q) = -\Pi(q) + \operatorname{spot\_drift}\cdot q + \sum_k H_k^{\text{MDP}}(q) + H^{\text{DP}}(q)$$
 
 **Pseudo-time iteration**
 $$h^{n+1}(q) = h^n(q) + dt\cdot\operatorname{RHS}^n(q) - h^{n+1}(0)$$
