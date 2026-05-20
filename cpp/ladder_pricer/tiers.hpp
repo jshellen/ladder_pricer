@@ -1,7 +1,8 @@
 #pragma once
 
 #include "common.hpp"
-#include "models.hpp"
+#include "flow_curve.hpp"
+#include "markout.hpp"
 #include "policy.hpp"
 #include "quote_analytics.hpp"
 
@@ -13,7 +14,7 @@ namespace hjb {
 struct Tier {
     std::string name;
     LogisticFlowCurve flow_curve;
-    SqrtMarkoutModel markout_model;
+    MarkoutModel markout_model;
     QuotePolicy policy;
 
     Tier() = default;
@@ -21,7 +22,7 @@ struct Tier {
     Tier(
         std::string name_,
         LogisticFlowCurve flow_curve_,
-        SqrtMarkoutModel markout_model_
+        MarkoutModel markout_model_
     )
         : name(std::move(name_)),
           flow_curve(std::move(flow_curve_)),
@@ -65,7 +66,7 @@ struct MDPTier final : public Tier {
         std::string name_,
         std::vector<double> sizes__,
         LogisticFlowCurve flow_curve_,
-        SqrtMarkoutModel markout_model_,
+        MarkoutModel markout_model_,
         double delta_min_ = -5.0,
         double delta_max_ = 5.0
     )

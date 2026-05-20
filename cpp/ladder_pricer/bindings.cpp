@@ -66,9 +66,10 @@ PYBIND11_MODULE(ladder_pricer, m) {
     py::class_<LogisticFlowCurve>(m, "LogisticFlowCurve")
         .def(py::init<>())
         .def(
-            py::init<double, double, double, double, double, double>(),
+            py::init<double, double, double, double, double, double, double>(),
             py::arg("A0"),
             py::arg("theta"),
+            py::arg("beta"),
             py::arg("shift"),
             py::arg("steepness"),
             py::arg("volume_shift"),
@@ -76,6 +77,7 @@ PYBIND11_MODULE(ladder_pricer, m) {
         )
         .def_readwrite("A0", &LogisticFlowCurve::A0)
         .def_readwrite("theta", &LogisticFlowCurve::theta)
+        .def_readwrite("beta", &LogisticFlowCurve::beta)
         .def_readwrite("shift", &LogisticFlowCurve::shift)
         .def_readwrite("steepness", &LogisticFlowCurve::steepness)
         .def_readwrite("volume_shift", &LogisticFlowCurve::volume_shift)
@@ -89,23 +91,49 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def(py::init<double, double>(), py::arg("base"), py::arg("coeff"))
         .def_readwrite("base", &SqrtMarkoutModel::base)
         .def_readwrite("coeff", &SqrtMarkoutModel::coeff)
-        .def("expected_markout", &SqrtMarkoutModel::expected_markout, py::arg("z"));
+        .def("expected_markout", &SqrtMarkoutModel::expected_markout, py::arg("z"), py::arg("t"));
+
+    py::class_<SqrtTimeMarkoutModel>(m, "SqrtTimeMarkoutModel")
+        .def(py::init<>())
+        .def(
+            py::init<double, double, double, double, double, double>(),
+            py::arg("a0"), py::arg("a1"), py::arg("a2"),
+            py::arg("b0"), py::arg("b1"), py::arg("b2")
+        )
+        .def_readwrite("a0", &SqrtTimeMarkoutModel::a0)
+        .def_readwrite("a1", &SqrtTimeMarkoutModel::a1)
+        .def_readwrite("a2", &SqrtTimeMarkoutModel::a2)
+        .def_readwrite("b0", &SqrtTimeMarkoutModel::b0)
+        .def_readwrite("b1", &SqrtTimeMarkoutModel::b1)
+        .def_readwrite("b2", &SqrtTimeMarkoutModel::b2)
+        .def("alpha", &SqrtTimeMarkoutModel::alpha, py::arg("z"))
+        .def("beta", &SqrtTimeMarkoutModel::beta, py::arg("z"))
+        .def("expected_markout", &SqrtTimeMarkoutModel::expected_markout, py::arg("z"), py::arg("t"));
+
+    py::class_<CarryCost>(m, "CarryCost")
+        .def(py::init<>())
+        .def(py::init<double, double>(), py::arg("risk_aversion"), py::arg("sigma"))
+        .def_readwrite("risk_aversion", &CarryCost::risk_aversion)
+        .def_readwrite("sigma", &CarryCost::sigma)
+        .def("value", &CarryCost::value);
+
+    py::class_<PolynomialInternalizationTime>(m, "PolynomialInternalizationTime")
+        .def(py::init<>())
+        .def(py::init<double, double, double>(), py::arg("tau0"), py::arg("tau1"), py::arg("tau2"))
+        .def_readwrite("tau0", &PolynomialInternalizationTime::tau0)
+        .def_readwrite("tau1", &PolynomialInternalizationTime::tau1)
+        .def_readwrite("tau2", &PolynomialInternalizationTime::tau2)
+        .def("value", &PolynomialInternalizationTime::value, py::arg("q"));
 
     py::class_<PolynomialInventoryPenalty>(m, "PolynomialInventoryPenalty")
         .def(py::init<>())
         .def(
-            py::init<double, double, double, double, double>(),
-            py::arg("risk_aversion"),
-            py::arg("sigma"),
-            py::arg("tau0"),
-            py::arg("tau1"),
-            py::arg("tau2")
+            py::init<CarryCost, PolynomialInternalizationTime>(),
+            py::arg("carry_cost"),
+            py::arg("internalization_time")
         )
-        .def_readwrite("risk_aversion", &PolynomialInventoryPenalty::risk_aversion)
-        .def_readwrite("sigma", &PolynomialInventoryPenalty::sigma)
-        .def_readwrite("tau0", &PolynomialInventoryPenalty::tau0)
-        .def_readwrite("tau1", &PolynomialInventoryPenalty::tau1)
-        .def_readwrite("tau2", &PolynomialInventoryPenalty::tau2)
+        .def_readwrite("carry_cost", &PolynomialInventoryPenalty::carry_cost)
+        .def_readwrite("internalization_time", &PolynomialInventoryPenalty::internalization_time)
         .def("value", &PolynomialInventoryPenalty::value, py::arg("q"));
 
 
@@ -285,10 +313,11 @@ PYBIND11_MODULE(ladder_pricer, m) {
         )
         .def(
             "expected_markout",
-            [](const Tier& self, double z) {
-                return self.markout_model.expected_markout(z);
+            [](const Tier& self, double z, double t) {
+                return expected_markout(self.markout_model, z, t);
             },
-            py::arg("z")
+            py::arg("z"),
+            py::arg("t")
         )
         .def(
             "is_admissible",
@@ -330,7 +359,7 @@ PYBIND11_MODULE(ladder_pricer, m) {
     py::class_<MDPTier, Tier>(m, "MDPTier")
         .def(py::init<>())
         .def(
-            py::init<std::string, std::vector<double>, LogisticFlowCurve, SqrtMarkoutModel, double, double>(),
+            py::init<std::string, std::vector<double>, LogisticFlowCurve, MarkoutModel, double, double>(),
             py::arg("name"),
             py::arg("sizes"),
             py::arg("flow_curve"),

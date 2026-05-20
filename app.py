@@ -112,33 +112,65 @@ DEFAULT_DARK_POOL_SETTINGS = {
 
 
 @dataclass
+class SqrtMarkoutSpec:
+    base: float = 0.0        # pips
+    coeff: float = 0.0       # pips
+    trading_cost: float = 0.0  # EUR / million
+
+    def build(self, spot: float) -> lp.SqrtMarkoutModel:
+        return lp.SqrtMarkoutModel(
+            base=self.base / 10_000 + self.trading_cost * spot / 1_000_000,
+            coeff=self.coeff / 10_000,
+        )
+
+
+@dataclass
+class SqrtTimeMarkoutSpec:
+    a0: float = -0.1785    # pips
+    a1: float = -0.1819    # pips
+    a2: float = 0.0052    # pips
+    b0: float = 0.0089    # pips
+    b1: float = 0.0068    # pips
+    b2: float = -0.0030    # pips
+
+    def build(self, spot: float) -> lp.SqrtTimeMarkoutModel:
+        return lp.SqrtTimeMarkoutModel(
+            a0=self.a0 / 10_000,
+            a1=self.a1 / 10_000,
+            a2=self.a2 / 10_000,
+            b0=self.b0 / 10_000,
+            b1=self.b1 / 10_000,
+            b2=self.b2 / 10_000,
+        )
+
+
+MarkoutSpec = SqrtMarkoutSpec | SqrtTimeMarkoutSpec
+
+
+@dataclass
 class CommonTierSpec:
     enabled: bool
     name: str
     flow_A0: float
     flow_theta: float
+    flow_beta: float
     flow_steepness: float
     flow_shift: float
     flow_volume_shift: float
-    markout_base: float       # pips
-    markout_coeff: float      # pips
-    trading_cost: float       # EUR / million
+    markout_spec: MarkoutSpec
     delta_min: float
     delta_max: float
 
-    def build_models(self, spot: float) -> tuple[lp.LogisticFlowCurve, lp.SqrtMarkoutModel]:
+    def build_models(self, spot: float):
         flow = lp.LogisticFlowCurve(
             A0=float(self.flow_A0),
             theta=float(self.flow_theta),
+            beta=float(self.flow_beta),
             shift=float(self.flow_shift),
             steepness=float(self.flow_steepness),
             volume_shift=float(self.flow_volume_shift),
         )
-        markout = lp.SqrtMarkoutModel(
-            base=float(self.markout_base) / 10_000 + float(self.trading_cost) * spot / 1_000_000,
-            coeff=float(self.markout_coeff) / 10_000,
-        )
-        return flow, markout
+        return flow, self.markout_spec.build(spot)
 
 
 @dataclass
@@ -221,6 +253,18 @@ def parse_integer_like_list(raw: str, field_name: str) -> list[float]:
 
 
 def default_tier_values(i: int) -> dict:
+    _markout_defaults = {
+        "markout_model_type": "sqrt_time",
+        "markout_base": 0.0,
+        "markout_coeff": 0.0,
+        "trading_cost": 0.0,
+        "sqrt_t_a0": 0.0,
+        "sqrt_t_a1": 0.0,
+        "sqrt_t_a2": 0.0,
+        "sqrt_t_b0": 0.0,
+        "sqrt_t_b1": 0.0,
+        "sqrt_t_b2": 0.0,
+    }
     presets = [
         {
             "enabled": True,
@@ -229,12 +273,17 @@ def default_tier_values(i: int) -> dict:
             "sizes": "1, 2, 3, 5, 10, 20",
             "flow_A0": 1.00,
             "flow_theta": 0.0,
+            "flow_beta": 0.0,
             "flow_steepness": 10.00,
             "flow_shift": 0.50,
             "flow_volume_shift": 0.015,
-            "markout_base": 0.0,
-            "markout_coeff": 0.0,
-            "trading_cost": 0.0,
+            **_markout_defaults,
+            "sqrt_t_a0": -0.1785,
+            "sqrt_t_a1": -0.1819,
+            "sqrt_t_a2":  0.0052,
+            "sqrt_t_b0":  0.0089,
+            "sqrt_t_b1":  0.0068,
+            "sqrt_t_b2": -0.0030,
             "delta_min": -100.0,
             "delta_max": 100.0,
         },
@@ -245,12 +294,11 @@ def default_tier_values(i: int) -> dict:
             "sizes": "1, 2, 3, 5, 10, 20",
             "flow_A0": 1.0,
             "flow_theta": 0.0,
+            "flow_beta": 0.0,
             "flow_steepness": 10.0,
             "flow_shift": 0.30,
             "flow_volume_shift": 0.01,
-            "markout_base": 0.0,
-            "markout_coeff": 0.0,
-            "trading_cost": 0.0,
+            **_markout_defaults,
             "delta_min": -100.0,
             "delta_max": 100.0,
         },
@@ -261,12 +309,11 @@ def default_tier_values(i: int) -> dict:
             "sizes": "1, 2, 3, 5, 10, 15, 20",
             "flow_A0": 0.85,
             "flow_theta": 0.15,
+            "flow_beta": 0.0,
             "flow_steepness": 1.60,
             "flow_shift": 0.28,
             "flow_volume_shift": 0.090,
-            "markout_base": 0.0,
-            "markout_coeff": 0.0,
-            "trading_cost": 0.0,
+            **_markout_defaults,
             "delta_min": -100.0,
             "delta_max": 100.0,
         },
@@ -302,13 +349,14 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
             sizes = try_parse_float_list(sizes_raw) or [1.0]
 
         st.markdown("**Flow curve parameters**")
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         flow_A0 = c1.number_input(
             f"A0 {i + 1}",
             value=float(defaults["flow_A0"]),
             step=0.05,
             format="%.4f",
             key=f"flow_A0_{i}",
+            help="Overall flow intensity: expected number of client RFQs per minute at δ = 50 % and z = 1.",
         )
         flow_theta = c2.number_input(
             f"theta {i + 1}",
@@ -317,16 +365,23 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
             format="%.4f",
             key=f"flow_theta_{i}",
         )
+        flow_beta = c3.number_input(
+            f"beta {i + 1}",
+            value=float(defaults.get("flow_beta", 0.0)),
+            step=0.005,
+            format="%.4f",
+            key=f"flow_beta_{i}",
+        )
 
-        c3, c4 = st.columns(2)
-        flow_steepness = c3.number_input(
+        c4, c5 = st.columns(2)
+        flow_steepness = c4.number_input(
             f"steepness {i + 1}",
             value=float(defaults["flow_steepness"]),
             step=0.05,
             format="%.4f",
             key=f"flow_steepness_{i}",
         )
-        flow_shift = c4.number_input(
+        flow_shift = c5.number_input(
             f"shift {i + 1}",
             value=float(defaults["flow_shift"]),
             step=0.05,
@@ -342,34 +397,63 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
             key=f"flow_volume_shift_{i}",
         )
 
-        st.markdown("**Markout / adverse selection (pips)**")
-        c5, c6 = st.columns(2)
-        markout_base = c5.number_input(
-            f"Markout base {i + 1}",
-            value=float(defaults["markout_base"]),
-            step=0.1,
-            format="%.2f",
-            key=f"markout_base_{i}",
-            help="Constant adverse-selection cost in pips (1 pip = 1/10 000).",
-        )
-        markout_coeff = c6.number_input(
-            f"Markout coeff {i + 1}",
-            value=float(defaults["markout_coeff"]),
-            step=0.1,
-            format="%.2f",
-            key=f"markout_coeff_{i}",
-            help="Size-dependent coefficient in pips. Total markout = base + coeff × √z pips.",
+        st.markdown("**Markout model**")
+        markout_model_type = st.selectbox(
+            f"Markout model type {i + 1}",
+            options=["sqrt", "sqrt_time"],
+            index=0 if defaults.get("markout_model_type", "sqrt") == "sqrt" else 1,
+            key=f"markout_model_type_{i}",
+            format_func=lambda x: "base + coeff·√z" if x == "sqrt" else "α(z)·√t + β(z)·t",
         )
 
-        st.markdown("**Trading cost (EUR / million)**")
-        trading_cost = st.number_input(
-            f"Trading cost {i + 1}",
-            value=float(defaults.get("trading_cost", 0.0)),
-            step=0.5,
-            format="%.2f",
-            key=f"trading_cost_{i}",
-            help="Flat execution cost in EUR per million traded. Added to markout base after converting via spot.",
-        )
+        if markout_model_type == "sqrt":
+            c5, c6 = st.columns(2)
+            markout_base = c5.number_input(
+                f"Markout base {i + 1}",
+                value=float(defaults["markout_base"]),
+                step=0.1,
+                format="%.2f",
+                key=f"markout_base_{i}",
+                help="Constant adverse-selection cost in pips (1 pip = 1/10 000).",
+            )
+            markout_coeff = c6.number_input(
+                f"Markout coeff {i + 1}",
+                value=float(defaults["markout_coeff"]),
+                step=0.1,
+                format="%.2f",
+                key=f"markout_coeff_{i}",
+                help="Size-dependent coefficient in pips. Total markout = base + coeff × √z pips.",
+            )
+            st.markdown("**Trading cost (EUR / million)**")
+            trading_cost = st.number_input(
+                f"Trading cost {i + 1}",
+                value=float(defaults.get("trading_cost", 0.0)),
+                step=0.5,
+                format="%.2f",
+                key=f"trading_cost_{i}",
+                help="Flat execution cost in EUR per million traded. Added to markout base after converting via spot.",
+            )
+            markout_spec: MarkoutSpec = SqrtMarkoutSpec(
+                base=float(markout_base),
+                coeff=float(markout_coeff),
+                trading_cost=float(trading_cost),
+            )
+        else:
+            st.caption("α(z) = a₀ + a₁z + a₂z²,   β(z) = b₀ + b₁z + b₂z²   (coefficients in pips)")
+            st.markdown("α(z) coefficients")
+            ca0, ca1, ca2 = st.columns(3)
+            sqrt_t_a0 = ca0.number_input(f"a0 {i+1}", value=float(defaults.get("sqrt_t_a0", 0.0)), step=0.1, format="%.4f", key=f"sqrt_t_a0_{i}")
+            sqrt_t_a1 = ca1.number_input(f"a1 {i+1}", value=float(defaults.get("sqrt_t_a1", 0.0)), step=0.01, format="%.4f", key=f"sqrt_t_a1_{i}")
+            sqrt_t_a2 = ca2.number_input(f"a2 {i+1}", value=float(defaults.get("sqrt_t_a2", 0.0)), step=0.001, format="%.5f", key=f"sqrt_t_a2_{i}")
+            st.markdown("β(z) coefficients")
+            cb0, cb1, cb2 = st.columns(3)
+            sqrt_t_b0 = cb0.number_input(f"b0 {i+1}", value=float(defaults.get("sqrt_t_b0", 0.0)), step=0.1, format="%.4f", key=f"sqrt_t_b0_{i}")
+            sqrt_t_b1 = cb1.number_input(f"b1 {i+1}", value=float(defaults.get("sqrt_t_b1", 0.0)), step=0.01, format="%.4f", key=f"sqrt_t_b1_{i}")
+            sqrt_t_b2 = cb2.number_input(f"b2 {i+1}", value=float(defaults.get("sqrt_t_b2", 0.0)), step=0.001, format="%.5f", key=f"sqrt_t_b2_{i}")
+            markout_spec = SqrtTimeMarkoutSpec(
+                a0=float(sqrt_t_a0), a1=float(sqrt_t_a1), a2=float(sqrt_t_a2),
+                b0=float(sqrt_t_b0), b1=float(sqrt_t_b1), b2=float(sqrt_t_b2),
+            )
 
         st.markdown("**Tier quote settings**")
         c7, c8 = st.columns(2)
@@ -396,12 +480,11 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
         name=name,
         flow_A0=float(flow_A0),
         flow_theta=float(flow_theta),
+        flow_beta=float(flow_beta),
         flow_steepness=float(flow_steepness),
         flow_shift=float(flow_shift),
         flow_volume_shift=float(flow_volume_shift),
-        markout_base=float(markout_base),
-        markout_coeff=float(markout_coeff),
-        trading_cost=float(trading_cost),
+        markout_spec=markout_spec,
         delta_min=float(tier_delta_min),
         delta_max=float(tier_delta_max),
     )
@@ -607,10 +690,10 @@ def make_flow_parameter_table(spec: TierSpec, cpp_tier: CppTier) -> pd.DataFrame
             "enabled": bool(spec.enabled),
             "type": tier_kind_label(),
             "z": zf,
-            "A(z)": spec.flow_A0 * zf ** (-spec.flow_theta),
+            "A(z)": spec.flow_A0 * zf ** (-spec.flow_theta - spec.flow_beta * zf),
             "delta_50(z)": spec.flow_shift - spec.flow_volume_shift * (zf - 1.0),
             "steepness": spec.flow_steepness,
-            "base_mu(z)": cpp_tier.expected_markout(zf),
+            "mu(z, t=1min)": cpp_tier.expected_markout(zf, 1.0),
         }
         rows.append(row)
     return pd.DataFrame(rows)
@@ -629,6 +712,23 @@ def make_flow_curve_figure(cpp_tier: CppTier, spec: TierSpec) -> go.Figure:
         title=f"Flow curves λ(δ, z) — {spec.name} ({tier_kind_label()})",
         xaxis_title="delta",
         yaxis_title="arrival rate",
+        height=500,
+    )
+    return fig
+
+
+def make_hit_ratio_figure(cpp_tier: CppTier, spec: TierSpec) -> go.Figure:
+    grid = np.linspace(-1.0, 1.0, 160)
+    fig = go.Figure()
+    for z in tier_sizes(spec):
+        zf = float(z)
+        vals = [cpp_tier.hit_ratio(float(d), zf) for d in grid]
+        fig.add_trace(go.Scatter(x=grid, y=vals, mode="lines", name=f"{zf:g}"))
+    fig.update_layout(
+        title=f"Hit ratios HR(δ, z) — {spec.name}",
+        xaxis_title="delta",
+        yaxis_title="hit ratio",
+        yaxis={"range": [0.0, 1.0]},
         height=500,
     )
     return fig
@@ -873,6 +973,39 @@ def make_dark_pool_full_fill_figure(venue: lp.DarkPoolVenue) -> go.Figure:
     return fig
 
 
+def make_internalization_time_figure(
+    internalization_time: lp.PolynomialInternalizationTime,
+    q_abs_max: float,
+) -> go.Figure:
+    q_abs = np.linspace(0.0, q_abs_max, 300)
+    t_vals = [internalization_time.value(float(q)) for q in q_abs]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=q_abs, y=t_vals, mode="lines", name="t(|q|)"))
+    fig.update_layout(
+        title="Internalization time t(|q|) = τ₀ + τ₁|q| + τ₂|q|²",
+        xaxis_title="|q| (absolute inventory)",
+        yaxis_title="t(|q|)",
+        height=420,
+    )
+    return fig
+
+
+def make_markout_figure(cpp_tier: CppTier, spec: TierSpec) -> go.Figure:
+    t_grid = np.linspace(0.0, 10.0, 300)
+    fig = go.Figure()
+    for z in tier_sizes(spec):
+        zf = float(z)
+        mu_vals = [cpp_tier.expected_markout(zf, float(t)) * 10_000 for t in t_grid]
+        fig.add_trace(go.Scatter(x=list(t_grid), y=mu_vals, mode="lines", name=f"z={zf:g}"))
+    fig.update_layout(
+        title=f"Markout — {spec.name}",
+        xaxis_title="Time since trade [minutes]",
+        yaxis_title="Market impact [pips]",
+        height=500,
+    )
+    return fig
+
+
 def make_h_figure(solution: lp.HJBSolution) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=list(solution.q_grid), y=list(solution.h), mode="lines+markers", name="h(q)"))
@@ -906,45 +1039,56 @@ st.markdown(
 )
 
 with st.sidebar:
-    st.header("Global parameters")
+    with st.sidebar.expander("Global parameters", expanded=True):
+        q_grid_mode = st.selectbox("Inventory grid mode", options=["uniform", "piecewise"], index=1)
+        q_abs_max = st.number_input("max |q|", value=20.0, min_value=0.5, step=0.5, format="%.4f")
 
-    q_grid_mode = st.selectbox("Inventory grid mode", options=["uniform", "piecewise"], index=1)
-    q_abs_max = st.number_input("max |q|", value=20.0, min_value=0.5, step=0.5, format="%.4f")
+        q_step = fine_half_width = fine_step = coarse_step = None
+        if q_grid_mode == "uniform":
+            q_step = st.number_input("q step", value=1.0, min_value=0.01, step=0.1, format="%.4f")
+        else:
+            fine_half_width = st.number_input("fine half-width", value=3.0, min_value=0.0, step=0.5, format="%.4f")
+            c_grid1, c_grid2 = st.columns(2)
+            fine_step = c_grid1.number_input("fine step", value=0.25, min_value=0.01, step=0.05, format="%.4f")
+            coarse_step = c_grid2.number_input("coarse step", value=1.0, min_value=0.01, step=0.1, format="%.4f")
 
-    q_step = fine_half_width = fine_step = coarse_step = None
-    if q_grid_mode == "uniform":
-        q_step = st.number_input("q step", value=1.0, min_value=0.01, step=0.1, format="%.4f")
-    else:
-        fine_half_width = st.number_input("fine half-width", value=3.0, min_value=0.0, step=0.5, format="%.4f")
-        c_grid1, c_grid2 = st.columns(2)
-        fine_step = c_grid1.number_input("fine step", value=0.25, min_value=0.01, step=0.05, format="%.4f")
-        coarse_step = c_grid2.number_input("coarse step", value=1.0, min_value=0.01, step=0.1, format="%.4f")
+        dt = st.number_input("dt", value=0.002, step=0.001, format="%.4f")
+        n_iter = st.number_input("n_iter", value=140, step=10, min_value=1)
 
-    dt = st.number_input("dt", value=0.002, step=0.001, format="%.4f")
-    n_iter = st.number_input("n_iter", value=140, step=10, min_value=1)
+        spread = st.number_input("reference spread", value=20.0 / 10000.0, step=1.0 / 10000.0, format="%.6f")
+        mid_price = st.number_input("display mid price", value=1.000000, step=0.000100, format="%.6f")
 
-    spread = st.number_input("reference spread", value=20.0 / 10000.0, step=1.0 / 10000.0, format="%.6f")
-    mid_price = st.number_input("display mid price", value=1.000000, step=0.000100, format="%.6f")
+    with st.sidebar.expander("Spot process", expanded=False):
+        spot = st.number_input("spot (quote CCY per base CCY)", value=11.5, min_value=0.001, step=0.1, format="%.4f")
+        spot_drift = st.number_input("spot_drift", value=0.0, step=0.001, format="%.5f")
 
-    st.header("Spot process")
-    spot = st.number_input("spot (quote CCY per base CCY)", value=11.5, min_value=0.001, step=0.1, format="%.4f")
-    spot_drift = st.number_input("spot_drift", value=0.0, step=0.001, format="%.5f")
+    with st.sidebar.expander("Optimization / stopping", expanded=False):
+        golden_tol = st.number_input("golden_tol", value=1e-4, format="%.1e")
+        golden_max_iter = st.number_input("golden_max_iter", value=32, step=1, min_value=1)
+        early_stop = st.checkbox("Enable early stopping", value=True)
+        tol_h = st.number_input("tol_h", value=1e-5, format="%.1e")
+        tol_rhs = st.number_input("tol_rhs", value=1e-4, format="%.1e")
+        min_iter = st.number_input("min_iter", value=5, step=1, min_value=0)
+        consecutive_passes_required = st.number_input("consecutive passes required", value=3, step=1, min_value=1)
 
-    st.header("Optimization / stopping")
-    golden_tol = st.number_input("golden_tol", value=1e-4, format="%.1e")
-    golden_max_iter = st.number_input("golden_max_iter", value=32, step=1, min_value=1)
-    early_stop = st.checkbox("Enable early stopping", value=True)
-    tol_h = st.number_input("tol_h", value=1e-5, format="%.1e")
-    tol_rhs = st.number_input("tol_rhs", value=1e-4, format="%.1e")
-    min_iter = st.number_input("min_iter", value=5, step=1, min_value=0)
-    consecutive_passes_required = st.number_input("consecutive passes required", value=3, step=1, min_value=1)
+    with st.sidebar.expander("Carry cost", expanded=False):
+        sigma = st.number_input(
+            "Volatility σ [pips / √min]",
+            value=20.0,
+            step=1.0,
+            format="%.2f",
+            help="One-minute volatility in pips. The carry cost term is γσ²·t(q) where t is in minutes.",
+        ) / 10_000.0
+        risk_aversion = st.number_input("risk_aversion", value=10.0, step=1.0, format="%.2f")
 
-    st.header("Inventory penalty")
-    sigma = st.number_input("Volatility [pips / 1min]", value=20.0, step=1.0, format="%.2f") / 10_000.0
-    risk_aversion = st.number_input("risk_aversion", value=10.0, step=1.0, format="%.2f")
-    tau0 = st.number_input("tau0", value=5.0, step=1.0, format="%.4f")
-    tau1 = st.number_input("cubic coeff", value=0.1, step=0.01, format="%.4f")
-    tau2 = st.number_input("quartic coeff", value=0.0015, step=0.0005, format="%.5f")
+    with st.sidebar.expander("Internalization time", expanded=False):
+        st.caption("t(q) = τ₀ + τ₁|q| + τ₂|q|²  —  time in minutes")
+        tau0 = st.number_input("tau0 (constant) [min]", value=5.0, step=1.0, format="%.4f",
+                               help="Minimum internalization time at zero inventory, in minutes.")
+        tau1 = st.number_input("tau1 (linear) [min / lot]", value=0.1, step=0.01, format="%.4f",
+                               help="Additional minutes per unit of absolute inventory.")
+        tau2 = st.number_input("tau2 (quadratic) [min / lot²]", value=0.0015, step=0.0005, format="%.5f",
+                               help="Quadratic growth in minutes per lot².")
 
     st.header("Pricing tiers")
     num_tiers = st.slider("Number of tiers", min_value=1, max_value=4, value=3)
@@ -998,15 +1142,16 @@ if errors:
         st.error(error)
     st.stop()
 
+global_internalization_time = lp.PolynomialInternalizationTime(
+    tau0=float(tau0), tau1=float(tau1), tau2=float(tau2)
+)
+
 mdp_cpp_tiers = build_cpp_tiers(active_tier_specs, float(spot))
 dark_pool_cpp = None if dark_pool_spec is None else dark_pool_spec.build_cpp_venue(float(spot))
 
 penalty = lp.PolynomialInventoryPenalty(
-    risk_aversion=float(risk_aversion),
-    sigma=float(sigma),
-    tau0=float(tau0),
-    tau1=float(tau1),
-    tau2=float(tau2),
+    carry_cost=lp.CarryCost(risk_aversion=float(risk_aversion), sigma=float(sigma)),
+    internalization_time=global_internalization_time,
 )
 
 config = build_solver_config(
@@ -1088,7 +1233,7 @@ with st.expander("Solver diagnostics", expanded=False):
         use_container_width=True,
     )
 
-tab_names = [f"{spec.name} [{tier_kind_label()}]" for spec in active_tier_specs]
+tab_names = ["Internalization time"] + [f"{spec.name} [{tier_kind_label()}]" for spec in active_tier_specs]
 if solution.dark_pool is not None:
     tab_names.append("Dark Pool")
 
@@ -1097,8 +1242,17 @@ if tab_names:
     available_q = [float(q) for q in solution.q_grid]
     default_q = 0.0 if 0.0 in available_q else available_q[len(available_q) // 2]
 
+    with tabs[0]:
+        internalization_time_model = lp.PolynomialInternalizationTime(
+            tau0=float(tau0), tau1=float(tau1), tau2=float(tau2)
+        )
+        st.plotly_chart(
+            make_internalization_time_figure(internalization_time_model, float(q_abs_max)),
+            use_container_width=True,
+        )
+
     for idx, (spec, cpp_tier) in enumerate(zip(active_tier_specs, solution_tiers)):
-        with tabs[idx]:
+        with tabs[idx + 1]:
             st.subheader(f"Tier: {spec.name}")
             st.caption(f"Type: {tier_kind_label()}")
 
@@ -1107,6 +1261,12 @@ if tab_names:
 
             with st.expander("Flow curves", expanded=False):
                 st.plotly_chart(make_flow_curve_figure(cpp_tier, spec), use_container_width=True)
+
+            with st.expander("Hit ratios", expanded=False):
+                st.plotly_chart(make_hit_ratio_figure(cpp_tier, spec), use_container_width=True)
+
+            with st.expander("Markouts", expanded=False):
+                st.plotly_chart(make_markout_figure(cpp_tier, spec), use_container_width=True)
 
             with st.expander("Quotes vs inventory", expanded=False):
                 st.plotly_chart(

@@ -43,11 +43,8 @@ def build_solution(
     )
 
     penalty = lp.PolynomialInventoryPenalty(
-        risk_aversion=10.0,
-        sigma=20.0 / 10_000.0,
-        tau0=5.0,
-        tau1=0.1,
-        tau2=0.0015,
+        carry_cost=lp.CarryCost(risk_aversion=10.0, sigma=20.0 / 10_000.0),
+        internalization_time=lp.PolynomialInternalizationTime(tau0=5.0, tau1=0.1, tau2=0.0015),
     )
 
     solver = lp.HJBLadderSolver(

@@ -2,7 +2,7 @@
 
 #include "common.hpp"
 #include "dark_pool.hpp"
-#include "models.hpp"
+#include "penalty.hpp"
 #include "policy.hpp"
 #include "solver_config.hpp"
 #include "tiers.hpp"
@@ -100,7 +100,7 @@ struct HJBLadderSolver {
     // --------------------------------------------------------
 
     double mdp_fill_payoff(double lam, double z, double d, double mu, double dh) const {
-        return lam * (z * config.spread * (0.5 - d) - z * mu + dh);
+        return lam * (z * config.spread * (0.5 - d) + z * mu + dh);
     }
 
     // --------------------------------------------------------
@@ -175,7 +175,8 @@ struct HJBLadderSolver {
         for (std::size_t j = 0; j < nz; ++j) {
             const double z = tier.sizes_[j];
             auto [lower, upper] = mdp_bounds_for_rung(tier, j, delta_row, q, Side::Bid, prev_delta);
-            const double mu = tier.markout_model.expected_markout(z);
+            const double tau = penalty.internalization_time.value(q + z);
+            const double mu = expected_markout(tier.markout_model, z, tau);
             const auto obj = [&](double d) {
                 return mdp_fill_payoff(tier.flow_curve.arrival_rate(d, z), z, d, mu, h(q + z) - h(q));
             };
@@ -197,7 +198,8 @@ struct HJBLadderSolver {
         for (std::size_t j = 0; j < nz; ++j) {
             const double z = tier.sizes_[j];
             auto [lower, upper] = mdp_bounds_for_rung(tier, j, delta_row, q, Side::Ask, prev_delta);
-            const double mu = tier.markout_model.expected_markout(z);
+            const double tau = penalty.internalization_time.value(q - z);
+            const double mu = expected_markout(tier.markout_model, z, tau);
             const auto obj = [&](double d) {
                 return mdp_fill_payoff(tier.flow_curve.arrival_rate(d, z), z, d, mu, h(q - z) - h(q));
             };
@@ -351,7 +353,7 @@ struct HJBLadderSolver {
             total += mdp_fill_payoff(
                 tier.flow_curve.arrival_rate(d, z),
                 z, d,
-                tier.markout_model.expected_markout(z),
+                expected_markout(tier.markout_model, z, penalty.internalization_time.value(q + direction * z)),
                 h(q + direction * z) - hq
             );
         }

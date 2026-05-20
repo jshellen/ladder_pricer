@@ -59,23 +59,23 @@ Quotes are optimized rung by rung via golden-section search under inventory-cons
 | $s$ | reference spread |
 | $h(q)$ | stationary inventory value function |
 | $\lambda(\delta,z)$ | fill / arrival rate |
-| $\mu(z)$ | baseline expected markout |
+| $\mu(z,t)$ | expected markout — positive means price moves in your favour, negative means adverse selection |
+| $t(q)$ | internalization time — expected minutes to offload inventory $q$ |
 | $\Pi(q)$ | inventory penalty |
 
 ### Delta convention
 
-The project uses a single normalized delta for both sides.
+The project uses a single normalized delta for both sides, where $s(0.5 - \delta)$ is the distance from mid:
 
-- **Bid relative to mid**: $p^{\text{bid}} - m = s(\delta - 0.5)$
-- **Ask relative to mid**: $p^{\text{ask}} - m = s(0.5 - \delta)$
+$$p^{\text{bid}} = m - s(0.5 - \delta), \qquad p^{\text{ask}} = m + s(0.5 - \delta)$$
 
-Therefore:
+For passive quoting $\delta < 0.5$, so $s(0.5-\delta) > 0$: the bid is below mid and the ask is above mid. The spread income per lot is $s(0.5-\delta)$ on both sides.
 
 | Value | Meaning |
 |---|---|
-| $\delta < 0.5$ | passive quote on the correct side of mid |
-| $\delta = 0.5$ | quote exactly at mid |
-| $\delta > 0.5$ | quote crosses through mid |
+| $\delta < 0.5$ | passive quote: bid below mid / ask above mid |
+| $\delta = 0.5$ | quote exactly at mid, zero spread income |
+| $\delta > 0.5$ | aggressive quote: crosses through mid |
 
 ---
 
@@ -85,10 +85,10 @@ Each tier uses a logistic fill curve.
 
 ### 3.1 Arrival scale
 
-$$A(z) = A_0\, z^{-\theta}$$
+$$A(z) = A_0\, z^{-\theta - \beta z}$$
 
-- $A_0$: overall flow intensity
-- $\theta$: size decay
+- $A_0$: overall flow intensity — expected RFQ arrivals per minute at $\delta = 0.5$, $z = 1$
+- $\theta$, $\beta$: size-decay exponents
 
 ### 3.2 Hit ratio
 
@@ -105,19 +105,41 @@ A larger $\delta$ is a more aggressive quote: higher fill probability, lower mar
 
 ## 4. Markout and inventory penalty
 
-### 4.1 Markout model
+### 4.1 Markout models
 
-$$\mu(z) = \mu_0 + c\sqrt{z}$$
+Two markout models are available. Both accept trade size $z$ and internalization time $t$ (pre-computed by the solver from inventory $q$ via §4.2).
 
-Implemented by `SqrtMarkoutModel`. Larger trades carry higher expected adverse selection.
+**`SqrtMarkoutModel`** — time-independent:
 
-### 4.2 Inventory penalty
+$$\mu(z, t) = \mu_0 + c\sqrt{z}$$
 
-$$\Pi(q) = \gamma\sigma^2\!\left(\tau_0|q|^2 + \tau_1|q|^3 + \tau_2|q|^4\right)$$
+Larger trades carry higher expected adverse selection; the cost does not vary with time.
 
-- $\gamma$: risk aversion
-- $\sigma$: volatility scale
-- $\tau_0, \tau_1, \tau_2$: curvature terms — higher values create a stronger incentive to unwind
+**`SqrtTimeMarkoutModel`** — time-dependent:
+
+$$\mu(z, t) = \alpha(z)\sqrt{t} + \beta(z)\,t$$
+
+$$\alpha(z) = a_0 + a_1 z + a_2 z^2, \qquad \beta(z) = b_0 + b_1 z + b_2 z^2$$
+
+The $\sqrt{t}$ term captures diffusive adverse selection and the $t$ term captures drift-like adverse selection. The solver computes $t = t(q)$ from §4.2 and passes it in; the markout model itself is inventory-agnostic.
+
+### 4.2 Internalization time
+
+$$t(q) = \tau_0 + \tau_1|q| + \tau_2|q|^2 \quad \text{(minutes)}$$
+
+Implemented by `PolynomialInternalizationTime`. Represents the expected number of minutes needed to offload inventory $q$: a positive constant floor $\tau_0$ plus terms that grow with $|q|$.
+
+### 4.3 Inventory penalty
+
+The penalty decomposes into a **carry cost** and the internalization time:
+
+$$\Pi(q) = \underbrace{\gamma\sigma^2}_{\text{CarryCost}} \cdot\, q^2\, t(q)$$
+
+- $\gamma$ (`risk_aversion`): risk-aversion coefficient
+- $\sigma$: one-minute volatility (pips / √min); carry cost per unit time = $\gamma\sigma^2$
+- $\tau_0, \tau_1, \tau_2$: internalization time coefficients (minutes)
+
+`PolynomialInventoryPenalty` composes `CarryCost` and `PolynomialInternalizationTime`.
 
 ---
 
@@ -145,13 +167,49 @@ For a bid fill $q' = q+z$; for an ask fill $q' = q-z$.
 
 MDP tiers are customer-facing two-sided ladders. For each size $z$, the market maker posts a bid delta $\delta^b(q,z)$ and an ask delta $\delta^a(q,z)$.
 
-### 6.1 Bid contribution
+### 6.1 Payoff derivation
 
-$$H^{\text{bid}}(q,z,\delta) = \lambda(\delta,z)\Bigl[zs(0.5-\delta) - z\mu(z) + h(q+z)-h(q)\Bigr]$$
+The value function ansatz is $V(x,q,m) = x + qm + h(q)$, where $x$ is cash and $m$ is the mid/spot price.
 
-### 6.2 Ask contribution
+**Bid fill** — client sells $z$ to us at $p^{\text{bid}} = m - s(0.5-\delta)$, which is below mid for passive quotes.
 
-$$H^{\text{ask}}(q,z,\delta) = \lambda(\delta,z)\Bigl[zs(0.5-\delta) - z\mu(z) + h(q-z)-h(q)\Bigr]$$
+$$V_{\text{before}} = x + qm + h(q)$$
+
+$$V_{\text{after}} = \bigl(x - z\,p^{\text{bid}}\bigr) + (q+z)m + h(q+z)$$
+
+$$= x - z\bigl(m - s(0.5-\delta)\bigr) + (q+z)m + h(q+z)$$
+
+$$= x - zm + zs(0.5-\delta) + qm + zm + h(q+z)$$
+
+$$\Delta V_{\text{instant}} = V_{\text{after}} - V_{\text{before}} = zs(0.5-\delta) + h(q+z) - h(q)$$
+
+After the fill the inventory is $q+z$. The market maker must internalize this position over an expected time $t(q+z)$. The expected markout $\mu(z,\,t(q+z))$ is the anticipated price move per lot over that period — negative when the flow is adverse (price moves against the position), positive when it is favourable. Adding it gives the net per-fill payoff:
+
+$$P^{\text{bid}}(q,z,\delta) = zs(0.5-\delta) + z\mu(z,\,t(q+z)) + h(q+z) - h(q)$$
+
+**Ask fill** — client buys $z$ from us at $p^{\text{ask}} = m + s(0.5-\delta)$, which is above mid for passive quotes.
+
+$$V_{\text{before}} = x + qm + h(q)$$
+
+$$V_{\text{after}} = \bigl(x + z\,p^{\text{ask}}\bigr) + (q-z)m + h(q-z)$$
+
+$$= x + z\bigl(m + s(0.5-\delta)\bigr) + (q-z)m + h(q-z)$$
+
+$$= x + zm + zs(0.5-\delta) + qm - zm + h(q-z)$$
+
+$$\Delta V_{\text{instant}} = V_{\text{after}} - V_{\text{before}} = zs(0.5-\delta) + h(q-z) - h(q)$$
+
+Post-fill inventory is $q-z$, so:
+
+$$P^{\text{ask}}(q,z,\delta) = zs(0.5-\delta) + z\mu(z,\,t(q-z)) + h(q-z) - h(q)$$
+
+The spread income $zs(0.5-\delta)$ is identical on both sides. The markout $t$ is evaluated at the **post-fill** inventory because it is the resulting position that must be internalized.
+
+### 6.2 Bellman contributions
+
+$$H^{\text{bid}}(q,z,\delta) = \lambda(\delta,z)\,P^{\text{bid}}(q,z,\delta)$$
+
+$$H^{\text{ask}}(q,z,\delta) = \lambda(\delta,z)\,P^{\text{ask}}(q,z,\delta)$$
 
 ### 6.3 Ladder objective
 
@@ -278,20 +336,24 @@ Stopping requires both to fall below their respective tolerances (`tol_h`, `tol_
 
 ```
 cpp/ladder_pricer/
-├── hjb_ladder.hpp       # aggregator — single include for downstream code
-├── common.hpp           # Matrix/OptionalDeltaRow types, grid utilities, Side enum
-├── models.hpp           # LogisticFlowCurve, SqrtMarkoutModel, PolynomialInventoryPenalty
-├── quote_analytics.hpp  # QuoteSummary, QuoteMetrics
-├── policy.hpp           # QuotePolicy, DarkPoolPolicy
-├── solver_config.hpp    # SolverConfig, GoldenSectionSearch, SolverDiagnostics
-├── tiers.hpp            # MDPTier
-├── dark_pool.hpp        # DarkPoolVenue
-├── solver.hpp           # HJBLadderSolver, HJBSolution
-└── bindings.cpp         # pybind11 Python bindings
+├── hjb_ladder.hpp           # aggregator — single include for downstream code
+├── common.hpp               # Matrix/OptionalDeltaRow types, grid utilities, Side enum
+├── flow_curve.hpp           # LogisticFlowCurve
+├── carry_cost.hpp           # CarryCost (γσ²)
+├── internalization_time.hpp # PolynomialInternalizationTime  t(q) = τ₀ + τ₁|q| + τ₂|q|²
+├── markout.hpp              # SqrtMarkoutModel, SqrtTimeMarkoutModel, MarkoutModel variant
+├── penalty.hpp              # PolynomialInventoryPenalty (composes CarryCost × InternalizationTime)
+├── quote_analytics.hpp      # QuoteSummary, QuoteMetrics
+├── policy.hpp               # QuotePolicy, DarkPoolPolicy
+├── solver_config.hpp        # SolverConfig, GoldenSectionSearch, SolverDiagnostics
+├── tiers.hpp                # MDPTier
+├── dark_pool.hpp            # DarkPoolVenue
+├── solver.hpp               # HJBLadderSolver, HJBSolution
+└── bindings.cpp             # pybind11 Python bindings
 
-app.py                   # Streamlit UI
+app.py                       # Streamlit UI
 tests/
-└── test_symmetry.py     # Numerical symmetry tests (zero drift → h and policies are even)
+└── test_symmetry.py         # Numerical symmetry tests (zero drift → h and policies are even)
 ```
 
 The Streamlit app lets you configure tiers, choose a uniform or piecewise grid, solve the HJB, and inspect flow curves, quote profiles, the value function, and the dark-pool posted-size policy.
@@ -314,12 +376,27 @@ The Streamlit app lets you configure tiers, choose a uniform or piecewise grid, 
 
 | Parameter | Effect |
 |---|---|
-| `A0`, `theta` | Flow intensity and size-decay exponent |
+| `A0` | Flow intensity: RFQ arrivals per minute at $\delta = 0.5$, $z = 1$ |
+| `theta`, `beta` | Size-decay exponents; $A(z) = A_0\,z^{-\theta - \beta z}$ |
 | `shift` | Delta at which the fill curve is at 50 % |
 | `steepness` | Sensitivity of fill rate to delta |
 | `volume_shift` | Shifts the fill curve for larger sizes |
-| `markout_base`, `markout_coeff` | Expected adverse selection cost |
 | `delta_min`, `delta_max` | Hard bounds on the quote control |
+
+**`SqrtMarkoutModel`** parameters:
+
+| Parameter | Effect |
+|---|---|
+| `markout_base` $\mu_0$ | Constant adverse-selection cost (pips) |
+| `markout_coeff` $c$ | Size-dependent coefficient (pips); total = $\mu_0 + c\sqrt{z}$ pips |
+| `trading_cost` | Flat execution cost (EUR/million); converted via spot and added to base |
+
+**`SqrtTimeMarkoutModel`** parameters:
+
+| Parameter | Effect |
+|---|---|
+| $a_0, a_1, a_2$ | Coefficients of $\alpha(z) = a_0 + a_1 z + a_2 z^2$ (pips / √min) |
+| $b_0, b_1, b_2$ | Coefficients of $\beta(z) = b_0 + b_1 z + b_2 z^2$ (pips / min) |
 
 ### Dark pool
 
@@ -331,29 +408,42 @@ The Streamlit app lets you configure tiers, choose a uniform or piecewise grid, 
 | `posted_sizes` | Candidate posting sizes to evaluate |
 | `min_fill_value` | Activation threshold; raise above 0 to suppress noise on non-uniform grids |
 
-### Inventory penalty
+### Carry cost
 
 | Parameter | Effect |
 |---|---|
-| `risk_aversion` $\gamma$ | Overall penalty scale |
-| `sigma` | Volatility used in the penalty |
-| `tau0`, `tau1`, `tau2` | Quadratic, cubic, quartic curvature terms |
+| `risk_aversion` $\gamma$ | Scales the penalty; higher values penalise inventory more strongly |
+| `sigma` $\sigma$ | One-minute volatility (pips / √min); carry cost per minute = $\gamma\sigma^2$ |
+
+### Internalization time (global)
+
+| Parameter | Effect |
+|---|---|
+| `tau0` | Constant floor — minimum time even at zero inventory |
+| `tau1` | Linear growth with $|q|$ |
+| `tau2` | Quadratic growth with $|q|$ |
 
 ---
 
 ## 14. Summary of core formulas
 
 **Flow**
-$$A(z)=A_0 z^{-\theta}, \qquad \lambda(\delta,z)=A(z)\cdot\frac{1}{1+e^{-y(\delta,z)}}$$
+$$A(z)=A_0 z^{-\theta-\beta z}, \qquad \lambda(\delta,z)=A(z)\cdot\frac{1}{1+e^{-y(\delta,z)}}$$
 
-**Markout**
-$$\mu(z)=\mu_0+c\sqrt{z}$$
+**Internalization time**
+$$t(q)=\tau_0+\tau_1|q|+\tau_2|q|^2$$
+
+**Markout — `SqrtMarkoutModel`**
+$$\mu(z,t)=\mu_0+c\sqrt{z}$$
+
+**Markout — `SqrtTimeMarkoutModel`**
+$$\mu(z,t)=\alpha(z)\sqrt{t}+\beta(z)\,t, \qquad \alpha(z)=a_0+a_1 z+a_2 z^2, \quad \beta(z)=b_0+b_1 z+b_2 z^2$$
 
 **Inventory penalty**
-$$\Pi(q)=\gamma\sigma^2\!\left(\tau_0|q|^2+\tau_1|q|^3+\tau_2|q|^4\right)$$
+$$\Pi(q)=\gamma\sigma^2\cdot q^2\cdot t(q)$$
 
 **MDP bid / ask payoff per fill**
-$$zs(0.5-\delta) - z\mu(z) + h(q\pm z) - h(q)$$
+$$zs(0.5-\delta) + z\mu(z,\,t(q\pm z)) + h(q\pm z) - h(q)$$
 
 **Bellman RHS**
 $$\operatorname{RHS}(q) = -\Pi(q) + \text{spot\_drift}\cdot q + \sum_k H_k^{\text{MDP}}(q) + H^{\text{DP}}(q)$$
