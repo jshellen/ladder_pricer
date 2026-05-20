@@ -436,7 +436,8 @@ struct HJBLadderSolver {
 
         for (std::size_t i = 0; i < grid_meta_.nq; ++i) {
             const double q = config.q_grid[i];
-            double val = -penalty.value(q) + config.spot_drift * q;
+            double val = -penalty.value(q)
+                       + config.spot_drift * q;
 
             for (const auto& tier : mdp_tiers) {
                 val += mdp_bellman_contribution_side(tier, q, i, h, Side::Bid);

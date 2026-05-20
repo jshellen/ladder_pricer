@@ -2,6 +2,8 @@
 
 #include "common.hpp"
 
+#include <cmath>
+
 namespace hjb {
 
 struct CarryCost {
@@ -17,5 +19,6 @@ struct CarryCost {
         return risk_aversion * sigma * sigma;
     }
 };
+
 
 } // namespace hjb

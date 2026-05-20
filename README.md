@@ -38,6 +38,8 @@ python -m unittest discover -s tests -v
 12. [File architecture](#12-file-architecture)
 13. [Parameter guide](#13-parameter-guide)
 14. [Summary of core formulas](#14-summary-of-core-formulas)
+15. [Units reference](#15-units-reference)
+
 
 ---
 
@@ -53,15 +55,16 @@ Quotes are optimized rung by rung via golden-section search under inventory-cons
 
 | Symbol | Meaning |
 |---|---|
-| $q$ | inventory |
-| $z$ | trade size |
+| $q$ | inventory (EUR lots) |
+| $z$ | trade size (EUR lots) |
+| $m$ | EUR/SEK spot rate |
 | $\delta$ | quote control in normalized spread units |
-| $s$ | reference spread |
-| $h(q)$ | stationary inventory value function |
-| $\lambda(\delta,z)$ | fill / arrival rate |
-| $\mu(z,t)$ | expected markout — positive means price moves in your favour, negative means adverse selection |
-| $t(q)$ | internalization time — expected minutes to offload inventory $q$ |
-| $\Pi(q)$ | inventory penalty |
+| $s$ | reference spread (SEK/EUR) |
+| $h(q)$ | stationary inventory value function (SEK) |
+| $\lambda(\delta,z)$ | fill / arrival rate (fills/min) |
+| $\mu(z,t)$ | expected markout (pips) — positive means price moves in your favour, negative means adverse selection |
+| $t(q)$ | internalization time (min) — expected minutes to offload inventory $q$ |
+| $\Pi(q)$ | inventory penalty (SEK/min) |
 
 ### Delta convention
 
@@ -408,12 +411,12 @@ The Streamlit app lets you configure tiers, choose a uniform or piecewise grid, 
 | `posted_sizes` | Candidate posting sizes to evaluate |
 | `min_fill_value` | Activation threshold; raise above 0 to suppress noise on non-uniform grids |
 
-### Carry cost
+### Carry cost (`CarryCost`)
 
 | Parameter | Effect |
 |---|---|
 | `risk_aversion` $\gamma$ | Scales the penalty; higher values penalise inventory more strongly |
-| `sigma` $\sigma$ | One-minute volatility (pips / √min); carry cost per minute = $\gamma\sigma^2$ |
+| `sigma` $\sigma$ | One-minute volatility (pips / √min); carry cost per unit time = $\gamma\sigma^2$ |
 
 ### Internalization time (global)
 
@@ -446,7 +449,25 @@ $$\Pi(q)=\gamma\sigma^2\cdot q^2\cdot t(q)$$
 $$zs(0.5-\delta) + z\mu(z,\,t(q\pm z)) + h(q\pm z) - h(q)$$
 
 **Bellman RHS**
-$$\operatorname{RHS}(q) = -\Pi(q) + \text{spot\_drift}\cdot q + \sum_k H_k^{\text{MDP}}(q) + H^{\text{DP}}(q)$$
+$$\operatorname{RHS}(q) = -\Pi(q) - c(\sigma)\cdot m\cdot|q| + \text{spot\_drift}\cdot q + \sum_k H_k^{\text{MDP}}(q) + H^{\text{DP}}(q)$$
 
 **Pseudo-time iteration**
 $$h^{n+1}(q) = h^n(q) + dt\cdot\operatorname{RHS}^n(q) - h^{n+1}(0)$$
+
+---
+
+## 15. Units reference
+
+All quantities in the HJB are in **SEK/min** (the P&L currency per unit pseudo-time). The value function $h(q)$ is in **SEK**.
+
+| Quantity | Units |
+|---|---|
+| $h(q)$ | SEK |
+| $\Pi(q)$ | SEK/min |
+| $\lambda(\delta,z)$ | fills/min |
+| $\mu(z,t)$ | pips (= $10^{-4}$ SEK/EUR, converted in payoff) |
+| $\sigma$ | pips/√min |
+| $t(q)$ | min |
+| $m$ | SEK/EUR (EUR/SEK spot) |
+
+**Currency note:** inventory $q$ is in EUR lots; P&L and value function are in SEK. To compare with real-world EUR P&L, divide by the spot $m$.

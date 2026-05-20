@@ -1181,10 +1181,13 @@ with st.sidebar:
             value=20.0,
             step=1.0,
             format="%.2f",
-            help="One-minute volatility in pips. The carry cost term is γσ²·t(q) where t is in minutes.",
+            help="One-minute volatility in pips. Used in both carry terms.",
         ) / 10_000.0
-        risk_aversion = st.number_input("risk_aversion", value=10.0, step=1.0, format="%.2f")
-
+        risk_aversion = st.number_input(
+            "γ (risk aversion)",
+            value=10.0, step=1.0, format="%.2f",
+            help="Quadratic penalty: γσ²·q²·t(q).",
+        )
     with st.sidebar.expander("Internalization time", expanded=False):
         st.caption("t(q) = τ₀ + τ₁|q| + τ₂|q|²  —  time in minutes")
         tau0 = st.number_input("tau0 (constant) [min]", value=4.0, step=1.0, format="%.4f",
