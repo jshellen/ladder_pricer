@@ -158,6 +158,7 @@ class CommonTierSpec:
     flow_shift: float
     flow_volume_shift: float
     markout_spec: MarkoutSpec
+    use_markout: bool
     delta_min: float
     delta_max: float
 
@@ -186,6 +187,7 @@ class MDPTierSpec(CommonTierSpec):
             markout_model=markout,
             delta_min=float(self.delta_min),
             delta_max=float(self.delta_max),
+            use_markout=bool(self.use_markout),
         )
 
 
@@ -271,12 +273,12 @@ def default_tier_values(i: int) -> dict:
             "kind": "mdp",
             "name": "Tier 1",
             "sizes": "1, 2, 3, 5, 10, 20",
-            "flow_A0": 1.00,
-            "flow_theta": 0.0,
-            "flow_beta": 0.0,
-            "flow_steepness": 10.00,
-            "flow_shift": 0.50,
-            "flow_volume_shift": 0.015,
+            "flow_A0": 0.0155,
+            "flow_theta": 0.144,
+            "flow_beta": 0.0857,
+            "flow_steepness": 8.42,
+            "flow_shift": 0.52,
+            "flow_volume_shift": 0.026,
             **_markout_defaults,
             "sqrt_t_a0": -0.1785,
             "sqrt_t_a1": -0.1819,
@@ -292,13 +294,19 @@ def default_tier_values(i: int) -> dict:
             "kind": "mdp",
             "name": "Tier 2",
             "sizes": "1, 2, 3, 5, 10, 20",
-            "flow_A0": 1.0,
-            "flow_theta": 0.0,
-            "flow_beta": 0.0,
-            "flow_steepness": 10.0,
-            "flow_shift": 0.30,
-            "flow_volume_shift": 0.01,
+            "flow_A0": 0.0232,
+            "flow_theta": 0.303,
+            "flow_beta": 0.122,
+            "flow_steepness": 2.86,
+            "flow_shift": 0.48,
+            "flow_volume_shift": 0.02,
             **_markout_defaults,
+            "sqrt_t_a0": -0.16,
+            "sqrt_t_a1": -0.156,
+            "sqrt_t_a2":  0.0044,
+            "sqrt_t_b0":  0.011,
+            "sqrt_t_b1": -0.00046,
+            "sqrt_t_b2":  0.0,
             "delta_min": -100.0,
             "delta_max": 100.0,
         },
@@ -398,6 +406,11 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
         )
 
         st.markdown("**Markout model**")
+        use_markout = st.checkbox(
+            f"Price in markout {i + 1}",
+            value=bool(defaults.get("use_markout", True)),
+            key=f"use_markout_{i}",
+        )
         markout_model_type = st.selectbox(
             f"Markout model type {i + 1}",
             options=["sqrt", "sqrt_time"],
@@ -485,6 +498,7 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
         flow_shift=float(flow_shift),
         flow_volume_shift=float(flow_volume_shift),
         markout_spec=markout_spec,
+        use_markout=bool(use_markout),
         delta_min=float(tier_delta_min),
         delta_max=float(tier_delta_max),
     )
@@ -734,6 +748,51 @@ def make_hit_ratio_figure(cpp_tier: CppTier, spec: TierSpec) -> go.Figure:
     return fig
 
 
+def make_implied_hit_ratio_figure(cpp_tier: CppTier, spec: TierSpec) -> go.Figure:
+    q_grid = [float(q) for q in cpp_tier.policy.q_grid]
+    sizes = [float(z) for z in tier_sizes(spec)]
+    n = len(sizes)
+    fig = go.Figure()
+
+    for i, zf in enumerate(sizes):
+        t = 1.0 - i / max(n - 1, 1)
+        shade = int((0.3 + 0.6 * t) * 255)
+        bid_color = f"rgb(0, {shade // 2}, {shade})"
+        ask_color = f"rgb({shade}, {shade // 4}, 0)"
+
+        bid_hr, ask_hr = [], []
+        for q in q_grid:
+            if is_admissible(cpp_tier, q, zf, "bid"):
+                d = cpp_tier.quote(q, zf, "bid")
+                bid_hr.append(cpp_tier.hit_ratio(float(d), zf))
+            else:
+                bid_hr.append(np.nan)
+
+            if is_admissible(cpp_tier, q, zf, "ask"):
+                d = cpp_tier.quote(q, zf, "ask")
+                ask_hr.append(cpp_tier.hit_ratio(float(d), zf))
+            else:
+                ask_hr.append(np.nan)
+
+        fig.add_trace(go.Scatter(
+            x=q_grid, y=bid_hr, mode="lines",
+            name=f"{zf:g} bid", line=dict(color=bid_color),
+        ))
+        fig.add_trace(go.Scatter(
+            x=q_grid, y=ask_hr, mode="lines",
+            name=f"{zf:g} ask", line=dict(color=ask_color, dash="dash"),
+        ))
+
+    fig.update_layout(
+        title=f"Implied hit ratios vs inventory — {spec.name}",
+        xaxis_title="Inventory q",
+        yaxis_title="Hit ratio",
+        yaxis={"range": [0.0, 1.0]},
+        height=500,
+    )
+    return fig
+
+
 def make_quote_inventory_figure(
     cpp_tier: CppTier,
     spec: TierSpec,
@@ -741,29 +800,33 @@ def make_quote_inventory_figure(
     mid_price: float,
 ) -> go.Figure:
     q_grid = [float(q) for q in cpp_tier.policy.q_grid]
+    sizes = [float(z) for z in tier_sizes(spec)]
+    n = len(sizes)
     fig = go.Figure()
 
-    for z in tier_sizes(spec):
-        zf = float(z)
+    for i, zf in enumerate(sizes):
+        # shade from light (small rung) to dark (large rung), range [0.3, 0.9]
+        t = 1.0 - i / max(n - 1, 1)
+        shade = int((0.3 + 0.6 * t) * 255)
+        bid_color = f"rgb(0, {shade // 2}, {shade})"
+        ask_color = f"rgb({shade}, {shade // 4}, 0)"
+
         bid_vals: list[float] = []
         ask_vals: list[float] = []
-
         for q in q_grid:
             bid = masked_quote_summary(cpp_tier, q, zf, "bid", mid_price, spread)
             ask = masked_quote_summary(cpp_tier, q, zf, "ask", mid_price, spread)
             bid_vals.append(np.nan if bid is None else float(bid.quote_relative_to_mid_pips))
             ask_vals.append(np.nan if ask is None else float(ask.quote_relative_to_mid_pips))
 
-        fig.add_trace(go.Scatter(x=q_grid, y=bid_vals, mode="lines", name=f"{zf:g} bid"))
-        fig.add_trace(
-            go.Scatter(
-                x=q_grid,
-                y=ask_vals,
-                mode="lines",
-                line=dict(dash="dash"),
-                name=f"{zf:g} ask",
-            )
-        )
+        fig.add_trace(go.Scatter(
+            x=q_grid, y=bid_vals, mode="lines",
+            name=f"{zf:g} bid", line=dict(color=bid_color),
+        ))
+        fig.add_trace(go.Scatter(
+            x=q_grid, y=ask_vals, mode="lines",
+            name=f"{zf:g} ask", line=dict(color=ask_color, dash="dash"),
+        ))
 
     fig.add_hline(y=0.0)
     fig.update_layout(
@@ -772,6 +835,47 @@ def make_quote_inventory_figure(
         yaxis_title="Quote relative to mid (pips)",
         height=500,
         yaxis=dict(range=[-20, 20]),
+    )
+    return fig
+
+
+def make_quote_surface_figure(
+    cpp_tier: CppTier,
+    spec: TierSpec,
+    spread: float,
+    mid_price: float,
+    side: str,
+) -> go.Figure:
+    q_grid = [float(q) for q in cpp_tier.policy.q_grid]
+    sizes = [float(z) for z in tier_sizes(spec)]
+
+    surface_z = []
+    for zf in sizes:
+        row = []
+        for q in q_grid:
+            qs = masked_quote_summary(cpp_tier, q, zf, side, mid_price, spread)
+            row.append(np.nan if qs is None else float(qs.quote_relative_to_mid_pips))
+        surface_z.append(row)
+
+    colorscale = "Blues" if side == "bid" else "Reds"
+    fig = go.Figure()
+    fig.add_trace(go.Surface(
+        x=q_grid, y=sizes, z=surface_z,
+        colorscale=colorscale, opacity=0.85,
+        showscale=False,
+        contours=dict(
+            x=dict(show=True, color="white", width=1),
+            y=dict(show=True, color="white", width=1),
+        ),
+    ))
+    fig.update_layout(
+        title=f"{side.capitalize()} quote surface — {spec.name}",
+        scene=dict(
+            xaxis_title="Inventory q",
+            yaxis_title="Rung size z",
+            zaxis_title="Quote vs mid (pips)",
+        ),
+        height=500,
     )
     return fig
 
@@ -1039,7 +1143,7 @@ st.markdown(
 )
 
 with st.sidebar:
-    with st.sidebar.expander("Global parameters", expanded=True):
+    with st.sidebar.expander("Global parameters", expanded=False):
         q_grid_mode = st.selectbox("Inventory grid mode", options=["uniform", "piecewise"], index=1)
         q_abs_max = st.number_input("max |q|", value=20.0, min_value=0.5, step=0.5, format="%.4f")
 
@@ -1055,12 +1159,12 @@ with st.sidebar:
         dt = st.number_input("dt", value=0.002, step=0.001, format="%.4f")
         n_iter = st.number_input("n_iter", value=140, step=10, min_value=1)
 
-        spread = st.number_input("reference spread", value=20.0 / 10000.0, step=1.0 / 10000.0, format="%.6f")
         mid_price = st.number_input("display mid price", value=1.000000, step=0.000100, format="%.6f")
 
     with st.sidebar.expander("Spot process", expanded=False):
         spot = st.number_input("spot (quote CCY per base CCY)", value=11.5, min_value=0.001, step=0.1, format="%.4f")
         spot_drift = st.number_input("spot_drift", value=0.0, step=0.001, format="%.5f")
+        spread = st.number_input("reference spread", value=20.0 / 10000.0, step=1.0 / 10000.0, format="%.6f")
 
     with st.sidebar.expander("Optimization / stopping", expanded=False):
         golden_tol = st.number_input("golden_tol", value=1e-4, format="%.1e")
@@ -1083,11 +1187,11 @@ with st.sidebar:
 
     with st.sidebar.expander("Internalization time", expanded=False):
         st.caption("t(q) = τ₀ + τ₁|q| + τ₂|q|²  —  time in minutes")
-        tau0 = st.number_input("tau0 (constant) [min]", value=5.0, step=1.0, format="%.4f",
+        tau0 = st.number_input("tau0 (constant) [min]", value=4.0, step=1.0, format="%.4f",
                                help="Minimum internalization time at zero inventory, in minutes.")
-        tau1 = st.number_input("tau1 (linear) [min / lot]", value=0.1, step=0.01, format="%.4f",
+        tau1 = st.number_input("tau1 (linear) [min / lot]", value=0.070, step=0.01, format="%.4f",
                                help="Additional minutes per unit of absolute inventory.")
-        tau2 = st.number_input("tau2 (quadratic) [min / lot²]", value=0.0015, step=0.0005, format="%.5f",
+        tau2 = st.number_input("tau2 (quadratic) [min / lot²]", value=0.0084, step=0.0005, format="%.5f",
                                help="Quadratic growth in minutes per lot².")
 
     st.header("Pricing tiers")
@@ -1265,6 +1369,9 @@ if tab_names:
             with st.expander("Hit ratios", expanded=False):
                 st.plotly_chart(make_hit_ratio_figure(cpp_tier, spec), use_container_width=True)
 
+            with st.expander("Implied hit ratios vs inventory", expanded=False):
+                st.plotly_chart(make_implied_hit_ratio_figure(cpp_tier, spec), use_container_width=True)
+
             with st.expander("Markouts", expanded=False):
                 st.plotly_chart(make_markout_figure(cpp_tier, spec), use_container_width=True)
 
@@ -1274,29 +1381,71 @@ if tab_names:
                     use_container_width=True,
                 )
 
-            q_for_ladder = st.select_slider(
-                f"Inventory level for ladder — {spec.name}",
-                options=available_q,
-                value=default_q,
-                key=f"qslider_{idx}",
-            )
+            with st.expander("Quote surface (3D)", expanded=False):
+                col_bid, col_ask = st.columns(2)
+                with col_bid:
+                    st.plotly_chart(
+                        make_quote_surface_figure(cpp_tier, spec, float(config.spread), float(mid_price), "bid"),
+                        use_container_width=True,
+                    )
+                with col_ask:
+                    st.plotly_chart(
+                        make_quote_surface_figure(cpp_tier, spec, float(config.spread), float(mid_price), "ask"),
+                        use_container_width=True,
+                    )
 
-            st.plotly_chart(
-                make_ladder_figure(cpp_tier, spec, float(q_for_ladder), float(config.spread), float(mid_price)),
-                use_container_width=True,
-            )
+            with st.expander("Volume premium", expanded=False):
+                q_for_ladder = st.select_slider(
+                    f"Inventory level for ladder — {spec.name}",
+                    options=available_q,
+                    value=default_q,
+                    key=f"qslider_{idx}",
+                )
+                st.plotly_chart(
+                    make_ladder_figure(cpp_tier, spec, float(q_for_ladder), float(config.spread), float(mid_price)),
+                    use_container_width=True,
+                )
+                q_for_table = st.selectbox(
+                    f"q for ladder table — {spec.name}",
+                    options=available_q,
+                    index=available_q.index(default_q),
+                    key=f"qtable_{idx}",
+                )
+                st.dataframe(
+                    make_q_ladder_table(cpp_tier, spec, float(q_for_table), float(config.spread), float(mid_price)),
+                    use_container_width=True,
+                )
 
-            q_for_table = st.selectbox(
-                f"q for ladder table — {spec.name}",
-                options=available_q,
-                index=available_q.index(default_q),
-                key=f"qtable_{idx}",
-            )
+            with st.expander("What this tab is solving"):
+                st.markdown(
+                    r"""
+**MDP tier — rung-by-rung two-sided ladder**
 
-            st.dataframe(
-                make_q_ladder_table(cpp_tier, spec, float(q_for_table), float(config.spread), float(mid_price)),
-                use_container_width=True,
-            )
+The dealer solves a stationary HJB equation. With value decomposition $V(x, q, m) = x + qm + h(q)$, the HJB reduces to a fixed-point problem in the inventory value-adjustment $h(q)$.
+
+**Fill payoff for a bid quote at rung $z$, inventory $q$:**
+
+$$
+\Pi^{\text{bid}}(z, q, \delta) = \lambda(\delta, z)\Bigl[z s(0.5 - \delta) + z\,\mu(z,\,t(q+z)) + h(q+z) - h(q)\Bigr]
+$$
+
+where $s$ is the spread, $\delta$ is the quoted delta, $\mu(z, t)$ is the expected markout, and $t(q)$ is the internalization time.
+
+**Ask is symmetric** (inventory decreases by $z$, markout evaluated at $t(q-z)$).
+
+**Carry cost penalty:**
+
+$$
+\Pi(q) = -\gamma\sigma^2 q^2\, t(q)
+$$
+
+**Flow curve:** $\lambda(\delta, z) = A(z)\cdot\sigma\!\left(\kappa\bigl(\delta - \delta_{50}(z)\bigr)\right)$, with $A(z) = A_0\,z^{-\theta - \beta z}$.
+
+**Markout model:** $\mu(z, t) = \alpha(z)\sqrt{t} + \beta(z)\,t$, with $\alpha(z) = a_0 + a_1 z + a_2 z^2$ and $\beta(z) = b_0 + b_1 z + b_2 z^2$.
+
+**Internalization time:** $t(q) = \tau_0 + \tau_1|q| + \tau_2 q^2$.
+                    """
+                )
 
     if solution.dark_pool is not None:
         dark_pool_tab = tabs[-1]
@@ -1326,25 +1475,30 @@ if tab_names:
                 st.plotly_chart(make_dark_pool_size_figure(venue), use_container_width=True)
                 st.dataframe(make_dark_pool_posted_size_table(venue), use_container_width=True)
 
-with st.expander("What this app is solving"):
-    st.markdown(
-        r"""
-MDP tiers use rung-by-rung two-sided ladder optimization.
+            with st.expander("What this tab is solving"):
+                st.markdown(
+                    r"""
+**Dark-pool venue**
 
-Dark-pool venue:
-- execution price is the mid
-- there is no quote-price optimization
-- arrival intensity is constant
-- incoming order size is geometric
-- if posted size is $u$ and incoming size is $Z$, then executed size is $\min(u, Z)$
-- the optimizer chooses posted bid size, ask size, or both depending on the venue mode
+The dealer posts a fixed bid size $u^{\text{bid}}$ and/or ask size $u^{\text{ask}}$. Execution is at the current mid price — no quote-price optimisation.
 
-The inventory grid must be:
-- strictly increasing
-- symmetric around 0
-- odd-length
-- with $0$ exactly at the middle index
-        """
-    )
+**Arrival process:** Poisson with constant intensity $\lambda^{\text{bid}}$ / $\lambda^{\text{ask}}$.
+
+**Order-size distribution:** Geometric with success probability $p$, so the mean incoming size is $1/p$.
+
+**Executed size:** $\min(u, Z)$ where $Z \sim \text{Geom}(p)$ is the incoming order size and $u$ is the posted size.
+
+**Fill payoff for bid, posted size $u$:**
+
+$$
+\Pi^{\text{bid}}(u) = \lambda^{\text{bid}}\,\mathbb{E}\bigl[\min(u, Z)\bigr]\,\bigl[h(q + \min(u,Z)) - h(q) - \text{fee}\bigr]
+$$
+
+**Optimizer chooses** $u^{\text{bid}}$, $u^{\text{ask}}$, or both, subject to the venue's allow-both-sides flag.
+
+**Inventory grid constraints:**
+- strictly increasing, symmetric around 0, odd-length, with 0 at the centre index
+                    """
+                )
 
 st.caption("After replacing the C++ files, rebuild the extension and restart Streamlit.")

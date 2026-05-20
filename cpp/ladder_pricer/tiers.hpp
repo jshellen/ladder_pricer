@@ -16,17 +16,20 @@ struct Tier {
     LogisticFlowCurve flow_curve;
     MarkoutModel markout_model;
     QuotePolicy policy;
+    bool use_markout{true};
 
     Tier() = default;
 
     Tier(
         std::string name_,
         LogisticFlowCurve flow_curve_,
-        MarkoutModel markout_model_
+        MarkoutModel markout_model_,
+        bool use_markout_ = true
     )
         : name(std::move(name_)),
           flow_curve(std::move(flow_curve_)),
-          markout_model(std::move(markout_model_)) {}
+          markout_model(std::move(markout_model_)),
+          use_markout(use_markout_) {}
 
     virtual ~Tier() = default;
 
@@ -68,9 +71,10 @@ struct MDPTier final : public Tier {
         LogisticFlowCurve flow_curve_,
         MarkoutModel markout_model_,
         double delta_min_ = -5.0,
-        double delta_max_ = 5.0
+        double delta_max_ = 5.0,
+        bool use_markout_ = true
     )
-        : Tier(std::move(name_), std::move(flow_curve_), std::move(markout_model_)),
+        : Tier(std::move(name_), std::move(flow_curve_), std::move(markout_model_), use_markout_),
           sizes_(std::move(sizes__)),
           delta_min(delta_min_),
           delta_max(delta_max_) {

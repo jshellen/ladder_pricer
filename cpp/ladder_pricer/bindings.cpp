@@ -292,6 +292,7 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("flow_curve", &Tier::flow_curve)
         .def_readwrite("markout_model", &Tier::markout_model)
         .def_readwrite("policy", &Tier::policy)
+        .def_readwrite("use_markout", &Tier::use_markout)
         .def("tier_type_name", &Tier::tier_type_name)
         .def("sizes", &Tier::sizes, py::return_value_policy::reference_internal)
         .def("A", [](const Tier& self, double z) { return self.flow_curve.A(z); }, py::arg("z"))
@@ -359,13 +360,14 @@ PYBIND11_MODULE(ladder_pricer, m) {
     py::class_<MDPTier, Tier>(m, "MDPTier")
         .def(py::init<>())
         .def(
-            py::init<std::string, std::vector<double>, LogisticFlowCurve, MarkoutModel, double, double>(),
+            py::init<std::string, std::vector<double>, LogisticFlowCurve, MarkoutModel, double, double, bool>(),
             py::arg("name"),
             py::arg("sizes"),
             py::arg("flow_curve"),
             py::arg("markout_model"),
             py::arg("delta_min") = -5.0,
-            py::arg("delta_max") = 5.0
+            py::arg("delta_max") = 5.0,
+            py::arg("use_markout") = true
         )
         .def_readwrite("sizes_", &MDPTier::sizes_)
         .def_readwrite("delta_min", &MDPTier::delta_min)

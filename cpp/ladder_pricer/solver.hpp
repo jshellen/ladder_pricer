@@ -176,7 +176,7 @@ struct HJBLadderSolver {
             const double z = tier.sizes_[j];
             auto [lower, upper] = mdp_bounds_for_rung(tier, j, delta_row, q, Side::Bid, prev_delta);
             const double tau = penalty.internalization_time.value(q + z);
-            const double mu = expected_markout(tier.markout_model, z, tau);
+            const double mu = tier.use_markout ? expected_markout(tier.markout_model, z, tau) : 0.0;
             const auto obj = [&](double d) {
                 return mdp_fill_payoff(tier.flow_curve.arrival_rate(d, z), z, d, mu, h(q + z) - h(q));
             };
@@ -199,7 +199,7 @@ struct HJBLadderSolver {
             const double z = tier.sizes_[j];
             auto [lower, upper] = mdp_bounds_for_rung(tier, j, delta_row, q, Side::Ask, prev_delta);
             const double tau = penalty.internalization_time.value(q - z);
-            const double mu = expected_markout(tier.markout_model, z, tau);
+            const double mu = tier.use_markout ? expected_markout(tier.markout_model, z, tau) : 0.0;
             const auto obj = [&](double d) {
                 return mdp_fill_payoff(tier.flow_curve.arrival_rate(d, z), z, d, mu, h(q - z) - h(q));
             };
@@ -353,7 +353,7 @@ struct HJBLadderSolver {
             total += mdp_fill_payoff(
                 tier.flow_curve.arrival_rate(d, z),
                 z, d,
-                expected_markout(tier.markout_model, z, penalty.internalization_time.value(q + direction * z)),
+                tier.use_markout ? expected_markout(tier.markout_model, z, penalty.internalization_time.value(q + direction * z)) : 0.0,
                 h(q + direction * z) - hq
             );
         }
