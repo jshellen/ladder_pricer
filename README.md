@@ -141,6 +141,24 @@ $$\Pi(q) = \underbrace{\gamma\sigma^2}_{\text{CarryCost}} \cdot q^2 \cdot t(q)$$
 
 `PolynomialInventoryPenalty` composes `CarryCost` and `PolynomialInternalizationTime`.
 
+#### Variance interpretation
+
+The carry cost penalty has a natural interpretation as the mark-to-market variance of inventory under linearly-decaying execution. 
+
+**Setup:** Suppose inventory decays linearly from initial position $q$ to zero over the internalization horizon $t(q)$:
+
+$$q(s) = q\left(1 - \frac{s}{t(q)}\right), \quad s \in [0, t(q)]$$
+
+Under an arithmetic Brownian motion price model $dP_s = \sigma \, dW_s$, the mark-to-market P&L variance is:
+
+$$\text{Var}(\text{MtM}) = \sigma^2 \int_0^{t(q)} q(s)^2 \, ds = \sigma^2 q^2 \int_0^{t(q)} \left(1 - \frac{s}{t(q)}\right)^2 ds = \frac{\sigma^2 q^2 \cdot t(q)}{3}$$
+
+The carry cost penalty is proportional to this realized variance:
+
+$$\Pi(q) = \gamma\sigma^2 q^2 t(q) = 3\gamma \cdot \text{Var}(\text{MtM})$$
+
+Thus $\gamma$ acts as a risk-aversion multiplier above the realized variance. When $\gamma=1$, the penalty is three times the variance of linearly-decaying inventory, which is conservative but reasonable for controlling risk. The longer inventory takes to internalize (larger $t(q)$), the more severe the quadratic penalty becomes, which discourages holding large positions.
+
 ---
 
 ## 5. Stationary HJB derivation
@@ -242,23 +260,43 @@ The gap between consecutive rungs is preserved across inventory rows so the ladd
 
 ## 8. Dark-pool venue
 
-The dark pool is an optional additional flow source. The market maker posts a size $u$ and receives fills drawn from a geometric distribution.
+The dark pool is an optional additional flow source. The market maker posts a size $u$ and receives fills drawn from a pluggable arrival distribution (`ArrivalDistribution` interface in `arrival_distributions.hpp`).
 
-### 8.1 Fill distribution
+### 8.1 Fill distributions
 
-Arrival sizes are geometric with success probability $p$:
+Two concrete distributions are available:
 
-$$P(\text{fill} = k) = p(1-p)^{k-1}, \quad k < u$$
+**`GeometricArrivalDist`** — geometric fill size with cap $u$:
 
-The posted size $u$ acts as a cap: if the underlying draw would exceed $u$, the fill is truncated to $u$ with residual probability $(1-p)^{u-1}$.
+$$P(\text{fill} = k) = p(1-p)^{k-1}, \quad k = 1,\ldots,u-1$$
+$$P(\text{fill} = u) = (1-p)^{u-1}$$
+
+Parameters: `lambda` (arrival intensity), `p` (success probability per unit).
+
+**`ZeroInflatedPoissonArrivalDist`** — zero-inflated truncated Poisson:
+
+$$P(\text{fill} = 0) = p_0$$
+$$P(\text{fill} = k) = (1-p_0)\,\frac{\tilde{P}(k;\mu)}{\sum_{j=1}^{u}\tilde{P}(j;\mu)}, \quad k = 1,\ldots,u$$
+
+where $\tilde{P}(k;\mu) = e^{-\mu}\mu^k/k!$ is the unnormalized Poisson PMF. With probability $p_0$ no fill occurs; otherwise the fill size is drawn from a Poisson($\mu$) distribution truncated to $\{1,\ldots,u\}$.
+
+Parameters: `lambda_arr` (arrival intensity), `mu` (Poisson rate parameter — note: the mean of the truncated distribution differs from `mu` for small `mu` or small `u`), `p0` (zero-inflation mass).
 
 ### 8.2 Fill value
 
-For a bid posting of size $u$ at inventory $q$ (direction $= +1$):
+For a bid posting of size $u$ at inventory $q$ (direction $d = +1$):
 
-$$H^{\text{DP,bid}}(q,u) = \lambda^{\text{bid}} \left[\sum_{k=1}^{u-1} p(1-p)^{k-1}\bigl(h(q+k)-h(q)-f^{\text{bid}}k\bigr) + (1-p)^{u-1}\bigl(h(q+u)-h(q)-f^{\text{bid}}u\bigr)\right]$$
+$$H^{\text{DP,bid}}(q,u) = \mathtt{dist\_bid.expected\_fill\_value}\!\left(h,\,q,\,h(q),\,u,\,f^{\text{bid}},\,+1\right)$$
 
-The ask side is symmetric with direction $= -1$, $\lambda^{\text{ask}}$, and $f^{\text{ask}}$.
+where the concrete expansion depends on the chosen distribution. For **GeometricArrivalDist**:
+
+$$H^{\text{DP,bid}}(q,u) = \lambda \left[\sum_{k=1}^{u-1} p(1-p)^{k-1}\bigl(h(q+k)-h(q)-f^{\text{bid}}k\bigr) + (1-p)^{u-1}\bigl(h(q+u)-h(q)-f^{\text{bid}}u\bigr)\right]$$
+
+For **ZeroInflatedPoissonArrivalDist**:
+
+$$H^{\text{DP,bid}}(q,u) = \lambda_{\text{arr}} \sum_{k=1}^{u} (1-p_0)\,\frac{\tilde{P}(k;\mu)}{\sum_{j=1}^{u}\tilde{P}(j;\mu)}\bigl(h(q+k)-h(q)-f^{\text{bid}}k\bigr)$$
+
+The ask side is symmetric with $d = -1$ and the ask distribution and fee.
 
 ### 8.3 Activation policy
 
@@ -347,7 +385,8 @@ cpp/ladder_pricer/
 ├── policy.hpp               # QuotePolicy, DarkPoolPolicy
 ├── solver_config.hpp        # SolverConfig, GoldenSectionSearch, SolverDiagnostics
 ├── tiers.hpp                # MDPTier
-├── dark_pool.hpp            # DarkPoolVenue
+├── arrival_distributions.hpp # ArrivalDistribution (abstract), GeometricArrivalDist, ZeroInflatedPoissonArrivalDist
+├── dark_pool.hpp            # DarkPoolVenue — depends on arrival_distributions.hpp
 ├── solver.hpp               # HJBLadderSolver, HJBSolution
 └── bindings.cpp             # pybind11 Python bindings
 
@@ -371,6 +410,9 @@ The Streamlit app lets you configure tiers, choose a uniform or piecewise grid, 
 | `dt` | 0.002 | Pseudo-time step — smaller is safer but slower |
 | `n_iter` | 140 | Maximum iterations |
 | `tol_h` / `tol_rhs` | 1e-5 / 1e-4 | Convergence tolerances |
+| `min_iter` | 5 | Minimum iterations before early stopping is allowed |
+| `consecutive_passes_required` | 3 | How many back-to-back iterations must both tolerances be met before stopping |
+| `early_stop` | true | Whether to stop before `n_iter` once convergence criteria are satisfied |
 
 ### MDP tier
 
@@ -382,14 +424,14 @@ The Streamlit app lets you configure tiers, choose a uniform or piecewise grid, 
 | `steepness` | Sensitivity of fill rate to delta |
 | `volume_shift` | Shifts the fill curve for larger sizes |
 | `delta_min`, `delta_max` | Hard bounds on the quote control |
+| `use_markout` | Whether to include the markout term in the per-fill payoff; set to `false` to ignore adverse selection |
 
 **`SqrtMarkoutModel`** parameters:
 
 | Parameter | Effect |
 |---|---|
-| `markout_base` $\mu_0$ | Constant adverse-selection cost (pips) |
-| `markout_coeff` $c$ | Size-dependent coefficient (pips); total = $\mu_0 + c\sqrt{z}$ pips |
-| `trading_cost` | Flat execution cost (EUR/million); converted via spot and added to base |
+| `base` $\mu_0$ | Constant adverse-selection cost (pips) |
+| `coeff` $c$ | Size-dependent coefficient (pips); total = $\mu_0 + c\sqrt{z}$ pips |
 
 **`SqrtTimeMarkoutModel`** parameters:
 
@@ -398,15 +440,33 @@ The Streamlit app lets you configure tiers, choose a uniform or piecewise grid, 
 | $a_0, a_1, a_2$ | Coefficients of $\alpha(z) = a_0 + a_1 z + a_2 z^2$ (pips / √min) |
 | $b_0, b_1, b_2$ | Coefficients of $\beta(z) = b_0 + b_1 z + b_2 z^2$ (pips / min) |
 
-### Dark pool
+**Note on Streamlit UI:** The Streamlit app includes a `trading_cost` parameter (EUR/million) for convenience. This is not a C++ parameter; it is converted and added to the `base` parameter during configuration.
+
+### Dark pool (`DarkPoolVenue`)
 
 | Parameter | Effect |
 |---|---|
-| `lambda_bid` / `lambda_ask` | Arrival intensity on each side |
-| `p_bid` / `p_ask` | Geometric fill probability |
+| `dist_bid` / `dist_ask` | `ArrivalDistribution` objects for each side (set via constructor) |
 | `fee_per_unit_bid/ask` | Per-unit execution cost |
 | `posted_sizes` | Candidate posting sizes to evaluate |
 | `min_fill_value` | Activation threshold; raise above 0 to suppress noise on non-uniform grids |
+
+The legacy positional constructor `DarkPoolVenue(lambda_bid, lambda_ask, p_bid, p_ask, ...)` creates a `GeometricArrivalDist` on each side automatically.
+
+**`GeometricArrivalDist`** parameters:
+
+| Parameter | Effect |
+|---|---|
+| `lambda` | Arrival intensity (fills/min) |
+| `p` | Success probability per unit; controls the tail of the fill-size distribution |
+
+**`ZeroInflatedPoissonArrivalDist`** parameters:
+
+| Parameter | Effect |
+|---|---|
+| `lambda_arr` | Arrival intensity (fills/min) |
+| `mu` | Poisson rate parameter — controls the shape of the truncated fill-size distribution (not equal to the mean for small `mu` or small cap `u`) |
+| `p0` | Zero-inflation probability — chance of no fill regardless of arrival |
 
 ### Carry cost (`CarryCost`)
 

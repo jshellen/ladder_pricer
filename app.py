@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -100,10 +101,17 @@ def validate_centered_q_grid(q_grid: np.ndarray) -> list[str]:
 DEFAULT_MDP_SIZES = "1, 2, 3, 5, 10, 20"
 DEFAULT_DARK_POOL_SETTINGS = {
     "enabled": False,
+    "dist_type": "Geometric",
     "lambda_bid": 2.00,
     "lambda_ask": 2.00,
+    # Geometric
     "p_bid": 0.50,
     "p_ask": 0.50,
+    # Zero-inflated Poisson
+    "mu_bid": 2.0,
+    "mu_ask": 2.0,
+    "p0_bid": 0.1,
+    "p0_ask": 0.1,
     "fee_per_unit_bid": 0.0,
     "fee_per_unit_ask": 0.0,
     "posted_sizes": "1, 2, 3, 5",
@@ -193,26 +201,46 @@ class MDPTierSpec(CommonTierSpec):
 
 @dataclass
 class DarkPoolSpec:
+    dist_type: str  # "Geometric" or "Zero-inflated Poisson"
     lambda_bid: float
     lambda_ask: float
-    p_bid: float
-    p_ask: float
-    fee_per_unit_bid: float
-    fee_per_unit_ask: float
-    posted_sizes: list[float]
-    allow_both_sides: bool
+    # Geometric params
+    p_bid: float = 0.5
+    p_ask: float = 0.5
+    # Zero-inflated Poisson params
+    mu_bid: float = 2.0
+    mu_ask: float = 2.0
+    p0_bid: float = 0.1
+    p0_ask: float = 0.1
+    fee_per_unit_bid: float = 0.0
+    fee_per_unit_ask: float = 0.0
+    posted_sizes: list[float] = field(default_factory=lambda: [1.0, 2.0, 3.0, 5.0])
+    allow_both_sides: bool = False
 
     def build_cpp_venue(self, spot: float) -> lp.DarkPoolVenue:
-        return lp.DarkPoolVenue(
-            lambda_bid=float(self.lambda_bid),
-            lambda_ask=float(self.lambda_ask),
-            p_bid=float(self.p_bid),
-            p_ask=float(self.p_ask),
-            fee_per_unit_bid=float(self.fee_per_unit_bid) * spot / 1_000_000,
-            fee_per_unit_ask=float(self.fee_per_unit_ask) * spot / 1_000_000,
-            posted_sizes=[float(u) for u in self.posted_sizes],
-            allow_both_sides=bool(self.allow_both_sides),
-        )
+        fee_bid = float(self.fee_per_unit_bid) * spot / 1_000_000
+        fee_ask = float(self.fee_per_unit_ask) * spot / 1_000_000
+        sizes = [float(u) for u in self.posted_sizes]
+        if self.dist_type == "Geometric":
+            return lp.DarkPoolVenue(
+                lambda_bid=float(self.lambda_bid),
+                lambda_ask=float(self.lambda_ask),
+                p_bid=float(self.p_bid),
+                p_ask=float(self.p_ask),
+                fee_per_unit_bid=fee_bid,
+                fee_per_unit_ask=fee_ask,
+                posted_sizes=sizes,
+                allow_both_sides=bool(self.allow_both_sides),
+            )
+        else:
+            return lp.DarkPoolVenue(
+                dist_bid=lp.ZeroInflatedPoissonArrivalDist(float(self.lambda_bid), float(self.mu_bid), float(self.p0_bid)),
+                dist_ask=lp.ZeroInflatedPoissonArrivalDist(float(self.lambda_ask), float(self.mu_ask), float(self.p0_ask)),
+                fee_per_unit_bid=fee_bid,
+                fee_per_unit_ask=fee_ask,
+                posted_sizes=sizes,
+                allow_both_sides=bool(self.allow_both_sides),
+            )
 
 
 TierSpec = MDPTierSpec
@@ -536,6 +564,13 @@ def build_dark_pool_spec_from_ui() -> DarkPoolSpec | None:
             help="If disabled, the dark pool only posts the inventory-reducing side.",
         )
 
+        dist_type = st.selectbox(
+            "Arrival distribution",
+            options=["Geometric", "Zero-inflated Poisson"],
+            index=["Geometric", "Zero-inflated Poisson"].index(defaults["dist_type"]),
+            help="Distribution of incoming dark-pool order sizes.",
+        )
+
         c1, c2 = st.columns(2)
         lambda_bid = c1.number_input(
             "Dark pool λ bid",
@@ -553,32 +588,73 @@ def build_dark_pool_spec_from_ui() -> DarkPoolSpec | None:
         )
 
         c3, c4 = st.columns(2)
-        p_bid = c3.number_input(
-            "Geometric p bid",
-            value=float(defaults["p_bid"]),
-            min_value=0.001,
-            max_value=1.0,
-            step=0.01,
-            format="%.4f",
-        )
-        p_ask = c4.number_input(
-            "Geometric p ask",
-            value=float(defaults["p_ask"]),
-            min_value=0.001,
-            max_value=1.0,
-            step=0.01,
-            format="%.4f",
-        )
+        if dist_type == "Geometric":
+            p_bid = c3.number_input(
+                "p bid",
+                value=float(defaults["p_bid"]),
+                min_value=0.001,
+                max_value=1.0,
+                step=0.01,
+                format="%.4f",
+                help="Success probability per unit. Mean fill size = 1/p.",
+            )
+            p_ask = c4.number_input(
+                "p ask",
+                value=float(defaults["p_ask"]),
+                min_value=0.001,
+                max_value=1.0,
+                step=0.01,
+                format="%.4f",
+                help="Success probability per unit. Mean fill size = 1/p.",
+            )
+            mu_bid = mu_ask = p0_bid = p0_ask = 0.0
+        else:
+            mu_bid = c3.number_input(
+                "μ bid",
+                value=float(defaults["mu_bid"]),
+                min_value=0.01,
+                step=0.1,
+                format="%.3f",
+                help="Poisson rate — mean fill size conditional on a non-zero fill.",
+            )
+            mu_ask = c4.number_input(
+                "μ ask",
+                value=float(defaults["mu_ask"]),
+                min_value=0.01,
+                step=0.1,
+                format="%.3f",
+                help="Poisson rate — mean fill size conditional on a non-zero fill.",
+            )
+            c5, c6 = st.columns(2)
+            p0_bid = c5.number_input(
+                "p₀ bid",
+                value=float(defaults["p0_bid"]),
+                min_value=0.0,
+                max_value=0.999,
+                step=0.01,
+                format="%.3f",
+                help="Zero-inflation probability — chance of no fill regardless of arrival.",
+            )
+            p0_ask = c6.number_input(
+                "p₀ ask",
+                value=float(defaults["p0_ask"]),
+                min_value=0.0,
+                max_value=0.999,
+                step=0.01,
+                format="%.3f",
+                help="Zero-inflation probability — chance of no fill regardless of arrival.",
+            )
+            p_bid = p_ask = 0.5
 
-        c5, c6 = st.columns(2)
-        fee_per_unit_bid = c5.number_input(
+        c_fee1, c_fee2 = st.columns(2)
+        fee_per_unit_bid = c_fee1.number_input(
             "Fee / rebate bid [EUR/M]",
             value=float(defaults["fee_per_unit_bid"]),
             step=0.5,
             format="%.2f",
             help="Positive = fee, negative = rebate. EUR per million of dark-pool fill.",
         )
-        fee_per_unit_ask = c6.number_input(
+        fee_per_unit_ask = c_fee2.number_input(
             "Fee / rebate ask [EUR/M]",
             value=float(defaults["fee_per_unit_ask"]),
             step=0.5,
@@ -599,15 +675,20 @@ def build_dark_pool_spec_from_ui() -> DarkPoolSpec | None:
             raise ValueError("Dark pool posted sizes must be strictly increasing.")
 
         st.caption(
-            "Dark-pool fills occur at mid. Arrival intensity is constant. Incoming order size is geometric, "
-            "and the executed size is min(posted size, incoming size)."
+            "Dark-pool fills occur at mid. Arrival intensity is constant. "
+            "The executed size is min(posted size, incoming size)."
         )
 
     return DarkPoolSpec(
+        dist_type=str(dist_type),
         lambda_bid=float(lambda_bid),
         lambda_ask=float(lambda_ask),
         p_bid=float(p_bid),
         p_ask=float(p_ask),
+        mu_bid=float(mu_bid),
+        mu_ask=float(mu_ask),
+        p0_bid=float(p0_bid),
+        p0_ask=float(p0_ask),
         fee_per_unit_bid=float(fee_per_unit_bid),
         fee_per_unit_ask=float(fee_per_unit_ask),
         posted_sizes=posted_sizes,
@@ -959,22 +1040,23 @@ def make_q_ladder_table(
 
 
 def make_dark_pool_parameter_table(venue: lp.DarkPoolVenue) -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {
-                "lambda_bid": float(venue.lambda_bid),
-                "lambda_ask": float(venue.lambda_ask),
-                "p_bid": float(venue.p_bid),
-                "p_ask": float(venue.p_ask),
-                "mean arrival size bid": round(1.0 / float(venue.p_bid), 4),
-                "mean arrival size ask": round(1.0 / float(venue.p_ask), 4),
-                "fee_per_unit_bid": float(venue.fee_per_unit_bid),
-                "fee_per_unit_ask": float(venue.fee_per_unit_ask),
-                "allow_both_sides": bool(venue.allow_both_sides),
-                "posted_sizes": ", ".join(f"{float(u):g}" for u in venue.posted_sizes),
-            }
-        ]
-    )
+    row: dict = {
+        "dist_bid": venue.dist_bid.name(),
+        "dist_ask": venue.dist_ask.name(),
+        "lambda_bid": float(venue.lambda_bid),
+        "lambda_ask": float(venue.lambda_ask),
+        "fee_per_unit_bid": float(venue.fee_per_unit_bid),
+        "fee_per_unit_ask": float(venue.fee_per_unit_ask),
+        "allow_both_sides": bool(venue.allow_both_sides),
+        "posted_sizes": ", ".join(f"{float(u):g}" for u in venue.posted_sizes),
+    }
+    if isinstance(venue.dist_bid, lp.GeometricArrivalDist):
+        row["p_bid"] = float(venue.p_bid)
+        row["mean fill size bid"] = round(1.0 / float(venue.p_bid), 4)
+    if isinstance(venue.dist_ask, lp.GeometricArrivalDist):
+        row["p_ask"] = float(venue.p_ask)
+        row["mean fill size ask"] = round(1.0 / float(venue.p_ask), 4)
+    return pd.DataFrame([row])
 
 
 def make_dark_pool_size_figure(venue: lp.DarkPoolVenue) -> go.Figure:
@@ -1015,34 +1097,62 @@ def make_dark_pool_posted_size_table(venue: lp.DarkPoolVenue) -> pd.DataFrame:
     return pd.DataFrame(rows).set_index("Inventory")
 
 
+def _geom_pmf(p: float, k_values: list[int]) -> list[float]:
+    r = 1.0 - p
+    return [p * r ** (k - 1) for k in k_values]
+
+
+def _zip_pmf(dist: lp.ZeroInflatedPoissonArrivalDist, k_values: list[int]) -> list[float]:
+    """P(fill=k) for k in k_values (all >= 1) under the truncated ZIP used by the solver.
+
+    The cap u = max(k_values). Normalization is over {1,...,u} as in the C++ implementation.
+    """
+    mu = float(dist.mu)
+    p0 = float(dist.p0)
+    u = max(k_values)
+    log_mu = math.log(mu) if mu > 0.0 else float("-inf")
+    raw = [math.exp(-mu + k * log_mu - math.lgamma(k + 1)) for k in range(1, u + 1)]
+    Z = sum(raw)
+    if Z < 1e-15:
+        return [0.0] * len(k_values)
+    return [(1.0 - p0) * raw[k - 1] / Z for k in k_values]
+
+
+def _dist_sides(
+    dist_bid: lp.ArrivalDistribution, dist_ask: lp.ArrivalDistribution
+) -> list[tuple[str, lp.ArrivalDistribution]]:
+    """Return [(label, dist), ...] deduplicating bid/ask if they have identical params."""
+    if dist_bid.name() == dist_ask.name():
+        if isinstance(dist_bid, lp.GeometricArrivalDist) and isinstance(dist_ask, lp.GeometricArrivalDist):
+            if dist_bid.p == dist_ask.p:
+                return [("bid/ask", dist_bid)]
+        elif isinstance(dist_bid, lp.ZeroInflatedPoissonArrivalDist) and isinstance(dist_ask, lp.ZeroInflatedPoissonArrivalDist):
+            if dist_bid.mu == dist_ask.mu and dist_bid.p0 == dist_ask.p0:
+                return [("bid/ask", dist_bid)]
+    return [("bid", dist_bid), ("ask", dist_ask)]
+
+
 def make_dark_pool_arrival_figure(venue: lp.DarkPoolVenue) -> go.Figure:
     posted_sizes = sorted(int(round(float(u))) for u in venue.posted_sizes)
     max_size = max(posted_sizes)
     fill_sizes = list(range(1, max_size + 1))
-
-    def geometric_density(p: float) -> list[float]:
-        r = 1.0 - p
-        return [p * r ** (k - 1) for k in fill_sizes]
-
-    sides = [("bid", float(venue.p_bid)), ("ask", float(venue.p_ask))]
-    if sides[0][1] == sides[1][1]:
-        sides = sides[:1]
-
     x_labels = [str(k) for k in fill_sizes]
 
     fig = go.Figure()
-    for side, p in sides:
-        fig.add_trace(go.Bar(
-            x=x_labels,
-            y=geometric_density(p),
-            name=side if len(sides) > 1 else f"p={p:.3f}",
-            opacity=0.7,
-        ))
+    for side, dist in _dist_sides(venue.dist_bid, venue.dist_ask):
+        if isinstance(dist, lp.GeometricArrivalDist):
+            y = _geom_pmf(float(dist.p), fill_sizes)
+        elif isinstance(dist, lp.ZeroInflatedPoissonArrivalDist):
+            y = _zip_pmf(dist, fill_sizes)
+        else:
+            fig.add_annotation(text=f"PMF not implemented for {dist.name()}", showarrow=False)
+            break
+        fig.add_trace(go.Bar(x=x_labels, y=y, name=side, opacity=0.7))
 
     fig.update_layout(
-        title="Geometric arrival density",
-        xaxis_title="Arrival size",
-        yaxis_title="Probability",
+        title=f"Fill size density ({venue.dist_bid.name()})",
+        xaxis_title="Fill size k",
+        yaxis_title="P(fill = k)",
         height=400,
     )
     return fig
@@ -1050,28 +1160,25 @@ def make_dark_pool_arrival_figure(venue: lp.DarkPoolVenue) -> go.Figure:
 
 def make_dark_pool_full_fill_figure(venue: lp.DarkPoolVenue) -> go.Figure:
     posted_sizes = sorted(int(round(float(u))) for u in venue.posted_sizes)
-
-    sides = [("bid", float(venue.p_bid)), ("ask", float(venue.p_ask))]
-    if sides[0][1] == sides[1][1]:
-        sides = sides[:1]
-
     x_labels = [str(u) for u in posted_sizes]
 
     fig = go.Figure()
-    for side, p in sides:
-        r = 1.0 - p
-        probs = [r ** (u - 1) for u in posted_sizes]
-        fig.add_trace(go.Bar(
-            x=x_labels,
-            y=probs,
-            name=side if len(sides) > 1 else f"p={p:.3f}",
-            opacity=0.7,
-        ))
+    for side, dist in _dist_sides(venue.dist_bid, venue.dist_ask):
+        if isinstance(dist, lp.GeometricArrivalDist):
+            r = 1.0 - float(dist.p)
+            y = [r ** (u - 1) for u in posted_sizes]
+        elif isinstance(dist, lp.ZeroInflatedPoissonArrivalDist):
+            # P(fill = u | cap u) — last term of the truncated ZIP
+            y = [_zip_pmf(dist, list(range(1, u + 1)))[-1] for u in posted_sizes]
+        else:
+            fig.add_annotation(text=f"P(full fill) not implemented for {dist.name()}", showarrow=False)
+            break
+        fig.add_trace(go.Bar(x=x_labels, y=y, name=side, opacity=0.7))
 
     fig.update_layout(
         title="P(full fill) by posted size",
-        xaxis_title="Posted size",
-        yaxis_title="Probability",
+        xaxis_title="Posted size u",
+        yaxis_title="P(fill = u)",
         height=400,
     )
     return fig
@@ -1459,8 +1566,14 @@ $$
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("λ bid", f"{float(venue.lambda_bid):.4f}")
             c2.metric("λ ask", f"{float(venue.lambda_ask):.4f}")
-            c3.metric("mean arrival size bid", f"{1.0 / float(venue.p_bid):.3f}")
-            c4.metric("mean arrival size ask", f"{1.0 / float(venue.p_ask):.3f}")
+            if isinstance(venue.dist_bid, lp.GeometricArrivalDist):
+                c3.metric("mean fill size bid", f"{1.0 / float(venue.p_bid):.3f}")
+            else:
+                c3.metric("dist bid", venue.dist_bid.name())
+            if isinstance(venue.dist_ask, lp.GeometricArrivalDist):
+                c4.metric("mean fill size ask", f"{1.0 / float(venue.p_ask):.3f}")
+            else:
+                c4.metric("dist ask", venue.dist_ask.name())
 
             c5, c6, c7 = st.columns(3)
             c5.metric("fee / rebate bid", f"{float(venue.fee_per_unit_bid):.5f}")
@@ -1470,7 +1583,7 @@ $$
             with st.expander("Dark-pool parameters", expanded=False):
                 st.dataframe(make_dark_pool_parameter_table(venue), use_container_width=True)
 
-            with st.expander("Geometric arrival density", expanded=False):
+            with st.expander("Arrival size density", expanded=False):
                 st.plotly_chart(make_dark_pool_arrival_figure(venue), use_container_width=True)
             with st.expander("P(full fill) by posted size", expanded=False):
                 st.plotly_chart(make_dark_pool_full_fill_figure(venue), use_container_width=True)
@@ -1487,14 +1600,14 @@ The dealer posts a fixed bid size $u^{\text{bid}}$ and/or ask size $u^{\text{ask
 
 **Arrival process:** Poisson with constant intensity $\lambda^{\text{bid}}$ / $\lambda^{\text{ask}}$.
 
-**Order-size distribution:** Geometric with success probability $p$, so the mean incoming size is $1/p$.
+**Order-size distribution:** Pluggable via `ArrivalDistribution`. The default is geometric with success probability $p$ (mean fill size $= 1/p$); zero-inflated Poisson is also supported.
 
-**Executed size:** $\min(u, Z)$ where $Z \sim \text{Geom}(p)$ is the incoming order size and $u$ is the posted size.
+**Executed size:** $\min(u, Z)$ where $Z$ is the incoming order size drawn from the distribution and $u$ is the posted size.
 
 **Fill payoff for bid, posted size $u$:**
 
 $$
-\Pi^{\text{bid}}(u) = \lambda^{\text{bid}}\,\mathbb{E}\bigl[\min(u, Z)\bigr]\,\bigl[h(q + \min(u,Z)) - h(q) - \text{fee}\bigr]
+\Pi^{\text{bid}}(u) = \sum_{k=1}^{u} P(\text{fill}=k)\,\bigl[h(q+k) - h(q) - \text{fee}\cdot k\bigr]
 $$
 
 **Optimizer chooses** $u^{\text{bid}}$, $u^{\text{ask}}$, or both, subject to the venue's allow-both-sides flag.

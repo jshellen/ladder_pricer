@@ -1,19 +1,19 @@
 #pragma once
 
+#include "arrival_distributions.hpp"
 #include "common.hpp"
 #include "policy.hpp"
 
 #include <cmath>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
 namespace hjb {
 
 struct DarkPoolVenue {
-    double lambda_bid{0.0};
-    double lambda_ask{0.0};
-    double p_bid{0.5};
-    double p_ask{0.5};
+    std::shared_ptr<ArrivalDistribution> dist_bid;
+    std::shared_ptr<ArrivalDistribution> dist_ask;
     double fee_per_unit_bid{0.0};
     double fee_per_unit_ask{0.0};
     std::vector<double> posted_sizes{1.0, 2.0, 3.0};
@@ -23,6 +23,12 @@ struct DarkPoolVenue {
 
     DarkPoolVenue() = default;
 
+    DarkPoolVenue(DarkPoolVenue&&) = default;
+    DarkPoolVenue& operator=(DarkPoolVenue&&) = default;
+    DarkPoolVenue(const DarkPoolVenue&) = default;
+    DarkPoolVenue& operator=(const DarkPoolVenue&) = default;
+
+    /// Constructor with geometric arrival distributions (legacy compatibility).
     DarkPoolVenue(
         double lambda_bid_,
         double lambda_ask_,
@@ -34,10 +40,28 @@ struct DarkPoolVenue {
         bool allow_both_sides_ = false,
         double min_fill_value_ = 0.0
     )
-        : lambda_bid(lambda_bid_),
-          lambda_ask(lambda_ask_),
-          p_bid(p_bid_),
-          p_ask(p_ask_),
+        : dist_bid(std::make_shared<GeometricArrivalDist>(lambda_bid_, p_bid_)),
+          dist_ask(std::make_shared<GeometricArrivalDist>(lambda_ask_, p_ask_)),
+          fee_per_unit_bid(fee_per_unit_bid_),
+          fee_per_unit_ask(fee_per_unit_ask_),
+          posted_sizes(std::move(posted_sizes_)),
+          allow_both_sides(allow_both_sides_),
+          min_fill_value(min_fill_value_) {
+        validate();
+    }
+
+    /// Constructor with explicit arrival distributions.
+    DarkPoolVenue(
+        std::shared_ptr<ArrivalDistribution> dist_bid_,
+        std::shared_ptr<ArrivalDistribution> dist_ask_,
+        double fee_per_unit_bid_,
+        double fee_per_unit_ask_,
+        std::vector<double> posted_sizes_,
+        bool allow_both_sides_ = false,
+        double min_fill_value_ = 0.0
+    )
+        : dist_bid(std::move(dist_bid_)),
+          dist_ask(std::move(dist_ask_)),
           fee_per_unit_bid(fee_per_unit_bid_),
           fee_per_unit_ask(fee_per_unit_ask_),
           posted_sizes(std::move(posted_sizes_)),
@@ -51,17 +75,16 @@ struct DarkPoolVenue {
     }
 
     void validate() const {
-        if (lambda_bid < 0.0 || lambda_ask < 0.0) {
-            throw std::invalid_argument("DarkPoolVenue: arrival intensities must be nonnegative.");
+        if (!dist_bid || !dist_ask) {
+            throw std::invalid_argument("DarkPoolVenue: dist_bid and dist_ask must be set.");
         }
-        if (!(p_bid > 0.0 && p_bid <= 1.0) || !(p_ask > 0.0 && p_ask <= 1.0)) {
-            throw std::invalid_argument("DarkPoolVenue: geometric probabilities must lie in (0, 1].");
-        }
+        dist_bid->validate();
+        dist_ask->validate();
         validate_positive_strictly_increasing(posted_sizes, "DarkPoolVenue.posted_sizes");
         for (double u : posted_sizes) {
             if (!is_integer_like(u)) {
                 throw std::invalid_argument(
-                    "DarkPoolVenue: posted_sizes must be integer-valued because arrival sizes are geometric in unit chunks."
+                    "DarkPoolVenue: posted_sizes must be integer-valued."
                 );
             }
         }

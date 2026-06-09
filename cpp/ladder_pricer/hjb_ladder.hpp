@@ -1,5 +1,6 @@
 #pragma once
 
+#include "arrival_distributions.hpp"
 #include "carry_cost.hpp"
 #include "common.hpp"
 #include "flow_curve.hpp"

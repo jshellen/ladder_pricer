@@ -244,33 +244,25 @@ struct HJBLadderSolver {
     }
 
     // --------------------------------------------------------
-    // Dark-pool geometric fill value
+    // Dark-pool fill value with pluggable arrival distributions
     // --------------------------------------------------------
 
     // Expected value of posting size u at inventory q in the dark pool.
     // direction = +1.0 for bid (inventory increases), -1.0 for ask (inventory decreases).
-    // Arrival sizes are geometric: P(fill = k) = p*(1-p)^{k-1} for k < u,
-    // with the final term absorbing the tail P(fill >= u) = (1-p)^{u-1} — the posted size
-    // acts as a cap so the last term has no leading p factor.
+    // Uses the venue's arrival distribution to compute fill probabilities.
     double dark_pool_fill_value(
         const LinearInterpolator1D& h,
         double q,
         double hq,
         int u,
-        double lambda,
-        double p,
+        const ArrivalDistribution& dist,
         double fee,
         double direction
     ) const {
-        const double r = 1.0 - p;
-        double expected = 0.0;
-        for (int k = 1; k < u; ++k) {
-            const double kd = static_cast<double>(k);
-            expected += p * std::pow(r, kd - 1.0) * (h(q + direction * kd) - hq - fee * kd);
-        }
-        const double ud = static_cast<double>(u);
-        expected += std::pow(r, ud - 1.0) * (h(q + direction * ud) - hq - fee * ud);
-        return lambda * expected;
+        return dist.expected_fill_value(
+            [&h](double q_val) { return h(q_val); },
+            q, hq, u, fee, direction
+        );
     }
 
     // --------------------------------------------------------
@@ -289,10 +281,10 @@ struct HJBLadderSolver {
             double best_size = 0.0;
             double best_value = std::numeric_limits<double>::lowest();
             for (double u_raw : venue.posted_sizes) {
-                if (venue.lambda_bid <= 0.0 || u_raw <= 0.0) continue;
+                if (!venue.dist_bid || u_raw <= 0.0) continue;
                 const double value = dark_pool_fill_value(
                     h, q, hq, static_cast<int>(std::llround(u_raw)),
-                    venue.lambda_bid, venue.p_bid, venue.fee_per_unit_bid, +1.0
+                    *venue.dist_bid, venue.fee_per_unit_bid, +1.0
                 );
                 if (value > best_value) { best_value = value; best_size = u_raw; }
             }
@@ -313,10 +305,10 @@ struct HJBLadderSolver {
             double best_size = 0.0;
             double best_value = std::numeric_limits<double>::lowest();
             for (double u_raw : venue.posted_sizes) {
-                if (venue.lambda_ask <= 0.0 || u_raw <= 0.0) continue;
+                if (!venue.dist_ask || u_raw <= 0.0) continue;
                 const double value = dark_pool_fill_value(
                     h, q, hq, static_cast<int>(std::llround(u_raw)),
-                    venue.lambda_ask, venue.p_ask, venue.fee_per_unit_ask, -1.0
+                    *venue.dist_ask, venue.fee_per_unit_ask, -1.0
                 );
                 if (value > best_value) { best_value = value; best_size = u_raw; }
             }
@@ -369,22 +361,22 @@ struct HJBLadderSolver {
         const double hq = h(q);
         double total = 0.0;
 
-        if (venue.policy.is_active(q_index, Side::Bid) && venue.lambda_bid > 0.0) {
+        if (venue.policy.is_active(q_index, Side::Bid) && venue.dist_bid) {
             const double u_raw = venue.policy.bid_size[q_index];
             if (u_raw > 0.0) {
                 total += dark_pool_fill_value(
                     h, q, hq, static_cast<int>(std::llround(u_raw)),
-                    venue.lambda_bid, venue.p_bid, venue.fee_per_unit_bid, +1.0
+                    *venue.dist_bid, venue.fee_per_unit_bid, +1.0
                 );
             }
         }
 
-        if (venue.policy.is_active(q_index, Side::Ask) && venue.lambda_ask > 0.0) {
+        if (venue.policy.is_active(q_index, Side::Ask) && venue.dist_ask) {
             const double u_raw = venue.policy.ask_size[q_index];
             if (u_raw > 0.0) {
                 total += dark_pool_fill_value(
                     h, q, hq, static_cast<int>(std::llround(u_raw)),
-                    venue.lambda_ask, venue.p_ask, venue.fee_per_unit_ask, -1.0
+                    *venue.dist_ask, venue.fee_per_unit_ask, -1.0
                 );
             }
         }

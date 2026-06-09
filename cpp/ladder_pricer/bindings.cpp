@@ -373,6 +373,27 @@ PYBIND11_MODULE(ladder_pricer, m) {
         .def_readwrite("delta_min", &MDPTier::delta_min)
         .def_readwrite("delta_max", &MDPTier::delta_max);
 
+    py::class_<ArrivalDistribution, std::shared_ptr<ArrivalDistribution>>(m, "ArrivalDistribution")
+        .def("validate", &ArrivalDistribution::validate)
+        .def("name", &ArrivalDistribution::name);
+
+    py::class_<GeometricArrivalDist, ArrivalDistribution, std::shared_ptr<GeometricArrivalDist>>(m, "GeometricArrivalDist")
+        .def(py::init<>())
+        .def(py::init<double, double>(), py::arg("lambda"), py::arg("p"))
+        .def_readwrite("lambda", &GeometricArrivalDist::lambda)
+        .def_readwrite("p", &GeometricArrivalDist::p)
+        .def("validate", &GeometricArrivalDist::validate)
+        .def("name", &GeometricArrivalDist::name);
+
+    py::class_<ZeroInflatedPoissonArrivalDist, ArrivalDistribution, std::shared_ptr<ZeroInflatedPoissonArrivalDist>>(m, "ZeroInflatedPoissonArrivalDist")
+        .def(py::init<>())
+        .def(py::init<double, double, double>(), py::arg("lambda_arr"), py::arg("mu"), py::arg("p0"))
+        .def_readwrite("lambda_arr", &ZeroInflatedPoissonArrivalDist::lambda_arr)
+        .def_readwrite("mu", &ZeroInflatedPoissonArrivalDist::mu)
+        .def_readwrite("p0", &ZeroInflatedPoissonArrivalDist::p0)
+        .def("validate", &ZeroInflatedPoissonArrivalDist::validate)
+        .def("name", &ZeroInflatedPoissonArrivalDist::name);
+
     py::class_<DarkPoolVenue>(m, "DarkPoolVenue")
         .def(py::init<>())
         .def(
@@ -387,16 +408,48 @@ PYBIND11_MODULE(ladder_pricer, m) {
             py::arg("allow_both_sides") = false,
             py::arg("min_fill_value") = 0.0
         )
-        .def_readwrite("lambda_bid", &DarkPoolVenue::lambda_bid)
-        .def_readwrite("lambda_ask", &DarkPoolVenue::lambda_ask)
-        .def_readwrite("p_bid", &DarkPoolVenue::p_bid)
-        .def_readwrite("p_ask", &DarkPoolVenue::p_ask)
+        .def(
+            py::init<std::shared_ptr<ArrivalDistribution>, std::shared_ptr<ArrivalDistribution>, double, double, std::vector<double>, bool, double>(),
+            py::arg("dist_bid"),
+            py::arg("dist_ask"),
+            py::arg("fee_per_unit_bid"),
+            py::arg("fee_per_unit_ask"),
+            py::arg("posted_sizes"),
+            py::arg("allow_both_sides") = false,
+            py::arg("min_fill_value") = 0.0
+        )
+        .def_readwrite("dist_bid", &DarkPoolVenue::dist_bid)
+        .def_readwrite("dist_ask", &DarkPoolVenue::dist_ask)
         .def_readwrite("fee_per_unit_bid", &DarkPoolVenue::fee_per_unit_bid)
         .def_readwrite("fee_per_unit_ask", &DarkPoolVenue::fee_per_unit_ask)
         .def_readwrite("posted_sizes", &DarkPoolVenue::posted_sizes)
         .def_readwrite("allow_both_sides", &DarkPoolVenue::allow_both_sides)
         .def_readwrite("min_fill_value", &DarkPoolVenue::min_fill_value)
         .def_readwrite("policy", &DarkPoolVenue::policy)
+        .def_property_readonly("lambda_bid", [](const DarkPoolVenue& v) {
+            if (auto* g = dynamic_cast<const GeometricArrivalDist*>(v.dist_bid.get()))
+                return g->lambda;
+            if (auto* z = dynamic_cast<const ZeroInflatedPoissonArrivalDist*>(v.dist_bid.get()))
+                return z->lambda_arr;
+            throw std::runtime_error("lambda_bid: unsupported distribution type");
+        })
+        .def_property_readonly("lambda_ask", [](const DarkPoolVenue& v) {
+            if (auto* g = dynamic_cast<const GeometricArrivalDist*>(v.dist_ask.get()))
+                return g->lambda;
+            if (auto* z = dynamic_cast<const ZeroInflatedPoissonArrivalDist*>(v.dist_ask.get()))
+                return z->lambda_arr;
+            throw std::runtime_error("lambda_ask: unsupported distribution type");
+        })
+        .def_property_readonly("p_bid", [](const DarkPoolVenue& v) {
+            if (auto* g = dynamic_cast<const GeometricArrivalDist*>(v.dist_bid.get()))
+                return g->p;
+            throw std::runtime_error("p_bid is only defined for GeometricArrivalDist");
+        })
+        .def_property_readonly("p_ask", [](const DarkPoolVenue& v) {
+            if (auto* g = dynamic_cast<const GeometricArrivalDist*>(v.dist_ask.get()))
+                return g->p;
+            throw std::runtime_error("p_ask is only defined for GeometricArrivalDist");
+        })
         .def("validate", &DarkPoolVenue::validate)
         .def("reset_policy_shape", &DarkPoolVenue::reset_policy_shape, py::arg("q_grid"))
         .def_static("is_integer_like", &DarkPoolVenue::is_integer_like, py::arg("x"), py::arg("tol") = 1e-10)
