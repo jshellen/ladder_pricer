@@ -45,9 +45,81 @@ python -m unittest discover -s tests -v
 
 ## 1. Purpose
 
-This project solves a **stationary inventory-control problem** for FX market making.
-The market maker posts two-sided size-ladder quotes (MDP tiers) and optionally participates in a dark pool.
-Quotes are optimized rung by rung via golden-section search under inventory-consistent monotonicity bounds.
+### The business problem
+
+As an FX market maker we earn money by quoting two prices to clients — a bid (we buy their euros) and an ask (we sell euros to them). The gap between the two is the spread, and every trade earns us a slice of it.
+
+The catch is **inventory**. Every trade shifts our position. If we buy euros all morning and the euro then weakens, we lose money on the position we built up. The longer we hold it and the larger it is, the more it costs — so there is a real tension between capturing spread income and controlling the inventory we accumulate.
+
+### What the model does
+
+**This model resolves that tension by telling us exactly how aggressively to quote, for every trade size and every inventory level, all at once.**
+
+The core intuition is straightforward:
+
+- When we are **long** euros we should *discourage* clients from selling to us (widen the bid) and *encourage* clients to buy from us (tighten the ask) — steering flow in the direction that reduces the position.
+- When we are **short** euros, the opposite applies.
+- When we are **flat**, we quote symmetrically to maximise spread income.
+
+The model makes this precise. It accounts for how sensitive clients are to our prices, how long it typically takes to work off a given position, and how much the market can move against us while we hold it.
+
+### How this differs from the previous model
+
+The previous generation model optimised a single quote — the 1M EUR price — and applied that decision uniformly across all trade sizes. This new model is a significant step forward in three respects.
+
+**Full size ladder.** Rather than pricing one size and scaling the rest manually, this model optimises every rung of the ladder simultaneously. The 1M, 2M, 3M, 5M, 10M, and 20M quotes are each solved for their own optimal delta, with the constraint that larger sizes are never quoted tighter than smaller ones. The volume premium curve emerges naturally from the optimisation rather than being set by hand.
+
+**Inventory-aware across all sizes.** The previous model's single-price output meant that inventory skewing had to be applied as a post-hoc adjustment. Here, inventory feeds directly into the optimisation for every size at once — so the ladder tilts and reshapes coherently as position changes, rather than receiving a uniform shift on top of a static curve.
+
+**Dark pool integration.** The previous model had no mechanism for passive inventory management. The new model incorporates a dark pool channel and optimises posting sizes alongside the client-facing quotes, giving us an additional lever to reduce inventory at mid without moving the public ladder.
+
+### Built on empirical customer flow data
+
+A pricing model is only as good as its understanding of how clients actually behave. Rather than relying on assumed or generic price sensitivity, this model is driven by **hit ratio curves calibrated individually for each customer and each FX pair** from our own RFQ history.
+
+For every client we estimate, statistically, how their likelihood of trading changes as our quote moves tighter or wider. These individual curves are then aggregated across the client base to produce a realistic, up-to-date picture of the flow dynamics we face at the portfolio level — capturing not just the average client but the full mix of flow types, sizes, and price sensitivities we actually see.
+
+The result is that the model's view of "how clients respond to our prices" is not a rough assumption — it is a continuously refreshed, data-driven input grounded in the actual behaviour of our specific counterparties.
+
+The same empirical discipline extends to the dark pool. Dark pool flow operates through a fundamentally different trading mechanism — fills arrive anonymously, there is no negotiation, and the size we actually receive depends on what counterparty flow happens to cross our resting order. This calls for a different model structure: rather than a price-sensitivity curve, we calibrate the arrival intensity and the distribution of fill sizes from historical dark pool activity. Crucially, because both the MDP and the dark pool are calibrated from real data and solved jointly, the model can account for the interaction between them — the value of a dark pool fill at a given inventory level is priced consistently with what we would otherwise earn by adjusting our client-facing quotes. This means the MDP ladder already reflects the presence of the dark pool as an inventory management alternative, and vice versa.
+
+### Inventory skews the volume premium curve
+
+The output is a complete **quote ladder** — a bid and an ask for each trade size (1M, 2M, 3M, 5M, 10M, 20M EUR) that updates coherently as inventory changes. Importantly, it is not just the overall level of quotes that shifts — the **shape of the volume premium curve** changes too.
+
+When we are long, the ladder steepens on the bid side: the extra spread we charge for larger sizes increases, because a 20M fill would make a bad position significantly worse. On the ask side the ladder flattens: we become more willing to deal in size to get the position down faster. The opposite pattern holds when we are short. Inventory therefore skews both the level and the steepness of the size-vs-spread relationship simultaneously.
+
+### Dark pool
+
+Alongside the client-facing ladder, the model supports an optional **dark pool** channel.
+
+A dark pool is an anonymous electronic venue where participants post orders without revealing their identity or intent. There is no spread to earn or pay — trades execute at the prevailing mid price. The attraction for us is purely inventory management: if we are long euros and a counterparty is looking to buy, we can offload position at mid rather than waiting for a client RFQ or moving our quotes aggressively and signalling distress to the market.
+
+The challenge is that dark pool fills are uncertain. We post a size, but the actual fill depends on what counterparty flow arrives — we may get a partial fill, a full fill, or nothing at all. Posting too large a size ties up capacity without guarantee of execution; posting too small leaves inventory reduction on the table.
+
+The model handles this explicitly. At each inventory level it evaluates all candidate posting sizes, computes the expected value of each taking into account the probability distribution of fill sizes and the cost of any execution fee, and selects the size that offers the best expected outcome. Posting is also directional by default: we only post to buy when we are short and only post to sell when we are long, so the dark pool always works in the same direction as the inventory signal from the quote ladder.
+
+### Automated calibration pipeline
+
+The quality of the model's inputs is maintained through a fully automated calibration process that runs daily across all three flow channels.
+
+**MDP customers** — the bilateral RFQ clients — are calibrated using logistic regression inspired techniques. For each customer and currency pair we fit a price-sensitivity curve to our historical quote and fill data, capturing how their probability of trading changes as we move our quote tighter or wider. This gives us a statistically grounded view of each client's behaviour rather than a desk estimate.
+
+**ECN flows** — trades executed on Electronic Communication Networks, the anonymous electronic venues where we stream prices to a broader market — present a different calibration challenge. On an ECN we do not observe every trade that takes place, only the fills that come to us. Calibration therefore has to be performed purely from our own execution history, without visibility into what competitors are quoting or what the rest of the market is doing. Despite this constraint, we can still extract a robust signal about arrival rates and price sensitivity from the pattern of our own fills over time.
+
+**Dark pool flows** are modelled as a zero-inflated Poisson process, reflecting the reality that arrivals are sporadic and fill sizes cluster around certain levels with a meaningful probability of receiving nothing at all. This too is calibrated from our historical dark pool activity.
+
+The entire estimation process — data extraction, model fitting, validation, and parameter publishing — is orchestrated by **Apache Airflow**. Airflow is a widely used open-source platform for scheduling and monitoring automated data workflows: think of it as a sophisticated job scheduler that runs a defined sequence of steps at a set time each day, tracks whether each step succeeded, and alerts the team if something goes wrong. In our case it ensures that freshly estimated flow parameters are available to the pricing model every morning before trading begins, without any manual intervention.
+
+The practical consequence is that the model's view of customer behaviour is never more than one day old. Flow dynamics that shift — a client becoming more price-sensitive, a change in dark pool liquidity, a new pattern emerging on ECNs — are reflected in the next day's calibration run automatically.
+
+### Adaptive to changing market conditions
+
+A pricing model that cannot keep up with the market is of limited use. The solver is implemented in C++ and typically converges in **under a second**, which means the entire quote ladder — all sizes, all inventory levels, bid and ask — can be recomputed from scratch as conditions evolve.
+
+In practice this matters most when the market moves quickly. If realised volatility spikes, the cost of holding inventory rises and the model will respond by quoting more defensively across the board. If we observe a sustained flow imbalance — more clients selling than buying, for instance — the model can be re-calibrated with updated flow parameters so that the ladder reflects what clients are actually doing today, not last month. Similarly, if the internalization environment changes or spreads widen, the solver can be rerun immediately to incorporate the new reality.
+
+The result is a system that stays aligned with live market dynamics rather than drifting on stale assumptions.
 
 ---
 
