@@ -1,14 +1,18 @@
 [build-system]
-requires = ["scikit-build-core>=0.10", "pybind11>=2.12"]
-build-backend = "scikit_build_core.build"
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "ladder_pricer"
-version = "0.1.0"
-description = "C++ HJB ladder solver with pybind11 bindings"
+version = "0.3.0"
+description = "Pure-Python Howard HJB ladder solver"
 readme = "README.md"
 requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
 
-[tool.scikit-build]
-minimum-version = "build-system.requires"
-cmake.build-type = "Release"
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ladder_pricer*"]
+
+[project.optional-dependencies]
+app = ["streamlit>=1.30", "pandas>=2.0", "plotly>=5.0"]

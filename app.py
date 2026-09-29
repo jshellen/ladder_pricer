@@ -12,7 +12,7 @@ try:
     import ladder_pricer as lp
 except ImportError as exc:
     raise ImportError(
-        "Could not import 'ladder_pricer'. Make sure the package is built and installed "
+        "Could not import 'ladder_pricer'. Make sure the package is installed "
         "into the same Python environment that runs Streamlit."
     ) from exc
 
@@ -120,39 +120,21 @@ DEFAULT_DARK_POOL_SETTINGS = {
 
 
 @dataclass
-class SqrtMarkoutSpec:
-    base: float = 0.0        # pips
-    coeff: float = 0.0       # pips
-    trading_cost: float = 0.0  # EUR / million
+class SaturatingMarkoutSpec:
+    impact_scale_pips: float = 1.0
+    size_exponent: float = 0.5
+    tau_minutes: float = 0.5
 
-    def build(self, spot: float) -> lp.SqrtMarkoutModel:
-        return lp.SqrtMarkoutModel(
-            base=self.base / 10_000 + self.trading_cost * spot / 1_000_000,
-            coeff=self.coeff / 10_000,
+    def build(self, spot: float) -> lp.SaturatingMarkoutModel:
+        del spot  # kept in the spec API for consistency with other tier builders
+        return lp.SaturatingMarkoutModel(
+            impact_scale=self.impact_scale_pips / 10_000.0,
+            size_exponent=self.size_exponent,
+            tau=self.tau_minutes,
         )
 
 
-@dataclass
-class SqrtTimeMarkoutSpec:
-    a0: float = -0.1785    # pips
-    a1: float = -0.1819    # pips
-    a2: float = 0.0052    # pips
-    b0: float = 0.0089    # pips
-    b1: float = 0.0068    # pips
-    b2: float = -0.0030    # pips
-
-    def build(self, spot: float) -> lp.SqrtTimeMarkoutModel:
-        return lp.SqrtTimeMarkoutModel(
-            a0=self.a0 / 10_000,
-            a1=self.a1 / 10_000,
-            a2=self.a2 / 10_000,
-            b0=self.b0 / 10_000,
-            b1=self.b1 / 10_000,
-            b2=self.b2 / 10_000,
-        )
-
-
-MarkoutSpec = SqrtMarkoutSpec | SqrtTimeMarkoutSpec
+MarkoutSpec = SaturatingMarkoutSpec
 
 
 @dataclass
@@ -186,7 +168,7 @@ class CommonTierSpec:
 class MDPTierSpec(CommonTierSpec):
     sizes: list[float]
 
-    def build_cpp_tier(self, spot: float) -> lp.MDPTier:
+    def build_tier(self, spot: float) -> lp.MDPTier:
         flow, markout = self.build_models(spot)
         return lp.MDPTier(
             name=self.name,
@@ -217,7 +199,7 @@ class DarkPoolSpec:
     posted_sizes: list[float] = field(default_factory=lambda: [1.0, 2.0, 3.0, 5.0])
     allow_both_sides: bool = False
 
-    def build_cpp_venue(self, spot: float) -> lp.DarkPoolVenue:
+    def build_venue(self, spot: float) -> lp.DarkPoolVenue:
         fee_bid = float(self.fee_per_unit_bid) * spot / 1_000_000
         fee_ask = float(self.fee_per_unit_ask) * spot / 1_000_000
         sizes = [float(u) for u in self.posted_sizes]
@@ -244,7 +226,7 @@ class DarkPoolSpec:
 
 
 TierSpec = MDPTierSpec
-CppTier = lp.MDPTier
+PricerTier = lp.MDPTier
 
 
 def tier_kind_label() -> str:
@@ -284,16 +266,10 @@ def parse_integer_like_list(raw: str, field_name: str) -> list[float]:
 
 def default_tier_values(i: int) -> dict:
     _markout_defaults = {
-        "markout_model_type": "sqrt_time",
-        "markout_base": 0.0,
-        "markout_coeff": 0.0,
-        "trading_cost": 0.0,
-        "sqrt_t_a0": 0.0,
-        "sqrt_t_a1": 0.0,
-        "sqrt_t_a2": 0.0,
-        "sqrt_t_b0": 0.0,
-        "sqrt_t_b1": 0.0,
-        "sqrt_t_b2": 0.0,
+        "impact_scale_pips": 1.0,
+        "impact_size_exponent": 0.5,
+        "impact_tau_minutes": 0.5,
+        "use_markout": True,
     }
     presets = [
         {
@@ -308,13 +284,7 @@ def default_tier_values(i: int) -> dict:
             "flow_shift": 0.52,
             "flow_volume_shift": 0.026,
             **_markout_defaults,
-            "sqrt_t_a0": -0.1785,
-            "sqrt_t_a1": -0.1819,
-            "sqrt_t_a2":  0.0052,
-            "sqrt_t_b0":  0.0089,
-            "sqrt_t_b1":  0.0068,
-            "sqrt_t_b2": -0.0030,
-            "delta_min": -100.0,
+            "delta_min": -10.0,
             "delta_max": 100.0,
         },
         {
@@ -329,13 +299,7 @@ def default_tier_values(i: int) -> dict:
             "flow_shift": 0.48,
             "flow_volume_shift": 0.02,
             **_markout_defaults,
-            "sqrt_t_a0": -0.16,
-            "sqrt_t_a1": -0.156,
-            "sqrt_t_a2":  0.0044,
-            "sqrt_t_b0":  0.011,
-            "sqrt_t_b1": -0.00046,
-            "sqrt_t_b2":  0.0,
-            "delta_min": -100.0,
+            "delta_min": -10.0,
             "delta_max": 100.0,
         },
         {
@@ -350,7 +314,7 @@ def default_tier_values(i: int) -> dict:
             "flow_shift": 0.28,
             "flow_volume_shift": 0.090,
             **_markout_defaults,
-            "delta_min": -100.0,
+            "delta_min": -10.0,
             "delta_max": 100.0,
         },
     ]
@@ -435,66 +399,44 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
 
         st.markdown("**Markout model**")
         use_markout = st.checkbox(
-            f"Price in markout {i + 1}",
+            f"Include adverse markout {i + 1}",
             value=bool(defaults.get("use_markout", True)),
             key=f"use_markout_{i}",
         )
-        markout_model_type = st.selectbox(
-            f"Markout model type {i + 1}",
-            options=["sqrt", "sqrt_time"],
-            index=0 if defaults.get("markout_model_type", "sqrt") == "sqrt" else 1,
-            key=f"markout_model_type_{i}",
-            format_func=lambda x: "base + coeff·√z" if x == "sqrt" else "α(z)·√t + β(z)·t",
+        st.caption(r"$m(z,t)=a z^{\beta}(1-e^{-t/\tau})$ — positive adverse-selection cost")
+        c5, c6, c7 = st.columns(3)
+        impact_scale_pips = c5.number_input(
+            f"Impact scale a {i + 1} [pips]",
+            value=float(defaults.get("impact_scale_pips", 1.0)),
+            min_value=0.0,
+            step=0.1,
+            format="%.3f",
+            key=f"impact_scale_pips_{i}",
+            help="Eventual markout for a 1M trade, in pips.",
         )
-
-        if markout_model_type == "sqrt":
-            c5, c6 = st.columns(2)
-            markout_base = c5.number_input(
-                f"Markout base {i + 1}",
-                value=float(defaults["markout_base"]),
-                step=0.1,
-                format="%.2f",
-                key=f"markout_base_{i}",
-                help="Constant adverse-selection cost in pips (1 pip = 1/10 000).",
-            )
-            markout_coeff = c6.number_input(
-                f"Markout coeff {i + 1}",
-                value=float(defaults["markout_coeff"]),
-                step=0.1,
-                format="%.2f",
-                key=f"markout_coeff_{i}",
-                help="Size-dependent coefficient in pips. Total markout = base + coeff × √z pips.",
-            )
-            st.markdown("**Trading cost (EUR / million)**")
-            trading_cost = st.number_input(
-                f"Trading cost {i + 1}",
-                value=float(defaults.get("trading_cost", 0.0)),
-                step=0.5,
-                format="%.2f",
-                key=f"trading_cost_{i}",
-                help="Flat execution cost in EUR per million traded. Added to markout base after converting via spot.",
-            )
-            markout_spec: MarkoutSpec = SqrtMarkoutSpec(
-                base=float(markout_base),
-                coeff=float(markout_coeff),
-                trading_cost=float(trading_cost),
-            )
-        else:
-            st.caption("α(z) = a₀ + a₁z + a₂z²,   β(z) = b₀ + b₁z + b₂z²   (coefficients in pips)")
-            st.markdown("α(z) coefficients")
-            ca0, ca1, ca2 = st.columns(3)
-            sqrt_t_a0 = ca0.number_input(f"a0 {i+1}", value=float(defaults.get("sqrt_t_a0", 0.0)), step=0.1, format="%.4f", key=f"sqrt_t_a0_{i}")
-            sqrt_t_a1 = ca1.number_input(f"a1 {i+1}", value=float(defaults.get("sqrt_t_a1", 0.0)), step=0.01, format="%.4f", key=f"sqrt_t_a1_{i}")
-            sqrt_t_a2 = ca2.number_input(f"a2 {i+1}", value=float(defaults.get("sqrt_t_a2", 0.0)), step=0.001, format="%.5f", key=f"sqrt_t_a2_{i}")
-            st.markdown("β(z) coefficients")
-            cb0, cb1, cb2 = st.columns(3)
-            sqrt_t_b0 = cb0.number_input(f"b0 {i+1}", value=float(defaults.get("sqrt_t_b0", 0.0)), step=0.1, format="%.4f", key=f"sqrt_t_b0_{i}")
-            sqrt_t_b1 = cb1.number_input(f"b1 {i+1}", value=float(defaults.get("sqrt_t_b1", 0.0)), step=0.01, format="%.4f", key=f"sqrt_t_b1_{i}")
-            sqrt_t_b2 = cb2.number_input(f"b2 {i+1}", value=float(defaults.get("sqrt_t_b2", 0.0)), step=0.001, format="%.5f", key=f"sqrt_t_b2_{i}")
-            markout_spec = SqrtTimeMarkoutSpec(
-                a0=float(sqrt_t_a0), a1=float(sqrt_t_a1), a2=float(sqrt_t_a2),
-                b0=float(sqrt_t_b0), b1=float(sqrt_t_b1), b2=float(sqrt_t_b2),
-            )
+        impact_size_exponent = c6.number_input(
+            f"Size exponent β {i + 1}",
+            value=float(defaults.get("impact_size_exponent", 0.5)),
+            min_value=0.0,
+            step=0.05,
+            format="%.3f",
+            key=f"impact_size_exponent_{i}",
+            help="Controls how eventual impact grows with trade size: M(z)=a·z^β.",
+        )
+        impact_tau_minutes = c7.number_input(
+            f"Impact τ {i + 1} [min]",
+            value=float(defaults.get("impact_tau_minutes", 0.5)),
+            min_value=0.001,
+            step=0.1,
+            format="%.2f",
+            key=f"impact_tau_minutes_{i}",
+            help="Time scale of impact. About 63% of eventual impact is reached after one τ.",
+        )
+        markout_spec: MarkoutSpec = SaturatingMarkoutSpec(
+            impact_scale_pips=float(impact_scale_pips),
+            size_exponent=float(impact_size_exponent),
+            tau_minutes=float(impact_tau_minutes),
+        )
 
         st.markdown("**Tier quote settings**")
         c7, c8 = st.columns(2)
@@ -702,41 +644,23 @@ def build_dark_pool_spec_from_ui() -> DarkPoolSpec | None:
 
 def build_solver_config(
     q_grid: np.ndarray,
-    dt: float,
-    n_iter: int,
     spread: float,
     spot: float,
     spot_drift: float,
-    golden_tol: float,
-    golden_max_iter: int,
-    early_stop: bool,
-    tol_h: float,
-    tol_rhs: float,
-    min_iter: int,
-    consecutive_passes_required: int,
 ) -> lp.SolverConfig:
     config = lp.SolverConfig()
     config.q_grid = [float(q) for q in q_grid]
-    config.dt = float(dt)
-    config.n_iter = int(n_iter)
     config.spread = float(spread)
     config.spot = float(spot)
     config.spot_drift = float(spot_drift)
-    config.golden_tol = float(golden_tol)
-    config.golden_max_iter = int(golden_max_iter)
-    config.early_stop = bool(early_stop)
-    config.tol_h = float(tol_h)
-    config.tol_rhs = float(tol_rhs)
-    config.min_iter = int(min_iter)
-    config.consecutive_passes_required = int(consecutive_passes_required)
     return config
 
 
-def build_cpp_tiers(specs: list[TierSpec], spot: float) -> list[lp.MDPTier]:
-    return [spec.build_cpp_tier(spot) for spec in specs if spec.enabled]
+def build_tiers(specs: list[TierSpec], spot: float) -> list[lp.MDPTier]:
+    return [spec.build_tier(spot) for spec in specs if spec.enabled]
 
 
-def ordered_solution_tiers(specs: list[TierSpec], solution: lp.HJBSolution) -> list[CppTier]:
+def ordered_solution_tiers(specs: list[TierSpec], solution: lp.HJBSolution) -> list[PricerTier]:
     mdp_iter = iter(solution.mdp_tiers)
     return [next(mdp_iter) for _ in specs]
 
@@ -752,16 +676,16 @@ def q_index_for_policy_qgrid(q_grid: list[float] | np.ndarray, q: float) -> int:
     return int(np.argmin(np.abs(q_arr - float(q))))
 
 
-def q_index_for_tier_policy(cpp_tier: CppTier, q: float) -> int:
+def q_index_for_tier_policy(cpp_tier: PricerTier, q: float) -> int:
     return q_index_for_policy_qgrid(cpp_tier.policy.q_grid, q)
 
 
-def is_admissible(cpp_tier: CppTier, q: float, z: float, side: str) -> bool:
+def is_admissible(cpp_tier: PricerTier, q: float, z: float, side: str) -> bool:
     return bool(cpp_tier.is_admissible(float(q), float(z), side))
 
 
 def masked_quote_summary(
-    cpp_tier: CppTier,
+    cpp_tier: PricerTier,
     q: float,
     z: float,
     side: str,
@@ -777,7 +701,7 @@ def masked_quote_summary(
 # Plots and tables
 # ============================================================
 
-def make_flow_parameter_table(spec: TierSpec, cpp_tier: CppTier) -> pd.DataFrame:
+def make_flow_parameter_table(spec: TierSpec, cpp_tier: PricerTier) -> pd.DataFrame:
     rows = []
     for z in tier_sizes(spec):
         zf = float(z)
@@ -788,13 +712,13 @@ def make_flow_parameter_table(spec: TierSpec, cpp_tier: CppTier) -> pd.DataFrame
             "A(z)": spec.flow_A0 * zf ** (-spec.flow_theta - spec.flow_beta * zf),
             "delta_50(z)": spec.flow_shift - spec.flow_volume_shift * (zf - 1.0),
             "steepness": spec.flow_steepness,
-            "mu(z, t=1min)": cpp_tier.expected_markout(zf, 1.0),
+            "markout(z, 1 min) [pips]": cpp_tier.expected_markout(zf, 1.0) * 10_000.0,
         }
         rows.append(row)
     return pd.DataFrame(rows)
 
 
-def make_flow_curve_figure(cpp_tier: CppTier, spec: TierSpec) -> go.Figure:
+def make_flow_curve_figure(cpp_tier: PricerTier, spec: TierSpec) -> go.Figure:
     grid = np.linspace(-1.0, 1.0, 160)
     fig = go.Figure()
 
@@ -812,7 +736,7 @@ def make_flow_curve_figure(cpp_tier: CppTier, spec: TierSpec) -> go.Figure:
     return fig
 
 
-def make_hit_ratio_figure(cpp_tier: CppTier, spec: TierSpec) -> go.Figure:
+def make_hit_ratio_figure(cpp_tier: PricerTier, spec: TierSpec) -> go.Figure:
     grid = np.linspace(-1.0, 1.0, 160)
     fig = go.Figure()
     for z in tier_sizes(spec):
@@ -829,7 +753,7 @@ def make_hit_ratio_figure(cpp_tier: CppTier, spec: TierSpec) -> go.Figure:
     return fig
 
 
-def make_implied_hit_ratio_figure(cpp_tier: CppTier, spec: TierSpec) -> go.Figure:
+def make_implied_hit_ratio_figure(cpp_tier: PricerTier, spec: TierSpec) -> go.Figure:
     q_grid = [float(q) for q in cpp_tier.policy.q_grid]
     sizes = [float(z) for z in tier_sizes(spec)]
     n = len(sizes)
@@ -875,7 +799,7 @@ def make_implied_hit_ratio_figure(cpp_tier: CppTier, spec: TierSpec) -> go.Figur
 
 
 def make_quote_inventory_figure(
-    cpp_tier: CppTier,
+    cpp_tier: PricerTier,
     spec: TierSpec,
     spread: float,
     mid_price: float,
@@ -921,7 +845,7 @@ def make_quote_inventory_figure(
 
 
 def make_quote_surface_figure(
-    cpp_tier: CppTier,
+    cpp_tier: PricerTier,
     spec: TierSpec,
     spread: float,
     mid_price: float,
@@ -962,7 +886,7 @@ def make_quote_surface_figure(
 
 
 def make_ladder_figure(
-    cpp_tier: CppTier,
+    cpp_tier: PricerTier,
     spec: TierSpec,
     q: float,
     spread: float,
@@ -999,7 +923,7 @@ def make_ladder_figure(
 
 
 def make_q_ladder_table(
-    cpp_tier: CppTier,
+    cpp_tier: PricerTier,
     spec: TierSpec,
     q: float,
     spread: float,
@@ -1105,7 +1029,7 @@ def _geom_pmf(p: float, k_values: list[int]) -> list[float]:
 def _zip_pmf(dist: lp.ZeroInflatedPoissonArrivalDist, k_values: list[int]) -> list[float]:
     """P(fill=k) for k in k_values (all >= 1) under the truncated ZIP used by the solver.
 
-    The cap u = max(k_values). Normalization is over {1,...,u} as in the C++ implementation.
+    The cap u = max(k_values). Normalization is over {1,...,u}.
     """
     mu = float(dist.mu)
     p0 = float(dist.p0)
@@ -1201,17 +1125,21 @@ def make_internalization_time_figure(
     return fig
 
 
-def make_markout_figure(cpp_tier: CppTier, spec: TierSpec) -> go.Figure:
-    t_grid = np.linspace(0.0, 10.0, 300)
+def make_markout_figure(cpp_tier: PricerTier, spec: TierSpec) -> go.Figure:
+    horizon_minutes = 15.0
+    t_minutes = np.linspace(0.0, horizon_minutes, 300)
     fig = go.Figure()
     for z in tier_sizes(spec):
         zf = float(z)
-        mu_vals = [cpp_tier.expected_markout(zf, float(t)) * 10_000 for t in t_grid]
-        fig.add_trace(go.Scatter(x=list(t_grid), y=mu_vals, mode="lines", name=f"z={zf:g}"))
+        mu_vals = [
+            cpp_tier.expected_markout(zf, float(t)) * 10_000.0
+            for t in t_minutes
+        ]
+        fig.add_trace(go.Scatter(x=list(t_minutes), y=mu_vals, mode="lines", name=f"{zf:g}M"))
     fig.update_layout(
-        title=f"Markout — {spec.name}",
+        title=f"Saturating markout — {spec.name}",
         xaxis_title="Time since trade [minutes]",
-        yaxis_title="Market impact [pips]",
+        yaxis_title="Adverse markout [pips]",
         height=500,
     )
     return fig
@@ -1263,9 +1191,6 @@ with st.sidebar:
             fine_step = c_grid1.number_input("fine step", value=0.25, min_value=0.01, step=0.05, format="%.4f")
             coarse_step = c_grid2.number_input("coarse step", value=1.0, min_value=0.01, step=0.1, format="%.4f")
 
-        dt = st.number_input("dt", value=0.002, step=0.001, format="%.4f")
-        n_iter = st.number_input("n_iter", value=140, step=10, min_value=1)
-
         mid_price = st.number_input("display mid price", value=1.000000, step=0.000100, format="%.6f")
 
     with st.sidebar.expander("Spot process", expanded=False):
@@ -1273,27 +1198,18 @@ with st.sidebar:
         spot_drift = st.number_input("spot_drift", value=0.0, step=0.001, format="%.5f")
         spread = st.number_input("reference spread", value=20.0 / 10000.0, step=1.0 / 10000.0, format="%.6f")
 
-    with st.sidebar.expander("Optimization / stopping", expanded=False):
-        golden_tol = st.number_input("golden_tol", value=1e-4, format="%.1e")
-        golden_max_iter = st.number_input("golden_max_iter", value=32, step=1, min_value=1)
-        early_stop = st.checkbox("Enable early stopping", value=True)
-        tol_h = st.number_input("tol_h", value=1e-5, format="%.1e")
-        tol_rhs = st.number_input("tol_rhs", value=1e-4, format="%.1e")
-        min_iter = st.number_input("min_iter", value=5, step=1, min_value=0)
-        consecutive_passes_required = st.number_input("consecutive passes required", value=3, step=1, min_value=1)
-
     with st.sidebar.expander("Carry cost", expanded=False):
         sigma = st.number_input(
             "Volatility σ [pips / √min]",
             value=20.0,
             step=1.0,
             format="%.2f",
-            help="One-minute volatility in pips. Used in both carry terms.",
+            help="One-minute volatility in pips. The running inventory penalty is γσ²q².",
         ) / 10_000.0
         risk_aversion = st.number_input(
             "γ (risk aversion)",
-            value=10.0, step=1.0, format="%.2f",
-            help="Quadratic penalty: γσ²·q²·t(q).",
+            value=0.01, step=0.01, format="%.2f",
+            help="Standard quadratic running penalty: γσ²·q².",
         )
     with st.sidebar.expander("Internalization time", expanded=False):
         st.caption("t(q) = τ₀ + τ₁|q| + τ₂|q|²  —  time in minutes")
@@ -1328,8 +1244,6 @@ disabled_tier_names = [spec.name for spec in tier_specs if not spec.enabled]
 
 if spread <= 0.0:
     errors.append("spread must be positive.")
-if golden_tol <= 0.0:
-    errors.append("golden_tol must be positive.")
 
 try:
     q_grid = (
@@ -1360,38 +1274,39 @@ global_internalization_time = lp.PolynomialInternalizationTime(
     tau0=float(tau0), tau1=float(tau1), tau2=float(tau2)
 )
 
-mdp_cpp_tiers = build_cpp_tiers(active_tier_specs, float(spot))
-dark_pool_cpp = None if dark_pool_spec is None else dark_pool_spec.build_cpp_venue(float(spot))
+mdp_tiers = build_tiers(active_tier_specs, float(spot))
+dark_pool_venue = None if dark_pool_spec is None else dark_pool_spec.build_venue(float(spot))
 
-penalty = lp.PolynomialInventoryPenalty(
+penalty = lp.QuadraticInventoryPenalty(
     carry_cost=lp.CarryCost(risk_aversion=float(risk_aversion), sigma=float(sigma)),
-    internalization_time=global_internalization_time,
 )
 
 config = build_solver_config(
     q_grid=q_grid,
-    dt=float(dt),
-    n_iter=int(n_iter),
     spread=float(spread),
     spot=float(spot),
     spot_drift=float(spot_drift),
-    golden_tol=float(golden_tol),
-    golden_max_iter=int(golden_max_iter),
-    early_stop=bool(early_stop),
-    tol_h=float(tol_h),
-    tol_rhs=float(tol_rhs),
-    min_iter=int(min_iter),
-    consecutive_passes_required=int(consecutive_passes_required),
 )
 
-with st.spinner("Solving HJB in C++ and building policies..."):
+with st.spinner("Solving HJB with Howard policy iteration..."):
     solver = lp.HJBLadderSolver(
         config=config,
         penalty=penalty,
-        mdp_tiers=mdp_cpp_tiers,
-        dark_pool=dark_pool_cpp,
+        internalization_time=global_internalization_time,
+        mdp_tiers=mdp_tiers,
+        dark_pool=dark_pool_venue,
     )
-    solution: lp.HJBSolution = solver.solve()
+    try:
+        solution: lp.HJBSolution = solver.solve()
+    except RuntimeError as exc:
+        st.error(
+            "Howard fixed-policy evaluation became singular/non-ergodic. "
+            "This can happen when extremely defensive quote bounds make transition rates "
+            "numerically zero, so a fixed policy no longer has a single recurrent class. "
+            "Adjust the economic quote bounds or model specification. "
+            f"Details: {exc}"
+        )
+        st.stop()
 
 diag = solution.diagnostics
 solution_tiers = ordered_solution_tiers(active_tier_specs, solution)
@@ -1409,15 +1324,14 @@ if disabled_tier_names:
 
 if diag.converged:
     st.info(
-        f"Early stopping triggered after {diag.iterations_used} iterations. "
-        f"Final max |Δh| = {diag.final_max_h_change:.2e}, "
-        f"final max |rhs| = {diag.final_max_rhs:.2e}."
+        f"Howard converged after {diag.iterations_used} policy iterations. "
+        f"Bellman residual = {diag.final_max_rhs:.2e}; "
+        f"average reward ρ = {solution.average_reward:.6g}."
     )
 else:
     st.warning(
-        f"Solver reached the iteration cap ({diag.iterations_used}). "
-        f"Final max |Δh| = {diag.final_max_h_change:.2e}, "
-        f"final max |rhs| = {diag.final_max_rhs:.2e}."
+        f"Howard did not reach machine-precision convergence. "
+        f"Iterations = {diag.iterations_used}; Bellman residual = {diag.final_max_rhs:.2e}."
     )
 
 with st.expander("Solver diagnostics", expanded=False):
@@ -1441,8 +1355,8 @@ with st.expander("Solver diagnostics", expanded=False):
     st.plotly_chart(
         make_convergence_figure(
             list(solution.diagnostics.history_max_rhs),
-            "Convergence: max |rhs|",
-            "max |rhs|",
+            "Convergence: Bellman residual",
+            "Bellman residual",
         ),
         use_container_width=True,
     )
@@ -1536,24 +1450,26 @@ The dealer solves a stationary HJB equation. With value decomposition $V(x, q, m
 **Fill payoff for a bid quote at rung $z$, inventory $q$:**
 
 $$
-\Pi^{\text{bid}}(z, q, \delta) = \lambda(\delta, z)\Bigl[z s(0.5 - \delta) + z\,\mu(z,\,t(q+z)) + h(q+z) - h(q)\Bigr]
+\Pi^{\text{bid}}(z, q, \delta) = \lambda(\delta, z)\Bigl[z s(0.5 - \delta) - z\,m(z,\,t(q+z)) + h(q+z) - h(q)\Bigr]
 $$
 
-where $s$ is the spread, $\delta$ is the quoted delta, $\mu(z, t)$ is the expected markout, and $t(q)$ is the internalization time.
+where $s$ is the spread, $\delta$ is the quoted delta, $m(z,t)\ge 0$ is the adverse markout cost, and $t(q)$ is the internalization horizon.
 
 **Ask is symmetric** (inventory decreases by $z$, markout evaluated at $t(q-z)$).
 
 **Carry cost penalty:**
 
 $$
-\Pi(q) = -\gamma\sigma^2 q^2\, t(q)
+\Pi(q) = -\gamma\sigma^2 q^2
 $$
 
 **Flow curve:** $\lambda(\delta, z) = A(z)\cdot\sigma\!\left(\kappa\bigl(\delta - \delta_{50}(z)\bigr)\right)$, with $A(z) = A_0\,z^{-\theta - \beta z}$.
 
-**Markout model:** $\mu(z, t) = \alpha(z)\sqrt{t} + \beta(z)\,t$, with $\alpha(z) = a_0 + a_1 z + a_2 z^2$ and $\beta(z) = b_0 + b_1 z + b_2 z^2$.
+**Markout model:** $m(z,t)=a z^{\beta}\left(1-e^{-t/\tau}\right)$. Larger trades have larger eventual impact $a z^{\beta}$; impact arrives quickly and then saturates with time scale $\tau$.
 
 **Internalization time:** $t(q) = \tau_0 + \tau_1|q| + \tau_2 q^2$.
+
+**Inventory ladder shape:** moving farther from zero inventory changes both ladder level and slope. On the inventory-increasing side every rung becomes less aggressive and volume-premium gaps may only widen; on the inventory-reducing side every rung becomes more aggressive and gaps may only flatten. Thus a long book shifts bids lower and steepens them, while shifting asks lower and flattening them; a short book is the mirror image.
                     """
                 )
 
@@ -1617,4 +1533,4 @@ $$
                     """
                 )
 
-st.caption("After replacing the C++ files, rebuild the extension and restart Streamlit.")
+st.caption("Pure Python + NumPy implementation. Restart Streamlit after editing the model code.")
