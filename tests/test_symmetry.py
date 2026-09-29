@@ -476,3 +476,41 @@ class TestLowPenaltyHoward(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestInventoryBoundaryPadding(unittest.TestCase):
+
+    def test_operational_grid_is_padded_by_largest_trade_size(self):
+        solution, solver = build_solution(q_grid=UNIFORM_GRID, sizes=SIZES)
+
+        self.assertAlmostEqual(solution.q_grid[0], -20.0)
+        self.assertAlmostEqual(solution.q_grid[-1], 20.0)
+        self.assertAlmostEqual(solution.solve_q_grid[0], -40.0)
+        self.assertAlmostEqual(solution.solve_q_grid[-1], 40.0)
+        self.assertAlmostEqual(solution.hard_inventory_limit, 40.0)
+        self.assertEqual(len(solution.h_solve), len(solution.solve_q_grid))
+
+        # A 20M bid at the displayed +20 inventory state lands at +40 and is
+        # therefore valued on a solved continuation state, not extrapolated.
+        self.assertTrue(solver._mdp_transition_admissible(20.0, 20.0, lp.Side.Bid))
+
+        # Once the hidden hard bound would be breached, wrong-way fills are
+        # inadmissible. Inventory-reducing fills remain available.
+        self.assertFalse(solver._mdp_transition_admissible(21.0, 20.0, lp.Side.Bid))
+        self.assertFalse(solver._mdp_transition_admissible(40.0, 1.0, lp.Side.Bid))
+        self.assertTrue(solver._mdp_transition_admissible(40.0, 20.0, lp.Side.Ask))
+
+        # The returned quote policy is intentionally only defined on the
+        # operational pricing range; public quote lookup does not extrapolate.
+        with self.assertRaises(ValueError):
+            solution.mdp_tiers[0].quote(21.0, 1.0, lp.Side.Bid)
+
+    def test_fixed_policy_operator_never_needs_extrapolation(self):
+        _, solver = build_solution(q_grid=UNIFORM_GRID, sizes=SIZES)
+        c, L = solver.fixed_policy_affine_operator()
+        self.assertEqual(L.shape, (len(solver.solve_q_grid_), len(solver.solve_q_grid_)))
+        self.assertTrue(np.all(np.isfinite(c)))
+        self.assertTrue(np.all(np.isfinite(L)))
+        # Generator rows sum to zero because every allowed transition is
+        # represented inside the solved domain.
+        self.assertTrue(np.allclose(L.sum(axis=1), 0.0, atol=1e-12))

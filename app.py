@@ -1180,7 +1180,14 @@ st.markdown(
 with st.sidebar:
     with st.sidebar.expander("Global parameters", expanded=False):
         q_grid_mode = st.selectbox("Inventory grid mode", options=["uniform", "piecewise"], index=1)
-        q_abs_max = st.number_input("max |q|", value=20.0, min_value=0.5, step=0.5, format="%.4f")
+        q_abs_max = st.number_input(
+            "operational max |q|", value=20.0, min_value=0.5, step=0.5, format="%.4f",
+            help=(
+                "Inventory range shown in the pricing GUI. The Howard solve automatically "
+                "adds a hidden buffer equal to the largest allowed trade size, so displayed "
+                "quotes never rely on extrapolated continuation values."
+            ),
+        )
 
         q_step = fine_half_width = fine_step = coarse_step = None
         if q_grid_mode == "uniform":
@@ -1335,13 +1342,19 @@ else:
     )
 
 with st.expander("Solver diagnostics", expanded=False):
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("q points", len(config.q_grid))
-    c2.metric("venues", total_venue_count(solution))
-    c3.metric("iterations used", diag.iterations_used)
-    c4.metric("converged", "yes" if diag.converged else "no")
-    c5.metric("spot drift", f"{config.spot_drift:.5f}")
-    c6.metric("spread", f"{config.spread:.6f}")
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+    c1.metric("pricing q points", len(config.q_grid))
+    c2.metric("solve q points", len(solution.solve_q_grid))
+    c3.metric("hard |q|", f"{solution.hard_inventory_limit:.2f}")
+    c4.metric("venues", total_venue_count(solution))
+    c5.metric("iterations used", diag.iterations_used)
+    c6.metric("converged", "yes" if diag.converged else "no")
+    c7.metric("spread", f"{config.spread:.6f}")
+    st.caption(
+        "The displayed pricing grid is padded internally by the largest allowed trade size. "
+        "Howard solves h(q) on that hidden domain; transitions beyond its hard edge are inadmissible, "
+        "so no continuation value is obtained by extrapolation."
+    )
 
     st.plotly_chart(make_h_figure(solution), use_container_width=True)
     st.plotly_chart(
@@ -1470,6 +1483,8 @@ $$
 **Internalization time:** $t(q) = \tau_0 + \tau_1|q| + \tau_2 q^2$.
 
 **Inventory ladder shape:** moving farther from zero inventory changes both ladder level and slope. On the inventory-increasing side every rung becomes less aggressive and volume-premium gaps may only widen; on the inventory-reducing side every rung becomes more aggressive and gaps may only flatten. Thus a long book shifts bids lower and steepens them, while shifting asks lower and flattening them; a short book is the mirror image.
+
+**Inventory boundary:** the GUI range is the operational pricing range. The solver automatically extends the hidden Howard grid by the largest allowed trade size, so every fill from a displayed state lands on a solved continuation state. At the hidden hard edge, further inventory-increasing fills are inadmissible rather than valued by extrapolating $h(q)$.
                     """
                 )
 
@@ -1529,7 +1544,9 @@ $$
 **Optimizer chooses** $u^{\text{bid}}$, $u^{\text{ask}}$, or both, subject to the venue's allow-both-sides flag.
 
 **Inventory grid constraints:**
-- strictly increasing, symmetric around 0, odd-length, with 0 at the centre index
+- the operational grid is strictly increasing, symmetric around 0, odd-length, with 0 at the centre index
+- the Howard solve adds a hidden buffer equal to the largest allowed fill size
+- transitions beyond the hidden hard inventory bound are inadmissible; $h(q)$ is never extrapolated outside the solved domain
                     """
                 )
 

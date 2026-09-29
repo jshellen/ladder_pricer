@@ -31,6 +31,33 @@ The only solver is exact Howard policy iteration:
 
 There is no pseudo-time step, discount rate, damping factor, optimizer tolerance, or user-selected iteration count.
 
+
+## Inventory domain and boundary
+
+`SolverConfig.q_grid` is the **operational pricing grid**: the inventory range returned in the solution and shown in Streamlit. It is not used as an extrapolation boundary.
+
+Let
+
+$$
+z_{\max}=\max\{\text{RFQ sizes, dark-pool posted sizes}\}.
+$$
+
+The Howard solver automatically constructs a hidden symmetric solve grid with hard limit
+
+$$
+Q_{\mathrm{hard}}=Q_{\mathrm{operational}}+z_{\max}.
+$$
+
+Therefore every allowed fill starting from the operational range lands inside a state for which $h(q)$ is explicitly solved. Internal interpolation is bounded: attempting to evaluate $h$ outside the hidden solve domain is an error, not a linear extrapolation.
+
+At the hidden hard edge, an RFQ or dark-pool action that could increase inventory beyond $Q_{\mathrm{hard}}$ is inadmissible. Inventory-reducing actions remain available. The trader level/gap shape constraints are enforced on the operational pricing surface; the hidden buffer exists only to provide economically defined continuation values.
+
+The returned `HJBSolution` exposes both views:
+
+- `solution.q_grid`, `solution.h`: operational/display grid;
+- `solution.solve_q_grid`, `solution.h_solve`: hidden Howard solve grid;
+- `solution.hard_inventory_limit`: hard absolute inventory limit.
+
 ## Inventory penalty
 
 The running inventory penalty is the standard quadratic form

@@ -2,7 +2,8 @@
 
 Howard policy iteration for a continuous-time, average-reward inventory-control
 problem. RFQ quote improvement uses the analytical logistic/Lambert-W solution.
-Within each inventory row, larger sizes cannot be quoted tighter. As absolute
+The operational pricing grid is padded internally so continuation values are never
+obtained by inventory extrapolation. Within each inventory row, larger sizes cannot be quoted tighter. As absolute
 inventory grows, every rung moves monotonically with inventory: quotes on the
 inventory-increasing side become less aggressive while quotes on the
 inventory-reducing side become more aggressive. At the same time adjacent rung
@@ -98,6 +99,46 @@ def _interp_weights(grid: Sequence[float], x: float) -> tuple[int, float, int, f
     if len(grid) == 1:
         return 0, 1.0, 0, 0.0
     i, t = _locate_segment_with_weight(grid, x)
+    return i, 1.0 - t, i + 1, t
+
+
+def _locate_segment_with_weight_bounded(
+    grid: Sequence[float], x: float, tol: float = 1e-10
+) -> tuple[int, float]:
+    """Locate ``x`` for interpolation, rejecting extrapolation outside ``grid``."""
+    if not grid:
+        raise ValueError("grid cannot be empty")
+    g = np.asarray(grid, dtype=float)
+    x = float(x)
+    if x < g[0] - tol or x > g[-1] + tol:
+        raise ValueError(
+            f"inventory state {x:g} lies outside solved domain [{g[0]:g}, {g[-1]:g}]"
+        )
+    # Clamp tiny floating-point overshoots back onto the solved domain.
+    x = min(max(x, float(g[0])), float(g[-1]))
+    if len(g) == 1:
+        return 0, 0.0
+    if x >= g[-1]:
+        return len(g) - 2, 1.0
+    i = int(np.searchsorted(g, x, side="right") - 1)
+    i = max(0, min(i, len(g) - 2))
+    t = (x - g[i]) / (g[i + 1] - g[i])
+    return i, float(t)
+
+
+def _interp_linear_bounded(grid: Sequence[float], vals: Sequence[float], x: float) -> float:
+    if len(grid) != len(vals):
+        raise ValueError("grid and vals size mismatch")
+    if len(grid) == 1:
+        return float(vals[0])
+    i, t = _locate_segment_with_weight_bounded(grid, x)
+    return float(vals[i] + t * (vals[i + 1] - vals[i]))
+
+
+def _interp_weights_bounded(grid: Sequence[float], x: float) -> tuple[int, float, int, float]:
+    if len(grid) == 1:
+        return 0, 1.0, 0, 0.0
+    i, t = _locate_segment_with_weight_bounded(grid, x)
     return i, 1.0 - t, i + 1, t
 
 
@@ -342,7 +383,7 @@ class QuotePolicy:
     def _interp_q_column(self, mat: list[list[float]], j: int, q: float) -> float:
         if len(self.q_grid) == 1:
             return mat[0][j]
-        i, t = _locate_segment_with_weight(self.q_grid, q)
+        i, t = _locate_segment_with_weight_bounded(self.q_grid, q)
         return mat[i][j] + t * (mat[i + 1][j] - mat[i][j])
 
     def delta(self, q: float, z: float, side: Side | str) -> float:
@@ -407,7 +448,7 @@ class DarkPoolPolicy:
         vals = self.bid_size if _side(side) is Side.Bid else self.ask_size
         if len(self.q_grid) == 1:
             return vals[0]
-        i, t = _locate_segment_with_weight(self.q_grid, q)
+        i, t = _locate_segment_with_weight_bounded(self.q_grid, q)
         return vals[i] if t <= 0.5 else vals[i + 1]
 
 
@@ -684,12 +725,18 @@ class SolverDiagnostics:
 
 @dataclass
 class HJBSolution:
+    # Public/operational grid shown to users and used for quote inspection.
     h: list[float] = field(default_factory=list)
     q_grid: list[float] = field(default_factory=list)
     mdp_tiers: list[MDPTier] = field(default_factory=list)
     dark_pool: Optional[DarkPoolVenue] = None
     diagnostics: SolverDiagnostics = field(default_factory=SolverDiagnostics)
     average_reward: float = 0.0
+    # Hidden grid used by Howard evaluation. This is padded beyond q_grid so
+    # every transition from the operational range lands on a solved state.
+    solve_q_grid: list[float] = field(default_factory=list)
+    h_solve: list[float] = field(default_factory=list)
+    hard_inventory_limit: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -707,7 +754,56 @@ class HJBLadderSolver:
         self.mdp_tiers = list(mdp_tiers or [])
         self.dark_pool = dark_pool
         self.grid_meta_ = SolverGridMeta()
+        self.solve_q_grid_: list[float] = []
+        self.hard_inventory_limit_: float = 0.0
         self.config.validate()
+
+    def _max_inventory_jump(self) -> float:
+        jumps = [float(z) for tier in self.mdp_tiers for z in tier.sizes_]
+        if self.dark_pool is not None:
+            jumps.extend(float(u) for u in self.dark_pool.posted_sizes)
+        return max(jumps, default=0.0)
+
+    def _build_padded_solve_grid(self) -> list[float]:
+        """Extend the operational grid by one maximum allowed inventory jump.
+
+        ``config.q_grid`` is the range for which the user wants prices. The
+        hidden Howard grid extends to ``Q_operational + z_max``. Thus every
+        RFQ/DP fill from an operational state lands inside a solved state. The
+        outer edge is a hard risk bound: transitions that would move inventory
+        farther out are inadmissible rather than extrapolated.
+        """
+        base = np.asarray(self.config.q_grid, dtype=float)
+        q_op = float(base[-1])
+        pad = self._max_inventory_jump()
+        q_hard = q_op + pad
+        if pad <= 0.0:
+            return base.tolist()
+        outer_step = float(base[-1] - base[-2])
+        if outer_step <= 0.0:
+            raise ValueError("q_grid must have positive outer spacing")
+        extra = np.arange(q_op + outer_step, q_hard + 0.5 * outer_step, outer_step)
+        extra = extra[extra < q_hard - 1e-10]
+        pos = np.concatenate([base[len(base)//2:], extra, np.array([q_hard])])
+        pos = np.unique(np.round(pos, 12))
+        return np.concatenate((-pos[:0:-1], pos)).astype(float).tolist()
+
+    def _inventory_transition_admissible(self, q: float, delta_q: float, tol: float = 1e-10) -> bool:
+        target = float(q) + float(delta_q)
+        return (
+            target >= -self.hard_inventory_limit_ - tol
+            and target <= self.hard_inventory_limit_ + tol
+        )
+
+    def _mdp_transition_admissible(self, q: float, z: float, side: Side | str) -> bool:
+        direction = 1.0 if _side(side) is Side.Bid else -1.0
+        return self._inventory_transition_admissible(q, direction * float(z))
+
+    def _dark_pool_post_admissible(self, q: float, u: int, side: Side | str) -> bool:
+        direction = 1.0 if _side(side) is Side.Bid else -1.0
+        # Fill distributions can realize any k up to u. Requiring the largest
+        # possible fill to stay inside the hard domain guarantees all fills do.
+        return self._inventory_transition_admissible(q, direction * float(u))
 
     @staticmethod
     def repair_or_throw_bounds(lower: float, upper: float, tier_name: str, side_name: str) -> tuple[float, float]:
@@ -724,12 +820,14 @@ class HJBLadderSolver:
         if self.dark_pool is not None: self.dark_pool.validate()
 
     def initialize_policy_shapes(self) -> None:
-        for tier in self.mdp_tiers: tier.reset_policy_shape(self.config.q_grid)
-        if self.dark_pool is not None: self.dark_pool.reset_policy_shape(self.config.q_grid)
+        for tier in self.mdp_tiers: tier.reset_policy_shape(self.solve_q_grid_)
+        if self.dark_pool is not None: self.dark_pool.reset_policy_shape(self.solve_q_grid_)
 
     def prepare_solve_context(self) -> None:
         self.validate_problem_definition()
-        self.grid_meta_ = build_solver_grid_meta(self.config.q_grid)
+        self.solve_q_grid_ = self._build_padded_solve_grid()
+        self.hard_inventory_limit_ = float(self.solve_q_grid_[-1])
+        self.grid_meta_ = build_solver_grid_meta(self.solve_q_grid_)
         self.initialize_policy_shapes()
 
     def mdp_fill_payoff(self, lam: float, z: float, d: float, mu: float, dh: float) -> float:
@@ -837,7 +935,7 @@ class HJBLadderSolver:
     ) -> list[float]:
         row: list[float] = []
         direction = 1.0 if side is Side.Bid else -1.0
-        hq = _interp_linear(self.config.q_grid, h, q)
+        hq = _interp_linear_bounded(self.solve_q_grid_, h, q)
         for j, z in enumerate(tier.sizes_):
             lo, hi = self.mdp_bounds_for_rung(
                 tier, j, row, q, side,
@@ -846,9 +944,15 @@ class HJBLadderSolver:
                 rung_upper_bounds=rung_upper_bounds,
             )
             q_next = q + direction * z
+            if not self._mdp_transition_admissible(q, z, side):
+                # Hard outer inventory bound: this RFQ size is not quoted. The
+                # stored delta is only a display placeholder; Bellman/reward
+                # calculations skip the transition entirely.
+                row.append(tier.delta_min)
+                continue
             tau = self.internalization_time.value(q_next)
             mu = tier.markout_model.expected_markout(z, tau) if tier.use_markout else 0.0
-            additive = -z * mu + _interp_linear(self.config.q_grid, h, q_next) - hq
+            additive = -z * mu + _interp_linear_bounded(self.solve_q_grid_, h, q_next) - hq
             d = tier.flow_curve.optimal_delta(z, self.config.spread, additive)
             row.append(min(max(d, lo), hi))
         return row
@@ -876,13 +980,15 @@ class HJBLadderSolver:
 
     def _ladder_hamiltonian(self, tier: MDPTier, h: np.ndarray, q: float, side: Side, row: Sequence[float]) -> float:
         direction = 1.0 if side is Side.Bid else -1.0
-        hq = _interp_linear(self.config.q_grid, h, q)
+        hq = _interp_linear_bounded(self.solve_q_grid_, h, q)
         total = 0.0
         for d, z in zip(row, tier.sizes_):
+            if not self._mdp_transition_admissible(q, z, side):
+                continue
             q_next = q + direction * z
             tau = self.internalization_time.value(q_next)
             mu = tier.markout_model.expected_markout(z, tau) if tier.use_markout else 0.0
-            dh = _interp_linear(self.config.q_grid, h, q_next) - hq
+            dh = _interp_linear_bounded(self.solve_q_grid_, h, q_next) - hq
             total += self.mdp_fill_payoff(tier.flow_curve.arrival_rate(d, z), z, d, mu, dh)
         return total
 
@@ -929,7 +1035,7 @@ class HJBLadderSolver:
         satisfies the desired neighboring-state inequalities exactly.
         """
         mat = tier.policy.bid if side is Side.Bid else tier.policy.ask
-        q_grid = self.config.q_grid
+        q_grid = self.solve_q_grid_
         q0 = self.grid_meta_.q0_idx
         old = [list(map(float, row)) for row in mat]
         improved = [list(row) for row in old]
@@ -963,8 +1069,19 @@ class HJBLadderSolver:
                 tier, h, q_grid[i], side, old[i], candidate, **kwargs
             )
 
-        # Positive inventory, moving q upward away from zero.
+        q_operational_max = float(self.config.q_grid[-1])
+
+        # Positive inventory, moving q upward away from zero. Trader shape
+        # constraints are enforced only on the operational pricing range. The
+        # hidden buffer exists solely to value continuation states and is free
+        # to choose its own mean-reverting policy subject to the hard bound.
         for i in range(q0 + 1, len(q_grid)):
+            if q_grid[i] > q_operational_max + 1e-10:
+                candidate = self._build_mdp_ladder(tier, h, q_grid[i], side)
+                improved[i] = self._choose_howard_safe_row(
+                    tier, h, q_grid[i], side, old[i], candidate
+                )
+                continue
             inner_i = i - 1
             if side is Side.Bid:
                 # Long book: bids add inventory -> lower bid deltas + wider gaps.
@@ -975,6 +1092,12 @@ class HJBLadderSolver:
 
         # Negative inventory, moving q downward away from zero.
         for i in range(q0 - 1, -1, -1):
+            if q_grid[i] < -q_operational_max - 1e-10:
+                candidate = self._build_mdp_ladder(tier, h, q_grid[i], side)
+                improved[i] = self._choose_howard_safe_row(
+                    tier, h, q_grid[i], side, old[i], candidate
+                )
+                continue
             inner_i = i + 1
             if side is Side.Bid:
                 # Short book: bids reduce inventory -> higher bid deltas + flatter gaps.
@@ -989,7 +1112,7 @@ class HJBLadderSolver:
     def _dark_pool_fill_value(self, h: np.ndarray, q: float, hq: float, u: int,
                               dist: ArrivalDistribution, fee: float, direction: float) -> float:
         return dist.expected_fill_value(
-            lambda x: _interp_linear(self.config.q_grid, h, x), q, hq, u, fee, direction
+            lambda x: _interp_linear_bounded(self.solve_q_grid_, h, x), q, hq, u, fee, direction
         )
 
     def build_dark_pool_policy(self, venue: DarkPoolVenue, h_vec: Sequence[float]) -> None:
@@ -998,14 +1121,16 @@ class HJBLadderSolver:
             (Side.Bid, +1.0, venue.dist_bid, venue.fee_per_unit_bid),
             (Side.Ask, -1.0, venue.dist_ask, venue.fee_per_unit_ask),
         ]:
-            for i, q in enumerate(self.config.q_grid):
+            for i, q in enumerate(self.solve_q_grid_):
                 if not venue.is_admissible(q, side):
                     venue.policy.set_posted_size(i, side, 0.0, False)
                     continue
-                hq = _interp_linear(self.config.q_grid, h, q)
+                hq = _interp_linear_bounded(self.solve_q_grid_, h, q)
                 best_size, best_value = 0.0, -math.inf
                 for u_raw in venue.posted_sizes:
                     u = int(round(u_raw))
+                    if not self._dark_pool_post_admissible(q, u, side):
+                        continue
                     value = self._dark_pool_fill_value(h, q, hq, u, dist, fee, direction)
                     if value > best_value:
                         best_size, best_value = u_raw, value
@@ -1036,7 +1161,7 @@ class HJBLadderSolver:
 
             defensive_bid = defensive_shift(zero_bid)
             defensive_ask = defensive_shift(zero_ask)
-            for i, q in enumerate(self.config.q_grid):
+            for i, q in enumerate(self.solve_q_grid_):
                 if q > 0.0:
                     tier.policy.bid[i] = list(defensive_bid)
                     tier.policy.ask[i] = list(zero_ask)
@@ -1048,7 +1173,7 @@ class HJBLadderSolver:
                     tier.policy.ask[i] = list(zero_ask)
         if self.dark_pool is not None:
             venue = self.dark_pool
-            for i, q in enumerate(self.config.q_grid):
+            for i, q in enumerate(self.solve_q_grid_):
                 venue.policy.set_posted_size(i, Side.Bid, 0.0, False)
                 venue.policy.set_posted_size(i, Side.Ask, 0.0, False)
                 if not venue.posted_sizes or q == 0.0: continue
@@ -1059,7 +1184,9 @@ class HJBLadderSolver:
     def _add_transition(self, L: np.ndarray, row: int, target_q: float, rate: float) -> None:
         if rate == 0.0:
             return
-        i0, w0, i1, w1 = _interp_weights(self.config.q_grid, target_q)
+        if target_q < -self.hard_inventory_limit_ - 1e-10 or target_q > self.hard_inventory_limit_ + 1e-10:
+            raise RuntimeError("attempted transition outside the solved inventory domain")
+        i0, w0, i1, w1 = _interp_weights_bounded(self.solve_q_grid_, target_q)
         L[row, i0] += rate * w0
         L[row, i1] += rate * w1
         L[row, row] -= rate
@@ -1069,7 +1196,7 @@ class HJBLadderSolver:
         c = np.zeros(n, dtype=float)
         L = np.zeros((n, n), dtype=float)
 
-        for i, q in enumerate(self.config.q_grid):
+        for i, q in enumerate(self.solve_q_grid_):
             c[i] = -self.penalty.value(q) + self.config.spot_drift * q
 
             for tier in self.mdp_tiers:
@@ -1078,6 +1205,8 @@ class HJBLadderSolver:
                     (Side.Ask, -1.0, tier.policy.ask[i]),
                 ]:
                     for j, z in enumerate(tier.sizes_):
+                        if not self._mdp_transition_admissible(q, z, side):
+                            continue
                         d = row[j]
                         lam = tier.flow_curve.arrival_rate(d, z)
                         q_next = q + direction * z
@@ -1095,7 +1224,7 @@ class HJBLadderSolver:
                     if not venue.policy.is_active(i, side):
                         continue
                     u = int(round(size_vec[i]))
-                    if u <= 0:
+                    if u <= 0 or not self._dark_pool_post_admissible(q, u, side):
                         continue
                     for k, rate in dist.fill_rates(u):
                         c[i] -= rate * fee * k
@@ -1127,20 +1256,22 @@ class HJBLadderSolver:
         s = _side(side)
         direction = 1.0 if s is Side.Bid else -1.0
         row = tier.policy.bid[q_index] if s is Side.Bid else tier.policy.ask[q_index]
-        hq = _interp_linear(self.config.q_grid, h, q)
+        hq = _interp_linear_bounded(self.solve_q_grid_, h, q)
         total = 0.0
         for j, z in enumerate(tier.sizes_):
+            if not self._mdp_transition_admissible(q, z, s):
+                continue
             d = row[j]
             q_next = q + direction * z
             mu = tier.markout_model.expected_markout(z, self.internalization_time.value(q_next)) if tier.use_markout else 0.0
             total += self.mdp_fill_payoff(tier.flow_curve.arrival_rate(d, z), z, d, mu,
-                                          _interp_linear(self.config.q_grid, h, q_next) - hq)
+                                          _interp_linear_bounded(self.solve_q_grid_, h, q_next) - hq)
         return total
 
     def dark_pool_bellman_contribution(self, venue: DarkPoolVenue, q: float, q_index: int,
                                        h_vec: Sequence[float]) -> float:
         h = np.asarray(h_vec, dtype=float)
-        hq = _interp_linear(self.config.q_grid, h, q)
+        hq = _interp_linear_bounded(self.solve_q_grid_, h, q)
         total = 0.0
         if venue.policy.is_active(q_index, Side.Bid) and venue.policy.bid_size[q_index] > 0:
             total += self._dark_pool_fill_value(h, q, hq, int(round(venue.policy.bid_size[q_index])),
@@ -1153,7 +1284,7 @@ class HJBLadderSolver:
     def bellman_rhs(self, h_vec: Sequence[float]) -> np.ndarray:
         h = np.asarray(h_vec, dtype=float)
         rhs = np.zeros(self.grid_meta_.nq, dtype=float)
-        for i, q in enumerate(self.config.q_grid):
+        for i, q in enumerate(self.solve_q_grid_):
             val = -self.penalty.value(q) + self.config.spot_drift * q
             for tier in self.mdp_tiers:
                 val += self.mdp_bellman_contribution_side(tier, q, i, h, Side.Bid)
@@ -1164,7 +1295,7 @@ class HJBLadderSolver:
         return rhs
 
     def bellman_rhs_from_policies(self, h_vec: Sequence[float]) -> list[float]:
-        if len(h_vec) != len(self.config.q_grid):
+        if len(h_vec) != len(self.solve_q_grid_):
             raise ValueError("h_vec size must match q_grid")
         self.prepare_solve_context()
         self.update_policies(h_vec)
@@ -1221,10 +1352,71 @@ class HJBLadderSolver:
                 diag.converged = True
                 break
 
+        # Return the user-requested operational range, while retaining the
+        # hidden solved grid for diagnostics. The operational points are a
+        # literal subset of the padded grid by construction.
+        solve_arr = np.asarray(self.solve_q_grid_, dtype=float)
+        op_indices: list[int] = []
+        for q in self.config.q_grid:
+            hits = np.where(np.isclose(solve_arr, float(q), atol=1e-10, rtol=0.0))[0]
+            if len(hits) != 1:
+                raise RuntimeError(f"operational inventory state {q} missing from solve grid")
+            op_indices.append(int(hits[0]))
+
+        out_tiers = copy.deepcopy(self.mdp_tiers)
+        for tier in out_tiers:
+            tier.policy.q_grid = list(map(float, self.config.q_grid))
+            tier.policy.bid = [tier.policy.bid[i] for i in op_indices]
+            tier.policy.ask = [tier.policy.ask[i] for i in op_indices]
+
+            # Snap the returned operational surface exactly onto the structural
+            # trader constraints. Howard has already converged; this only
+            # removes O(sqrt(machine-eps)) lag from the Jacobi propagation.
+            q0_out = len(tier.policy.q_grid) // 2
+            for i in range(q0_out + 1, len(tier.policy.q_grid)):
+                inner_bid = tier.policy.bid[i - 1]
+                inner_ask = tier.policy.ask[i - 1]
+                tier.policy.bid[i] = self._project_ladder_to_bounds(
+                    tier, tier.policy.bid[i],
+                    min_gaps=self._ladder_gaps(inner_bid),
+                    rung_upper_bounds=inner_bid,
+                )
+                tier.policy.ask[i] = self._project_ladder_to_bounds(
+                    tier, tier.policy.ask[i],
+                    max_gaps=self._ladder_gaps(inner_ask),
+                    rung_lower_bounds=inner_ask,
+                )
+            for i in range(q0_out - 1, -1, -1):
+                inner_bid = tier.policy.bid[i + 1]
+                inner_ask = tier.policy.ask[i + 1]
+                tier.policy.bid[i] = self._project_ladder_to_bounds(
+                    tier, tier.policy.bid[i],
+                    max_gaps=self._ladder_gaps(inner_bid),
+                    rung_lower_bounds=inner_bid,
+                )
+                tier.policy.ask[i] = self._project_ladder_to_bounds(
+                    tier, tier.policy.ask[i],
+                    min_gaps=self._ladder_gaps(inner_ask),
+                    rung_upper_bounds=inner_ask,
+                )
+
+        out_dark = copy.deepcopy(self.dark_pool)
+        if out_dark is not None:
+            p = out_dark.policy
+            p.q_grid = list(map(float, self.config.q_grid))
+            p.bid_size = [p.bid_size[i] for i in op_indices]
+            p.ask_size = [p.ask_size[i] for i in op_indices]
+            p.bid_active = [p.bid_active[i] for i in op_indices]
+            p.ask_active = [p.ask_active[i] for i in op_indices]
+
         return HJBSolution(
-            h=h.tolist(), q_grid=list(map(float, self.config.q_grid)),
-            mdp_tiers=copy.deepcopy(self.mdp_tiers), dark_pool=copy.deepcopy(self.dark_pool),
+            h=[float(h[i]) for i in op_indices],
+            q_grid=list(map(float, self.config.q_grid)),
+            mdp_tiers=out_tiers, dark_pool=out_dark,
             diagnostics=diag, average_reward=float(rho),
+            solve_q_grid=list(map(float, self.solve_q_grid_)),
+            h_solve=h.tolist(),
+            hard_inventory_limit=float(self.hard_inventory_limit_),
         )
 
 
