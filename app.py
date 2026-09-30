@@ -1,20 +1,64 @@
 from __future__ import annotations
 
+import importlib
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
+import sys
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+# Always prefer the package shipped next to this app.  Streamlit keeps the Python
+# process alive across reruns, so an older editable/site-packages copy can otherwise
+# remain in sys.modules after the project directory is replaced.
+_PROJECT_ROOT = Path(__file__).resolve().parent
+_LOCAL_PACKAGE_DIR = (_PROJECT_ROOT / "ladder_pricer").resolve()
+_project_root_str = str(_PROJECT_ROOT)
+if not sys.path or sys.path[0] != _project_root_str:
+    sys.path = [_project_root_str] + [p for p in sys.path if p != _project_root_str]
+importlib.invalidate_caches()
+
+_existing_lp = sys.modules.get("ladder_pricer")
+if _existing_lp is not None:
+    _existing_file = getattr(_existing_lp, "__file__", None)
+    _existing_is_local = False
+    if _existing_file:
+        try:
+            _existing_is_local = Path(_existing_file).resolve().parent == _LOCAL_PACKAGE_DIR
+        except OSError:
+            _existing_is_local = False
+    if not _existing_is_local:
+        del sys.modules["ladder_pricer"]
+
 try:
     import ladder_pricer as lp
 except ImportError as exc:
     raise ImportError(
-        "Could not import 'ladder_pricer'. Make sure the package is installed "
-        "into the same Python environment that runs Streamlit."
+        "Could not import the local 'ladder_pricer' package shipped with app.py."
     ) from exc
+
+# A same-path module can also be stale after hot-replacing project files.  Reload
+# once if the benchmark-version sentinel is missing.
+if not hasattr(lp, "PNL_BENCHMARK_VERSION"):
+    lp = importlib.reload(lp)
+
+_loaded_lp_file = Path(getattr(lp, "__file__", "")).resolve()
+if _loaded_lp_file.parent != _LOCAL_PACKAGE_DIR:
+    raise RuntimeError(
+        "Streamlit imported ladder_pricer from the wrong location: "
+        f"{_loaded_lp_file}. Expected {_LOCAL_PACKAGE_DIR}. Restart Streamlit "
+        "from this project directory."
+    )
+if not hasattr(lp, "PNL_BENCHMARK_VERSION"):
+    raise RuntimeError(
+        "The local ladder_pricer package is stale: PNL_BENCHMARK_VERSION is missing. "
+        "Restart Streamlit from this project directory."
+    )
+
+_PNL_BENCHMARK_VERSION = lp.PNL_BENCHMARK_VERSION
 
 
 # ============================================================
@@ -97,6 +141,12 @@ def validate_centered_q_grid(q_grid: np.ndarray) -> list[str]:
 # ============================================================
 # Specifications
 # ============================================================
+
+SESSION_START_LABEL = "07:45"
+SESSION_END_LABEL = "17:15"
+SESSION_HORIZON_MINUTES = 9.5 * 60.0  # 570 minutes
+BASE_CCY_LABEL = "EUR"
+QUOTE_CCY_LABEL = "SEK"
 
 DEFAULT_MDP_SIZES = "1, 2, 3, 5, 10, 20"
 DEFAULT_DARK_POOL_SETTINGS = {
@@ -306,14 +356,17 @@ def default_tier_values(i: int) -> dict:
             "enabled": False,
             "kind": "mdp",
             "name": "Tier 3",
-            "sizes": "1, 2, 3, 5, 10, 15, 20",
-            "flow_A0": 0.85,
-            "flow_theta": 0.15,
-            "flow_beta": 0.0,
-            "flow_steepness": 1.60,
-            "flow_shift": 0.28,
-            "flow_volume_shift": 0.090,
-            **_markout_defaults,
+            "sizes": "1",
+            "flow_A0": 1.0,
+            "flow_theta": 0.144,
+            "flow_beta": 0.0857,
+            "flow_steepness": 20.0,
+            "flow_shift": 0.52,
+            "flow_volume_shift": 0.026,
+            "impact_scale_pips": 4.0,
+            "impact_size_exponent": 0.5,
+            "impact_tau_minutes": 0.10,
+            "use_markout": True,
             "delta_min": -10.0,
             "delta_max": 100.0,
         },
@@ -356,7 +409,7 @@ def build_tier_spec_from_ui(i: int) -> TierSpec:
             step=0.05,
             format="%.4f",
             key=f"flow_A0_{i}",
-            help="Overall flow intensity: expected number of client RFQs per minute at δ = 50 % and z = 1.",
+            help="RFQ intensity scale [1/min]. The resulting fill intensity is A(z) × hit_ratio(δ,z), also in fills/minute.",
         )
         flow_theta = c2.number_input(
             f"theta {i + 1}",
@@ -515,14 +568,14 @@ def build_dark_pool_spec_from_ui() -> DarkPoolSpec | None:
 
         c1, c2 = st.columns(2)
         lambda_bid = c1.number_input(
-            "Dark pool λ bid",
+            "Dark pool λ bid [1/min]",
             value=float(defaults["lambda_bid"]),
             min_value=0.0,
             step=0.01,
             format="%.4f",
         )
         lambda_ask = c2.number_input(
-            "Dark pool λ ask",
+            "Dark pool λ ask [1/min]",
             value=float(defaults["lambda_ask"]),
             min_value=0.0,
             step=0.01,
@@ -669,6 +722,188 @@ def total_venue_count(solution: lp.HJBSolution) -> int:
     return len(solution.mdp_tiers) + (0 if solution.dark_pool is None else 1)
 
 
+def _rounded_flat(values, digits: int = 14) -> tuple[float, ...]:
+    arr = np.asarray(values, dtype=float).ravel()
+    return tuple(float(x) for x in np.round(arr, digits))
+
+
+def monte_carlo_model_signature(
+    solver: lp.HJBLadderSolver,
+    *,
+    horizon_minutes: float,
+    n_paths: int,
+    initial_inventory: float,
+    seed: int,
+    sigma: float,
+) -> tuple:
+    """Signature for cached Monte Carlo + closed-form results.
+
+    Include the benchmark implementation version, solved policies and every
+    model input used directly by the simulation/benchmark. This intentionally
+    invalidates cached results after PnL-accounting changes even when the HJB
+    policy itself is unchanged.
+    """
+    tier_sig = []
+    for tier in solver.mdp_tiers:
+        tier_sig.append((
+            tier.name,
+            tuple(float(z) for z in tier.sizes_),
+            float(tier.flow_curve.A0), float(tier.flow_curve.theta),
+            float(tier.flow_curve.beta), float(tier.flow_curve.shift),
+            float(tier.flow_curve.steepness), float(tier.flow_curve.volume_shift),
+            bool(tier.use_markout),
+            float(tier.markout_model.impact_scale),
+            float(tier.markout_model.size_exponent),
+            float(tier.markout_model.tau),
+            float(tier.delta_min), float(tier.delta_max),
+            _rounded_flat(tier.policy.bid),
+            _rounded_flat(tier.policy.ask),
+        ))
+
+    dark_sig = None
+    if solver.dark_pool is not None:
+        venue = solver.dark_pool
+        dark_sig = (
+            repr(venue.dist_bid), repr(venue.dist_ask),
+            float(venue.fee_per_unit_bid), float(venue.fee_per_unit_ask),
+            tuple(float(x) for x in venue.posted_sizes),
+            bool(venue.allow_both_sides),
+            _rounded_flat(venue.policy.bid_size),
+            _rounded_flat(venue.policy.ask_size),
+            tuple(bool(x) for x in venue.policy.bid_active),
+            tuple(bool(x) for x in venue.policy.ask_active),
+        )
+
+    return (
+        _PNL_BENCHMARK_VERSION,
+        tuple(float(q) for q in solver.solve_q_grid_),
+        float(solver.config.spot), float(solver.config.spot_drift),
+        float(solver.config.spread),
+        tuple(tier_sig), dark_sig,
+        float(horizon_minutes), int(n_paths), float(initial_inventory),
+        int(seed), float(sigma),
+    )
+
+
+
+
+def efficient_frontier_signature(
+    *,
+    q_grid: np.ndarray,
+    spot: float,
+    spot_drift: float,
+    spread: float,
+    sigma: float,
+    horizon_minutes: float,
+    initial_inventory: float,
+    tier_specs: list[TierSpec],
+    dark_pool_spec: DarkPoolSpec | None,
+    tau0: float,
+    tau1: float,
+    tau2: float,
+    gammas: np.ndarray,
+) -> tuple:
+    tier_sig = []
+    for spec in tier_specs:
+        tier_sig.append((
+            type(spec).__name__,
+            bool(spec.enabled),
+            str(spec.name),
+            tuple(float(z) for z in tier_sizes(spec)),
+            float(spec.flow_A0), float(spec.flow_theta), float(spec.flow_beta),
+            float(spec.flow_steepness), float(spec.flow_shift), float(spec.flow_volume_shift),
+            bool(spec.use_markout),
+            float(spec.markout_spec.impact_scale_pips),
+            float(spec.markout_spec.size_exponent),
+            float(spec.markout_spec.tau_minutes),
+            float(spec.delta_min), float(spec.delta_max),
+        ))
+
+    dark_sig = None
+    if dark_pool_spec is not None:
+        dark_sig = (
+            str(dark_pool_spec.dist_type),
+            float(dark_pool_spec.lambda_bid), float(dark_pool_spec.lambda_ask),
+            float(dark_pool_spec.p_bid), float(dark_pool_spec.p_ask),
+            float(dark_pool_spec.mu_bid), float(dark_pool_spec.mu_ask),
+            float(dark_pool_spec.p0_bid), float(dark_pool_spec.p0_ask),
+            float(dark_pool_spec.fee_per_unit_bid), float(dark_pool_spec.fee_per_unit_ask),
+            tuple(float(x) for x in dark_pool_spec.posted_sizes),
+            bool(dark_pool_spec.allow_both_sides),
+        )
+
+    return (
+        'efficient_frontier_v1',
+        _PNL_BENCHMARK_VERSION,
+        tuple(float(q) for q in q_grid),
+        float(spot), float(spot_drift), float(spread), float(sigma),
+        float(horizon_minutes), float(initial_inventory),
+        float(tau0), float(tau1), float(tau2),
+        tuple(float(x) for x in np.asarray(gammas, dtype=float)),
+        tuple(tier_sig),
+        dark_sig,
+    )
+
+
+def compute_efficient_frontier(
+    *,
+    q_grid: np.ndarray,
+    spot: float,
+    spot_drift: float,
+    spread: float,
+    sigma: float,
+    horizon_minutes: float,
+    initial_inventory: float,
+    tier_specs: list[TierSpec],
+    dark_pool_spec: DarkPoolSpec | None,
+    tau0: float,
+    tau1: float,
+    tau2: float,
+    gammas: np.ndarray,
+) -> pd.DataFrame:
+    rows: list[dict[str, float]] = []
+    for gamma in np.asarray(gammas, dtype=float):
+        local_tiers = build_tiers(tier_specs, float(spot))
+        local_dark_pool = None if dark_pool_spec is None else dark_pool_spec.build_venue(float(spot))
+        local_penalty = lp.QuadraticInventoryPenalty(
+            carry_cost=lp.CarryCost(risk_aversion=float(gamma), sigma=float(sigma)),
+        )
+        local_config = build_solver_config(
+            q_grid=q_grid,
+            spread=float(spread),
+            spot=float(spot),
+            spot_drift=float(spot_drift),
+        )
+        local_internalization_time = lp.PolynomialInternalizationTime(
+            tau0=float(tau0), tau1=float(tau1), tau2=float(tau2)
+        )
+        local_solver = lp.HJBLadderSolver(
+            config=local_config,
+            penalty=local_penalty,
+            internalization_time=local_internalization_time,
+            mdp_tiers=local_tiers,
+            dark_pool=local_dark_pool,
+        )
+        local_solution = local_solver.solve()
+        local_stats = local_solver.closed_form_pnl_statistics(
+            horizon_minutes=float(horizon_minutes),
+            sigma=float(sigma),
+            initial_inventory=float(initial_inventory),
+        )
+        rows.append({
+            'gamma': float(gamma),
+            'expected_pnl_base_ccy': float(local_stats.expected_pnl_base_ccy_at_reference_spot),
+            'std_pnl_base_ccy': float(local_stats.std_pnl_base_ccy_at_reference_spot),
+            'expected_pnl_quote_ccy': float(local_stats.expected_pnl_quote_ccy),
+            'std_pnl_quote_ccy': float(local_stats.std_pnl_quote_ccy),
+            'average_reward': float(local_solution.average_reward),
+            'n_states': float(len(local_solution.q_grid)),
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(['std_pnl_base_ccy', 'gamma']).reset_index(drop=True)
+    return df
+
 def q_index_for_policy_qgrid(q_grid: list[float] | np.ndarray, q: float) -> int:
     q_arr = np.asarray(list(q_grid), dtype=float)
     if q_arr.size == 0:
@@ -730,7 +965,7 @@ def make_flow_curve_figure(cpp_tier: PricerTier, spec: TierSpec) -> go.Figure:
     fig.update_layout(
         title=f"Flow curves λ(δ, z) — {spec.name} ({tier_kind_label()})",
         xaxis_title="delta",
-        yaxis_title="arrival rate",
+        yaxis_title="Fill intensity [1/min]",
         height=500,
     )
     return fig
@@ -1166,6 +1401,340 @@ def make_convergence_figure(values: list[float], title: str, yaxis_title: str) -
     return fig
 
 
+def make_pnl_distribution_figure(
+    result: lp.MonteCarloResult,
+    closed_form_value: float,
+) -> go.Figure:
+    pnl = np.asarray(result.pnl_base_ccy, dtype=float)
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=pnl,
+        nbinsx=max(20, min(80, int(math.sqrt(max(1, len(pnl)))) * 2)),
+        name="Monte Carlo PnL",
+        opacity=0.78,
+    ))
+    if len(pnl):
+        fig.add_vline(
+            x=float(np.mean(pnl)), line_dash="dash",
+            annotation_text="MC mean", annotation_position="top left",
+        )
+    fig.add_vline(
+        x=float(closed_form_value), line_dash="dot",
+        annotation_text="Closed-form mean", annotation_position="top right",
+    )
+    fig.update_layout(
+        title=f"Trading-session PnL distribution — {SESSION_START_LABEL}–{SESSION_END_LABEL}",
+        xaxis_title=f"PnL [{BASE_CCY_LABEL}]",
+        yaxis_title="Path count",
+        bargap=0.03,
+        height=500,
+    )
+    return fig
+
+
+def make_inventory_paths_distribution_figure(result: lp.MonteCarloResult) -> go.Figure:
+    fig = go.Figure()
+
+    # A handful of actual paths give intuition for the jump dynamics. The
+    # percentile envelope itself is computed from every simulated path.
+    for i, path in enumerate(result.sample_paths):
+        fig.add_trace(go.Scatter(
+            x=path.inventory_event_times,
+            y=path.inventory_event_values,
+            mode="lines",
+            line_shape="hv",
+            name=f"sample {i + 1}",
+            opacity=0.22,
+            showlegend=False,
+            hovertemplate="%{x:.1f} min<br>q=%{y:.2f}M<extra></extra>",
+        ))
+
+    times = np.asarray(result.inventory_sample_times, dtype=float)
+    lo = np.asarray(result.inventory_ci_lower, dtype=float)
+    med = np.asarray(result.inventory_median, dtype=float)
+    hi = np.asarray(result.inventory_ci_upper, dtype=float)
+    if len(times):
+        fig.add_trace(go.Scatter(
+            x=times, y=lo, mode="lines",
+            line=dict(width=0),
+            name="2.5th percentile",
+            showlegend=False,
+            hovertemplate="%{x:.1f} min<br>2.5%=%{y:.2f}M<extra></extra>",
+        ))
+        fig.add_trace(go.Scatter(
+            x=times, y=hi, mode="lines",
+            line=dict(width=0),
+            fill="tonexty",
+            name="95% interval",
+            hovertemplate="%{x:.1f} min<br>97.5%=%{y:.2f}M<extra></extra>",
+        ))
+        fig.add_trace(go.Scatter(
+            x=times, y=med, mode="lines",
+            name="Median inventory",
+            line=dict(width=2.5),
+            hovertemplate="%{x:.1f} min<br>median=%{y:.2f}M<extra></extra>",
+        ))
+
+    tickvals = [0.0, 120.0, 240.0, 360.0, 480.0, SESSION_HORIZON_MINUTES]
+    ticktext = ["07:45", "09:45", "11:45", "13:45", "15:45", "17:15"]
+    fig.add_hline(y=0.0, line_dash="dot")
+    fig.update_layout(
+        title=f"Inventory paths — median and 95% simulation interval — {SESSION_START_LABEL}–{SESSION_END_LABEL}",
+        xaxis_title="Session time",
+        yaxis_title="Inventory [M]",
+        xaxis=dict(tickmode="array", tickvals=tickvals, ticktext=ticktext),
+        height=430,
+        hovermode="x unified",
+    )
+    return fig
+
+
+
+
+def make_efficient_frontier_figure(frontier: pd.DataFrame, current_gamma: float) -> go.Figure:
+    fig = go.Figure()
+    if frontier.empty:
+        fig.update_layout(
+            title='Efficient frontier',
+            xaxis_title=f'Closed-form stdev [{BASE_CCY_LABEL}]',
+            yaxis_title=f'Closed-form expected PnL [{BASE_CCY_LABEL}]',
+            height=520,
+        )
+        return fig
+
+    df = frontier.sort_values(['std_pnl_base_ccy', 'gamma']).reset_index(drop=True)
+    hover = [
+        f"γ={row.gamma:.4g}<br>mean={_format_ccy(row.expected_pnl_base_ccy)} {BASE_CCY_LABEL}<br>std={_format_ccy(row.std_pnl_base_ccy)} {BASE_CCY_LABEL}"
+        for row in df.itertuples()
+    ]
+    fig.add_trace(go.Scatter(
+        x=df['std_pnl_base_ccy'],
+        y=df['expected_pnl_base_ccy'],
+        mode='lines+markers',
+        name='Closed-form frontier',
+        customdata=np.array(hover, dtype=object),
+        hovertemplate='%{customdata}<extra></extra>',
+    ))
+
+    idx_current = int(np.argmin(np.abs(df['gamma'].to_numpy(dtype=float) - float(current_gamma))))
+    current = df.iloc[idx_current]
+    fig.add_trace(go.Scatter(
+        x=[float(current['std_pnl_base_ccy'])],
+        y=[float(current['expected_pnl_base_ccy'])],
+        mode='markers',
+        name=f'Current γ={float(current["gamma"]):.4g}',
+        marker=dict(symbol='star', size=15, line=dict(width=1.5)),
+        hovertemplate=(
+            f"current γ={float(current['gamma']):.4g}<br>mean={_format_ccy(float(current['expected_pnl_base_ccy']))} {BASE_CCY_LABEL}"
+            f"<br>std={_format_ccy(float(current['std_pnl_base_ccy']))} {BASE_CCY_LABEL}<extra></extra>"
+        ),
+    ))
+    fig.update_layout(
+        title='Efficient frontier — closed-form mean vs. standard deviation',
+        xaxis_title=f'Closed-form PnL stdev [{BASE_CCY_LABEL}]',
+        yaxis_title=f'Closed-form expected PnL [{BASE_CCY_LABEL}]',
+        height=520,
+        hovermode='closest',
+    )
+    return fig
+
+
+
+def make_phi_risk_adjusted_figure(frontier: pd.DataFrame, current_gamma: float) -> go.Figure:
+    """Plot the frontier parameter phi against expected PnL / PnL stdev.
+
+    The current implementation uses the same risk-aversion parameter that is
+    called gamma in the HJB solver.  The plot labels it phi because phi is the
+    economic frontier parameter shown to the user.
+    """
+    fig = go.Figure()
+    if frontier.empty:
+        fig.update_layout(
+            title='Risk-adjusted return vs. φ',
+            xaxis_title='φ (risk aversion)',
+            yaxis_title='Expected PnL / stdev',
+            height=460,
+        )
+        return fig
+
+    df = frontier.sort_values('gamma').reset_index(drop=True).copy()
+    std = df['std_pnl_base_ccy'].to_numpy(dtype=float)
+    mean = df['expected_pnl_base_ccy'].to_numpy(dtype=float)
+    ratio = np.divide(mean, std, out=np.full_like(mean, np.nan), where=np.abs(std) > 1e-15)
+    df['mean_over_std'] = ratio
+
+    fig.add_trace(go.Scatter(
+        x=df['gamma'],
+        y=df['mean_over_std'],
+        mode='lines+markers',
+        name='Expected PnL / stdev',
+        customdata=np.column_stack((df['expected_pnl_base_ccy'], df['std_pnl_base_ccy'])),
+        hovertemplate=(
+            'φ=%{x:.4g}<br>'
+            'E[PnL]/Std=%{y:.4f}<br>'
+            f'E[PnL]=%{{customdata[0]:,.0f}} {BASE_CCY_LABEL}<br>'
+            f'Std=%{{customdata[1]:,.0f}} {BASE_CCY_LABEL}<extra></extra>'
+        ),
+    ))
+
+    idx_current = int(np.argmin(np.abs(df['gamma'].to_numpy(dtype=float) - float(current_gamma))))
+    current = df.iloc[idx_current]
+    fig.add_trace(go.Scatter(
+        x=[float(current['gamma'])],
+        y=[float(current['mean_over_std'])],
+        mode='markers',
+        name=f'Current φ={float(current["gamma"]):.4g}',
+        marker=dict(symbol='star', size=15, line=dict(width=1.5)),
+        hovertemplate=(
+            f'current φ={float(current["gamma"]):.4g}<br>'
+            f'E[PnL]/Std={float(current["mean_over_std"]):.4f}<extra></extra>'
+        ),
+    ))
+    fig.add_hline(y=0.0, line_dash='dot')
+    fig.update_layout(
+        title='Risk-adjusted return across φ',
+        xaxis_title='φ (risk aversion)',
+        yaxis_title='Expected PnL / stdev',
+        height=460,
+        hovermode='closest',
+    )
+    return fig
+
+SESSION_TICKVALS = [0.0, 120.0, 240.0, 360.0, 480.0, SESSION_HORIZON_MINUTES]
+SESSION_TICKTEXT = ["07:45", "09:45", "11:45", "13:45", "15:45", "17:15"]
+
+
+def _session_clock_label(elapsed_minutes: float, with_seconds: bool = True) -> str:
+    total_seconds = int(round((7 * 60 + 45 + float(elapsed_minutes)) * 60))
+    hours = (total_seconds // 3600) % 24
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if with_seconds else f"{hours:02d}:{minutes:02d}"
+
+
+def make_inventory_path_figure(path: lp.MonteCarloSamplePath) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=path.inventory_event_times,
+        y=path.inventory_event_values,
+        mode="lines",
+        line_shape="hv",
+        name="Inventory",
+    ))
+    fig.add_hline(y=0.0, line_dash="dot")
+    fig.update_layout(
+        title="Inventory path",
+        xaxis_title="Session time",
+        yaxis_title="Inventory [M]",
+        xaxis=dict(tickmode="array", tickvals=SESSION_TICKVALS, ticktext=SESSION_TICKTEXT),
+        height=360,
+        showlegend=False,
+    )
+    return fig
+
+
+def make_spot_quote_path_figure(path: lp.MonteCarloSamplePath, quote_size: float) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=path.times, y=path.spots, mode="lines", name="Spot", line=dict(width=2.5),
+    ))
+
+    matched_tiers: set[int] = set()
+    for series in path.quote_series:
+        if not math.isclose(series.size, float(quote_size), rel_tol=0.0, abs_tol=1e-12):
+            continue
+        matched_tiers.add(series.tier_idx)
+        side_label = "Bid" if series.side == "bid" else "Ask"
+        fig.add_trace(go.Scatter(
+            x=path.times,
+            y=series.prices,
+            mode="lines",
+            name=f"{series.tier_name} {side_label} {series.size:g}M",
+            line=dict(dash="dash" if series.side == "bid" else "dot"),
+        ))
+
+    # Actual execution markers, split by tier and side. Plot all fill sizes: the
+    # hover text makes it clear which rung executed.
+    groups: dict[tuple[str, str], list[lp.MonteCarloFillEvent]] = {}
+    for fill in path.fills:
+        groups.setdefault((fill.tier_name, fill.side), []).append(fill)
+    for (tier_name, side), fills in groups.items():
+        symbol = "triangle-up" if side == "bid" else "triangle-down"
+        side_label = "Bid fills" if side == "bid" else "Ask fills"
+        hover = [
+            f"{_session_clock_label(f.time_minutes)}<br>{f.tier_name} {f.side} {f.size:g}M"
+            f"<br>exec={f.execution_price:.6f}<br>q: {f.inventory_before:g} → {f.inventory_after:g}"
+            for f in fills
+        ]
+        fig.add_trace(go.Scatter(
+            x=[f.time_minutes for f in fills],
+            y=[f.execution_price for f in fills],
+            mode="markers",
+            name=f"{tier_name} {side_label}",
+            marker=dict(symbol=symbol, size=8),
+            text=hover,
+            hovertemplate="%{text}<extra></extra>",
+        ))
+
+    fig.update_layout(
+        title=f"Spot, {quote_size:g}M quotes and fills",
+        xaxis_title="Session time",
+        yaxis_title="Price",
+        xaxis=dict(tickmode="array", tickvals=SESSION_TICKVALS, ticktext=SESSION_TICKTEXT),
+        height=520,
+        legend=dict(orientation="h"),
+    )
+    return fig
+
+
+def make_fill_counts_figure(path: lp.MonteCarloSamplePath) -> go.Figure:
+    counts: dict[tuple[str, str], int] = {}
+    for fill in path.fills:
+        counts[(fill.tier_name, fill.side)] = counts.get((fill.tier_name, fill.side), 0) + 1
+    tiers = list(dict.fromkeys(fill.tier_name for fill in path.fills))
+    fig = go.Figure()
+    for side in ("bid", "ask"):
+        fig.add_trace(go.Bar(
+            x=tiers,
+            y=[counts.get((tier, side), 0) for tier in tiers],
+            name=side.capitalize(),
+        ))
+    fig.update_layout(
+        title="Fills by tier and side",
+        xaxis_title="Tier",
+        yaxis_title="Fill count",
+        barmode="group",
+        height=350,
+    )
+    return fig
+
+
+def fill_tape_frame(path: lp.MonteCarloSamplePath) -> pd.DataFrame:
+    rows = []
+    for fill in path.fills:
+        rows.append({
+            "Time": _session_clock_label(fill.time_minutes),
+            "Tier": fill.tier_name,
+            "Side": fill.side.capitalize(),
+            "Size [M]": fill.size,
+            "Execution price": fill.execution_price,
+            "Spot": fill.spot_before_fill,
+            "Inventory before": fill.inventory_before,
+            "Inventory after": fill.inventory_after,
+            "Delta": fill.delta,
+        })
+    return pd.DataFrame(rows)
+
+
+def _format_ccy(x: float) -> str:
+    ax = abs(float(x))
+    if ax >= 1_000_000:
+        return f"{x / 1_000_000:,.2f}m"
+    if ax >= 1_000:
+        return f"{x / 1_000:,.1f}k"
+    return f"{x:,.0f}"
+
+
 # ============================================================
 # App
 # ============================================================
@@ -1215,7 +1784,7 @@ with st.sidebar:
         ) / 10_000.0
         risk_aversion = st.number_input(
             "γ (risk aversion)",
-            value=0.01, step=0.01, format="%.2f",
+            value=0.1, step=0.01, format="%.2f",
             help="Standard quadratic running penalty: γσ²·q².",
         )
     with st.sidebar.expander("Internalization time", expanded=False):
@@ -1320,234 +1889,538 @@ solution_tiers = ordered_solution_tiers(active_tier_specs, solution)
 
 st.success("Solver run complete.")
 
-summary_cols = st.columns(4)
-summary_cols[0].metric("Configured tiers", len(tier_specs))
-summary_cols[1].metric("Active MDP tiers", active_mdp_count)
-summary_cols[2].metric("Dark pool", "on" if dark_pool_spec is not None else "off")
-summary_cols[3].metric("Disabled tiers", len(disabled_tier_names))
+main_policy_tab, monte_carlo_tab = st.tabs(["Policy", "Monte Carlo"])
 
-if disabled_tier_names:
-    st.caption("Excluded from solve: " + ", ".join(disabled_tier_names))
+with main_policy_tab:
+    summary_cols = st.columns(4)
+    summary_cols[0].metric("Configured tiers", len(tier_specs))
+    summary_cols[1].metric("Active MDP tiers", active_mdp_count)
+    summary_cols[2].metric("Dark pool", "on" if dark_pool_spec is not None else "off")
+    summary_cols[3].metric("Disabled tiers", len(disabled_tier_names))
 
-if diag.converged:
-    st.info(
-        f"Howard converged after {diag.iterations_used} policy iterations. "
-        f"Bellman residual = {diag.final_max_rhs:.2e}; "
-        f"average reward ρ = {solution.average_reward:.6g}."
-    )
-else:
-    st.warning(
-        f"Howard did not reach machine-precision convergence. "
-        f"Iterations = {diag.iterations_used}; Bellman residual = {diag.final_max_rhs:.2e}."
-    )
+    if disabled_tier_names:
+        st.caption("Excluded from solve: " + ", ".join(disabled_tier_names))
 
-with st.expander("Solver diagnostics", expanded=False):
-    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-    c1.metric("pricing q points", len(config.q_grid))
-    c2.metric("solve q points", len(solution.solve_q_grid))
-    c3.metric("hard |q|", f"{solution.hard_inventory_limit:.2f}")
-    c4.metric("venues", total_venue_count(solution))
-    c5.metric("iterations used", diag.iterations_used)
-    c6.metric("converged", "yes" if diag.converged else "no")
-    c7.metric("spread", f"{config.spread:.6f}")
-    st.caption(
-        "The displayed pricing grid is padded internally by the largest allowed trade size. "
-        "Howard solves h(q) on that hidden domain; transitions beyond its hard edge are inadmissible, "
-        "so no continuation value is obtained by extrapolation."
-    )
+    if diag.converged:
+        st.info(
+            f"Howard converged after {diag.iterations_used} policy iterations. "
+            f"Bellman residual = {diag.final_max_rhs:.2e}; "
+            f"average reward ρ = {solution.average_reward:.6g}."
+        )
+    else:
+        st.warning(
+            f"Howard did not reach machine-precision convergence. "
+            f"Iterations = {diag.iterations_used}; Bellman residual = {diag.final_max_rhs:.2e}."
+        )
 
-    st.plotly_chart(make_h_figure(solution), use_container_width=True)
-    st.plotly_chart(
-        make_convergence_figure(
-            list(solution.diagnostics.history_max_h_change),
-            "Convergence: max |Δh|",
-            "max |Δh|",
-        ),
-        use_container_width=True,
-    )
-    st.plotly_chart(
-        make_convergence_figure(
-            list(solution.diagnostics.history_max_rhs),
-            "Convergence: Bellman residual",
-            "Bellman residual",
-        ),
-        use_container_width=True,
-    )
+    with st.expander("Solver diagnostics", expanded=False):
+        c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+        c1.metric("pricing q points", len(config.q_grid))
+        c2.metric("solve q points", len(solution.solve_q_grid))
+        c3.metric("hard |q|", f"{solution.hard_inventory_limit:.2f}")
+        c4.metric("venues", total_venue_count(solution))
+        c5.metric("iterations used", diag.iterations_used)
+        c6.metric("converged", "yes" if diag.converged else "no")
+        c7.metric("spread", f"{config.spread:.6f}")
+        st.caption(
+            "The displayed pricing grid is padded internally by the largest allowed trade size. "
+            "Howard solves h(q) on that hidden domain; transitions beyond its hard edge are inadmissible, "
+            "so no continuation value is obtained by extrapolation."
+        )
 
-tab_names = ["Internalization time"] + [f"{spec.name} [{tier_kind_label()}]" for spec in active_tier_specs]
-if solution.dark_pool is not None:
-    tab_names.append("Dark Pool")
-
-if tab_names:
-    tabs = st.tabs(tab_names)
-    available_q = [float(q) for q in solution.q_grid]
-    default_q = 0.0 if 0.0 in available_q else available_q[len(available_q) // 2]
-
-    with tabs[0]:
-        internalization_time_model = lp.PolynomialInternalizationTime(
-            tau0=float(tau0), tau1=float(tau1), tau2=float(tau2)
+        st.plotly_chart(make_h_figure(solution), use_container_width=True)
+        st.plotly_chart(
+            make_convergence_figure(
+                list(solution.diagnostics.history_max_h_change),
+                "Convergence: max |Δh|",
+                "max |Δh|",
+            ),
+            use_container_width=True,
         )
         st.plotly_chart(
-            make_internalization_time_figure(internalization_time_model, float(q_abs_max)),
+            make_convergence_figure(
+                list(solution.diagnostics.history_max_rhs),
+                "Convergence: Bellman residual",
+                "Bellman residual",
+            ),
             use_container_width=True,
         )
 
-    for idx, (spec, cpp_tier) in enumerate(zip(active_tier_specs, solution_tiers)):
-        with tabs[idx + 1]:
-            st.subheader(f"Tier: {spec.name}")
-            st.caption(f"Type: {tier_kind_label()}")
-
-            with st.expander("Tier parameters", expanded=False):
-                st.dataframe(make_flow_parameter_table(spec, cpp_tier), use_container_width=True)
-
-            with st.expander("Flow curves", expanded=False):
-                st.plotly_chart(make_flow_curve_figure(cpp_tier, spec), use_container_width=True)
-
-            with st.expander("Hit ratios", expanded=False):
-                st.plotly_chart(make_hit_ratio_figure(cpp_tier, spec), use_container_width=True)
-
-            with st.expander("Implied hit ratios vs inventory", expanded=False):
-                st.plotly_chart(make_implied_hit_ratio_figure(cpp_tier, spec), use_container_width=True)
-
-            with st.expander("Markouts", expanded=False):
-                st.plotly_chart(make_markout_figure(cpp_tier, spec), use_container_width=True)
-
-            with st.expander("Quotes vs inventory", expanded=False):
-                st.plotly_chart(
-                    make_quote_inventory_figure(cpp_tier, spec, float(config.spread), float(mid_price)),
-                    use_container_width=True,
-                )
-
-            with st.expander("Quote surface (3D)", expanded=False):
-                col_bid, col_ask = st.columns(2)
-                with col_bid:
-                    st.plotly_chart(
-                        make_quote_surface_figure(cpp_tier, spec, float(config.spread), float(mid_price), "bid"),
-                        use_container_width=True,
-                    )
-                with col_ask:
-                    st.plotly_chart(
-                        make_quote_surface_figure(cpp_tier, spec, float(config.spread), float(mid_price), "ask"),
-                        use_container_width=True,
-                    )
-
-            with st.expander("Volume premium", expanded=False):
-                q_for_ladder = st.select_slider(
-                    f"Inventory level for ladder — {spec.name}",
-                    options=available_q,
-                    value=default_q,
-                    key=f"qslider_{idx}",
-                )
-                st.plotly_chart(
-                    make_ladder_figure(cpp_tier, spec, float(q_for_ladder), float(config.spread), float(mid_price)),
-                    use_container_width=True,
-                )
-                q_for_table = st.selectbox(
-                    f"q for ladder table — {spec.name}",
-                    options=available_q,
-                    index=available_q.index(default_q),
-                    key=f"qtable_{idx}",
-                )
-                st.dataframe(
-                    make_q_ladder_table(cpp_tier, spec, float(q_for_table), float(config.spread), float(mid_price)),
-                    use_container_width=True,
-                )
-
-            with st.expander("What this tab is solving"):
-                st.markdown(
-                    r"""
-**MDP tier — rung-by-rung two-sided ladder**
-
-The dealer solves a stationary HJB equation. With value decomposition $V(x, q, m) = x + qm + h(q)$, the HJB reduces to a fixed-point problem in the inventory value-adjustment $h(q)$.
-
-**Fill payoff for a bid quote at rung $z$, inventory $q$:**
-
-$$
-\Pi^{\text{bid}}(z, q, \delta) = \lambda(\delta, z)\Bigl[z s(0.5 - \delta) - z\,m(z,\,t(q+z)) + h(q+z) - h(q)\Bigr]
-$$
-
-where $s$ is the spread, $\delta$ is the quoted delta, $m(z,t)\ge 0$ is the adverse markout cost, and $t(q)$ is the internalization horizon.
-
-**Ask is symmetric** (inventory decreases by $z$, markout evaluated at $t(q-z)$).
-
-**Carry cost penalty:**
-
-$$
-\Pi(q) = -\gamma\sigma^2 q^2
-$$
-
-**Flow curve:** $\lambda(\delta, z) = A(z)\cdot\sigma\!\left(\kappa\bigl(\delta - \delta_{50}(z)\bigr)\right)$, with $A(z) = A_0\,z^{-\theta - \beta z}$.
-
-**Markout model:** $m(z,t)=a z^{\beta}\left(1-e^{-t/\tau}\right)$. Larger trades have larger eventual impact $a z^{\beta}$; impact arrives quickly and then saturates with time scale $\tau$.
-
-**Internalization time:** $t(q) = \tau_0 + \tau_1|q| + \tau_2 q^2$.
-
-**Inventory ladder shape:** moving farther from zero inventory changes both ladder level and slope. On the inventory-increasing side every rung becomes less aggressive and volume-premium gaps may only widen; on the inventory-reducing side every rung becomes more aggressive and gaps may only flatten. Thus a long book shifts bids lower and steepens them, while shifting asks lower and flattening them; a short book is the mirror image.
-
-**Inventory boundary:** the GUI range is the operational pricing range. The solver automatically extends the hidden Howard grid by the largest allowed trade size, so every fill from a displayed state lands on a solved continuation state. At the hidden hard edge, further inventory-increasing fills are inadmissible rather than valued by extrapolating $h(q)$.
-                    """
-                )
-
+    tab_names = ["Internalization time"] + [f"{spec.name} [{tier_kind_label()}]" for spec in active_tier_specs]
     if solution.dark_pool is not None:
-        dark_pool_tab = tabs[-1]
-        venue = solution.dark_pool
-        with dark_pool_tab:
-            st.subheader("Dark pool venue")
+        tab_names.append("Dark Pool")
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("λ bid", f"{float(venue.lambda_bid):.4f}")
-            c2.metric("λ ask", f"{float(venue.lambda_ask):.4f}")
-            if isinstance(venue.dist_bid, lp.GeometricArrivalDist):
-                c3.metric("mean fill size bid", f"{1.0 / float(venue.p_bid):.3f}")
-            else:
-                c3.metric("dist bid", venue.dist_bid.name())
-            if isinstance(venue.dist_ask, lp.GeometricArrivalDist):
-                c4.metric("mean fill size ask", f"{1.0 / float(venue.p_ask):.3f}")
-            else:
-                c4.metric("dist ask", venue.dist_ask.name())
+    if tab_names:
+        tabs = st.tabs(tab_names)
+        available_q = [float(q) for q in solution.q_grid]
+        default_q = 0.0 if 0.0 in available_q else available_q[len(available_q) // 2]
 
-            c5, c6, c7 = st.columns(3)
-            c5.metric("fee / rebate bid", f"{float(venue.fee_per_unit_bid):.5f}")
-            c6.metric("fee / rebate ask", f"{float(venue.fee_per_unit_ask):.5f}")
-            c7.metric("both sides allowed", "yes" if bool(venue.allow_both_sides) else "no")
+        with tabs[0]:
+            internalization_time_model = lp.PolynomialInternalizationTime(
+                tau0=float(tau0), tau1=float(tau1), tau2=float(tau2)
+            )
+            st.plotly_chart(
+                make_internalization_time_figure(internalization_time_model, float(q_abs_max)),
+                use_container_width=True,
+            )
 
-            with st.expander("Dark-pool parameters", expanded=False):
-                st.dataframe(make_dark_pool_parameter_table(venue), use_container_width=True)
+        for idx, (spec, cpp_tier) in enumerate(zip(active_tier_specs, solution_tiers)):
+            with tabs[idx + 1]:
+                st.subheader(f"Tier: {spec.name}")
+                st.caption(f"Type: {tier_kind_label()}")
 
-            with st.expander("Arrival size density", expanded=False):
-                st.plotly_chart(make_dark_pool_arrival_figure(venue), use_container_width=True)
-            with st.expander("P(full fill) by posted size", expanded=False):
-                st.plotly_chart(make_dark_pool_full_fill_figure(venue), use_container_width=True)
-            with st.expander("Dark pool policy", expanded=False):
-                st.plotly_chart(make_dark_pool_size_figure(venue), use_container_width=True)
-                st.dataframe(make_dark_pool_posted_size_table(venue), use_container_width=True)
+                with st.expander("Tier parameters", expanded=False):
+                    st.dataframe(make_flow_parameter_table(spec, cpp_tier), use_container_width=True)
 
-            with st.expander("What this tab is solving"):
-                st.markdown(
-                    r"""
-**Dark-pool venue**
+                with st.expander("Flow curves", expanded=False):
+                    st.plotly_chart(make_flow_curve_figure(cpp_tier, spec), use_container_width=True)
 
-The dealer posts a fixed bid size $u^{\text{bid}}$ and/or ask size $u^{\text{ask}}$. Execution is at the current mid price — no quote-price optimisation.
+                with st.expander("Hit ratios", expanded=False):
+                    st.plotly_chart(make_hit_ratio_figure(cpp_tier, spec), use_container_width=True)
 
-**Arrival process:** Poisson with constant intensity $\lambda^{\text{bid}}$ / $\lambda^{\text{ask}}$.
+                with st.expander("Implied hit ratios vs inventory", expanded=False):
+                    st.plotly_chart(make_implied_hit_ratio_figure(cpp_tier, spec), use_container_width=True)
 
-**Order-size distribution:** Pluggable via `ArrivalDistribution`. The default is geometric with success probability $p$ (mean fill size $= 1/p$); zero-inflated Poisson is also supported.
+                with st.expander("Markouts", expanded=False):
+                    st.plotly_chart(make_markout_figure(cpp_tier, spec), use_container_width=True)
 
-**Executed size:** $\min(u, Z)$ where $Z$ is the incoming order size drawn from the distribution and $u$ is the posted size.
+                with st.expander("Quotes vs inventory", expanded=False):
+                    st.plotly_chart(
+                        make_quote_inventory_figure(cpp_tier, spec, float(config.spread), float(mid_price)),
+                        use_container_width=True,
+                    )
 
-**Fill payoff for bid, posted size $u$:**
+                with st.expander("Quote surface (3D)", expanded=False):
+                    col_bid, col_ask = st.columns(2)
+                    with col_bid:
+                        st.plotly_chart(
+                            make_quote_surface_figure(cpp_tier, spec, float(config.spread), float(mid_price), "bid"),
+                            use_container_width=True,
+                        )
+                    with col_ask:
+                        st.plotly_chart(
+                            make_quote_surface_figure(cpp_tier, spec, float(config.spread), float(mid_price), "ask"),
+                            use_container_width=True,
+                        )
+
+                with st.expander("Volume premium", expanded=False):
+                    q_for_ladder = st.select_slider(
+                        f"Inventory level for ladder — {spec.name}",
+                        options=available_q,
+                        value=default_q,
+                        key=f"qslider_{idx}",
+                    )
+                    st.plotly_chart(
+                        make_ladder_figure(cpp_tier, spec, float(q_for_ladder), float(config.spread), float(mid_price)),
+                        use_container_width=True,
+                    )
+                    q_for_table = st.selectbox(
+                        f"q for ladder table — {spec.name}",
+                        options=available_q,
+                        index=available_q.index(default_q),
+                        key=f"qtable_{idx}",
+                    )
+                    st.dataframe(
+                        make_q_ladder_table(cpp_tier, spec, float(q_for_table), float(config.spread), float(mid_price)),
+                        use_container_width=True,
+                    )
+
+                with st.expander("What this tab is solving"):
+                    st.markdown(
+                        r"""
+    **MDP tier — rung-by-rung two-sided ladder**
+
+    The dealer solves a stationary HJB equation. With value decomposition $V(x, q, m) = x + qm + h(q)$, the HJB reduces to a fixed-point problem in the inventory value-adjustment $h(q)$.
+
+    **Fill payoff for a bid quote at rung $z$, inventory $q$:**
+
+    $$
+    \Pi^{\text{bid}}(z, q, \delta) = \lambda(\delta, z)\Bigl[z s(0.5 - \delta) - z\,m(z,\,t(q+z)) + h(q+z) - h(q)\Bigr]
+    $$
+
+    where $s$ is the spread, $\delta$ is the quoted delta, $m(z,t)\ge 0$ is the adverse markout cost, and $t(q)$ is the internalization horizon.
+
+    **Ask is symmetric** (inventory decreases by $z$, markout evaluated at $t(q-z)$).
+
+    **Carry cost penalty:**
+
+    $$
+    \Pi(q) = -\gamma\sigma^2 q^2
+    $$
+
+    **Flow curve:** $\lambda(\delta, z) = A(z)\cdot\sigma\!\left(\kappa\bigl(\delta - \delta_{50}(z)\bigr)\right)$, with $A(z) = A_0\,z^{-\theta - \beta z}$.
+
+    **Markout model:** $m(z,t)=a z^{\beta}\left(1-e^{-t/\tau}\right)$. Larger trades have larger eventual impact $a z^{\beta}$; impact arrives quickly and then saturates with time scale $\tau$.
+
+    **Internalization time:** $t(q) = \tau_0 + \tau_1|q| + \tau_2 q^2$.
+
+    **Inventory ladder shape:** moving farther from zero inventory changes both ladder level and slope. On the inventory-increasing side every rung becomes less aggressive and volume-premium gaps may only widen; on the inventory-reducing side every rung becomes more aggressive and gaps may only flatten. Thus a long book shifts bids lower and steepens them, while shifting asks lower and flattening them; a short book is the mirror image.
+
+    **Inventory boundary:** the GUI range is the operational pricing range. The solver automatically extends the hidden Howard grid by the largest allowed trade size, so every fill from a displayed state lands on a solved continuation state. At the hidden hard edge, further inventory-increasing fills are inadmissible rather than valued by extrapolating $h(q)$.
+                        """
+                    )
+
+        if solution.dark_pool is not None:
+            dark_pool_tab = tabs[-1]
+            venue = solution.dark_pool
+            with dark_pool_tab:
+                st.subheader("Dark pool venue")
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("λ bid", f"{float(venue.lambda_bid):.4f}")
+                c2.metric("λ ask", f"{float(venue.lambda_ask):.4f}")
+                if isinstance(venue.dist_bid, lp.GeometricArrivalDist):
+                    c3.metric("mean fill size bid", f"{1.0 / float(venue.p_bid):.3f}")
+                else:
+                    c3.metric("dist bid", venue.dist_bid.name())
+                if isinstance(venue.dist_ask, lp.GeometricArrivalDist):
+                    c4.metric("mean fill size ask", f"{1.0 / float(venue.p_ask):.3f}")
+                else:
+                    c4.metric("dist ask", venue.dist_ask.name())
+
+                c5, c6, c7 = st.columns(3)
+                c5.metric("fee / rebate bid", f"{float(venue.fee_per_unit_bid):.5f}")
+                c6.metric("fee / rebate ask", f"{float(venue.fee_per_unit_ask):.5f}")
+                c7.metric("both sides allowed", "yes" if bool(venue.allow_both_sides) else "no")
+
+                with st.expander("Dark-pool parameters", expanded=False):
+                    st.dataframe(make_dark_pool_parameter_table(venue), use_container_width=True)
+
+                with st.expander("Arrival size density", expanded=False):
+                    st.plotly_chart(make_dark_pool_arrival_figure(venue), use_container_width=True)
+                with st.expander("P(full fill) by posted size", expanded=False):
+                    st.plotly_chart(make_dark_pool_full_fill_figure(venue), use_container_width=True)
+                with st.expander("Dark pool policy", expanded=False):
+                    st.plotly_chart(make_dark_pool_size_figure(venue), use_container_width=True)
+                    st.dataframe(make_dark_pool_posted_size_table(venue), use_container_width=True)
+
+                with st.expander("What this tab is solving"):
+                    st.markdown(
+                        r"""
+    **Dark-pool venue**
+
+    The dealer posts a fixed bid size $u^{\text{bid}}$ and/or ask size $u^{\text{ask}}$. Execution is at the current mid price — no quote-price optimisation.
+
+    **Arrival process:** Poisson with constant intensity $\lambda^{\text{bid}}$ / $\lambda^{\text{ask}}$.
+
+    **Order-size distribution:** Pluggable via `ArrivalDistribution`. The default is geometric with success probability $p$ (mean fill size $= 1/p$); zero-inflated Poisson is also supported.
+
+    **Executed size:** $\min(u, Z)$ where $Z$ is the incoming order size drawn from the distribution and $u$ is the posted size.
+
+    **Fill payoff for bid, posted size $u$:**
+
+    $$
+    \Pi^{\text{bid}}(u) = \sum_{k=1}^{u} P(\text{fill}=k)\,\bigl[h(q+k) - h(q) - \text{fee}\cdot k\bigr]
+    $$
+
+    **Optimizer chooses** $u^{\text{bid}}$, $u^{\text{ask}}$, or both, subject to the venue's allow-both-sides flag.
+
+    **Inventory grid constraints:**
+    - the operational grid is strictly increasing, symmetric around 0, odd-length, with 0 at the centre index
+    - the Howard solve adds a hidden buffer equal to the largest allowed fill size
+    - transitions beyond the hidden hard inventory bound are inadmissible; $h(q)$ is never extrapolated outside the solved domain
+                        """
+                    )
+
+
+with monte_carlo_tab:
+    st.subheader("Monte Carlo PnL")
+    st.caption(
+        "Realized PnL is execution cashflow plus mark-to-market inventory PnL. "
+        "The quadratic inventory penalty is not subtracted from realized PnL; gamma affects PnL only through the solved policy."
+    )
+
+    available_mc_q = [float(q) for q in solution.q_grid]
+    st.info(
+        f"Core trading session: **{SESSION_START_LABEL}–{SESSION_END_LABEL}** "
+        f"(**{SESSION_HORIZON_MINUTES:.0f} minutes**). All flow intensities are interpreted per minute."
+    )
+    mc_horizon = SESSION_HORIZON_MINUTES
+    mc_c1, mc_c2, mc_c3 = st.columns(3)
+    mc_paths = mc_c1.number_input(
+        "Paths", min_value=100, max_value=20_000, value=1_000, step=500, key="mc_paths"
+    )
+    mc_q0 = mc_c2.selectbox(
+        "Initial inventory", options=available_mc_q,
+        index=available_mc_q.index(0.0) if 0.0 in available_mc_q else len(available_mc_q) // 2,
+        key="mc_q0",
+    )
+    mc_seed = mc_c3.number_input(
+        "Random seed", min_value=0, value=12345, step=1, key="mc_seed"
+    )
+
+    st.markdown(r"""
+The simulated spot process is
 
 $$
-\Pi^{\text{bid}}(u) = \sum_{k=1}^{u} P(\text{fill}=k)\,\bigl[h(q+k) - h(q) - \text{fee}\cdot k\bigr]
+dS_t = \mu\,dt + \sigma\,dW_t + \sum_k b_k(t-T_k)\,dt,
 $$
 
-**Optimizer chooses** $u^{\text{bid}}$, $u^{\text{ask}}$, or both, subject to the venue's allow-both-sides flag.
+where an RFQ fill at time $T_k$ adds an adverse drift kernel
 
-**Inventory grid constraints:**
-- the operational grid is strictly increasing, symmetric around 0, odd-length, with 0 at the centre index
-- the Howard solve adds a hidden buffer equal to the largest allowed fill size
-- transitions beyond the hidden hard inventory bound are inadmissible; $h(q)$ is never extrapolated outside the solved domain
-                    """
+$$
+b_k(u)= -\operatorname{sign}(\Delta q_k)\,\frac{a z_k^\beta}{\tau}e^{-u/\tau},\qquad u\ge0.
+$$
+
+Integrating this drift gives exactly the markout curve
+$m(z,u)=a z^\beta(1-e^{-u/\tau})$. Brownian spot noise remains on top of that expected drift.
+    """)
+
+    model_signature = monte_carlo_model_signature(
+        solver,
+        horizon_minutes=float(mc_horizon),
+        n_paths=int(mc_paths),
+        initial_inventory=float(mc_q0),
+        seed=int(mc_seed),
+        sigma=float(sigma),
+    )
+
+    # Streamlit keeps session_state across code hot-reloads. Explicitly discard
+    # results produced by any older benchmark implementation or model state.
+    if st.session_state.get("mc_signature") != model_signature:
+        st.session_state.pop("mc_result", None)
+        st.session_state.pop("mc_closed_form", None)
+        st.session_state.pop("mc_signature", None)
+
+    if st.button("Run Monte Carlo", type="primary", key="run_mc"):
+        with st.spinner("Simulating spot, fills and mark-to-market PnL..."):
+            try:
+                mc_result = solver.simulate_pnl(
+                    horizon_minutes=float(mc_horizon),
+                    n_paths=int(mc_paths),
+                    sigma=float(sigma),
+                    initial_inventory=float(mc_q0),
+                    initial_spot=float(config.spot),
+                    seed=int(mc_seed),
+                    sample_paths=8,
+                    sample_points=381,
                 )
+                closed_form = solver.closed_form_pnl_statistics(
+                    horizon_minutes=float(mc_horizon),
+                    sigma=float(sigma),
+                    initial_inventory=float(mc_q0),
+                )
+            except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
+                st.error(f"Monte Carlo / closed-form benchmark failed: {exc}")
+            else:
+                st.session_state["mc_result"] = mc_result
+                st.session_state["mc_closed_form"] = closed_form
+                st.session_state["mc_signature"] = model_signature
+
+    if st.session_state.get("mc_signature") == model_signature:
+        mc_result = st.session_state.get("mc_result")
+        closed_form = st.session_state.get("mc_closed_form")
+        if mc_result is not None and closed_form is not None:
+            pnl = np.asarray(mc_result.pnl_base_ccy, dtype=float)
+            m1, m2, m3, m4, m5, m6 = st.columns(6)
+            m1.metric(f"MC mean PnL [{BASE_CCY_LABEL}]", _format_ccy(float(np.mean(pnl))))
+            m2.metric(
+                f"Closed-form mean [{BASE_CCY_LABEL}]",
+                _format_ccy(closed_form.expected_pnl_base_ccy_at_reference_spot),
+                help=(
+                    f"Impact-aware finite-horizon SEK expectation using benchmark {_PNL_BENCHMARK_VERSION}, "
+                    f"converted at reference EURSEK spot {closed_form.reference_spot:.6f}."
+                ),
+            )
+            m3.metric(f"MC stdev [{BASE_CCY_LABEL}]", _format_ccy(float(np.std(pnl, ddof=1))))
+            m4.metric(
+                f"Closed-form stdev [{BASE_CCY_LABEL}]",
+                _format_ccy(closed_form.std_pnl_base_ccy_at_reference_spot),
+                help=(
+                    "Exact terminal SEK-PnL standard deviation under the fixed-policy model, "
+                    "including fill randomness, overlapping impact and Brownian inventory risk; "
+                    f"converted to EUR at reference EURSEK spot {closed_form.reference_spot:.6f}. "
+                    "It is not the exact standard deviation of the nonlinear pathwise conversion PnL_SEK / S_T."
+                ),
+            )
+            m5.metric(f"5% PnL [{BASE_CCY_LABEL}]", _format_ccy(float(np.percentile(pnl, 5))))
+            m6.metric("P(PnL < 0)", f"{100.0 * float(np.mean(pnl < 0.0)):.1f}%")
+
+            distribution_tab, frontier_tab, path_explorer_tab = st.tabs(["Distribution", "Efficient frontier", "Path explorer"])
+
+            with distribution_tab:
+                st.plotly_chart(
+                    make_pnl_distribution_figure(mc_result, closed_form.expected_pnl_base_ccy_at_reference_spot),
+                    use_container_width=True,
+                )
+                st.plotly_chart(make_inventory_paths_distribution_figure(mc_result), use_container_width=True)
+
+                d1, d2, d3 = st.columns(3)
+                d1.metric("Mean final inventory", f"{np.mean(mc_result.final_inventory):.2f}")
+                d2.metric("RMS final inventory", f"{math.sqrt(np.mean(np.square(mc_result.final_inventory))):.2f}")
+                d3.metric("Mean fills / path", f"{np.mean(mc_result.trade_count):.1f}")
+
+                st.caption(
+                    f"Monte Carlo PnL is reported in {BASE_CCY_LABEL} path by path as quote-currency PnL divided by the final simulated spot. "
+                    f"The closed-form benchmark uses the same exponential post-fill spot-impact dynamics as the Monte Carlo and is exact for expected {QUOTE_CCY_LABEL} PnL. "
+                    f"It is then converted to {BASE_CCY_LABEL} at the reference spot; because Monte Carlo converts path by path using final spot, the displayed {BASE_CCY_LABEL} means can still differ slightly. "
+                    "The artificial inventory penalty is excluded from both."
+                )
+
+
+            with frontier_tab:
+                st.markdown(
+                    "The efficient frontier below is computed from the **closed-form benchmark only**. "
+                    "Each point resolves the full HJB for a different risk-aversion parameter γ, then plots "
+                    "closed-form terminal PnL standard deviation on the horizontal axis and expected terminal PnL on the vertical axis."
+                )
+                fc1, fc2, fc3, fc4 = st.columns(4)
+                gamma_min = fc1.number_input(
+                    "γ min",
+                    min_value=1e-6,
+                    value=max(1e-4, float(risk_aversion) / 10.0),
+                    step=0.01,
+                    format="%.4f",
+                    key="frontier_gamma_min",
+                )
+                gamma_max = fc2.number_input(
+                    "γ max",
+                    min_value=1e-6,
+                    value=max(float(risk_aversion) * 5.0, float(risk_aversion) + 0.01),
+                    step=0.05,
+                    format="%.4f",
+                    key="frontier_gamma_max",
+                )
+                frontier_points = int(fc3.number_input(
+                    "Frontier points",
+                    min_value=3,
+                    max_value=25,
+                    value=9,
+                    step=1,
+                    key="frontier_points",
+                ))
+                log_gamma_grid = fc4.checkbox("Log-spaced γ grid", value=True, key="frontier_log_grid")
+
+                if gamma_max <= gamma_min:
+                    st.error("γ max must be larger than γ min.")
+                else:
+                    if log_gamma_grid:
+                        gamma_grid = np.geomspace(float(gamma_min), float(gamma_max), num=int(frontier_points))
+                    else:
+                        gamma_grid = np.linspace(float(gamma_min), float(gamma_max), num=int(frontier_points))
+                    gamma_grid = np.unique(np.round(np.append(gamma_grid, float(risk_aversion)), 12))
+
+                    frontier_signature = efficient_frontier_signature(
+                        q_grid=q_grid,
+                        spot=float(spot),
+                        spot_drift=float(spot_drift),
+                        spread=float(spread),
+                        sigma=float(sigma),
+                        horizon_minutes=float(mc_horizon),
+                        initial_inventory=float(mc_q0),
+                        tier_specs=active_tier_specs,
+                        dark_pool_spec=dark_pool_spec,
+                        tau0=float(tau0),
+                        tau1=float(tau1),
+                        tau2=float(tau2),
+                        gammas=gamma_grid,
+                    )
+
+                    if st.session_state.get("frontier_signature") != frontier_signature:
+                        st.session_state.pop("frontier_result", None)
+                        st.session_state.pop("frontier_signature", None)
+
+                    if st.button("Compute frontier", key="run_frontier"):
+                        with st.spinner("Solving closed-form frontier across γ..."):
+                            try:
+                                frontier_df = compute_efficient_frontier(
+                                    q_grid=q_grid,
+                                    spot=float(spot),
+                                    spot_drift=float(spot_drift),
+                                    spread=float(spread),
+                                    sigma=float(sigma),
+                                    horizon_minutes=float(mc_horizon),
+                                    initial_inventory=float(mc_q0),
+                                    tier_specs=active_tier_specs,
+                                    dark_pool_spec=dark_pool_spec,
+                                    tau0=float(tau0),
+                                    tau1=float(tau1),
+                                    tau2=float(tau2),
+                                    gammas=gamma_grid,
+                                )
+                            except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
+                                st.error(f"Efficient frontier failed: {exc}")
+                            else:
+                                st.session_state["frontier_result"] = frontier_df
+                                st.session_state["frontier_signature"] = frontier_signature
+
+                    if st.session_state.get("frontier_signature") == frontier_signature and st.session_state.get("frontier_result") is not None:
+                        frontier_df = st.session_state["frontier_result"].copy()
+                        st.plotly_chart(make_efficient_frontier_figure(frontier_df, float(risk_aversion)), use_container_width=True)
+                        st.plotly_chart(make_phi_risk_adjusted_figure(frontier_df, float(risk_aversion)), use_container_width=True)
+                        display_df = frontier_df.rename(columns={
+                            'gamma': 'γ',
+                            'expected_pnl_base_ccy': f'Expected PnL [{BASE_CCY_LABEL}]',
+                            'std_pnl_base_ccy': f'Stdev [{BASE_CCY_LABEL}]',
+                            'average_reward': 'Average reward',
+                        })[[
+                            'γ',
+                            f'Expected PnL [{BASE_CCY_LABEL}]',
+                            f'Stdev [{BASE_CCY_LABEL}]',
+                            'Average reward',
+                        ]]
+                        st.dataframe(display_df, use_container_width=True, hide_index=True)
+                        st.caption(
+                            f"All frontier points use the same session horizon ({SESSION_HORIZON_MINUTES:.0f} min), "
+                            f"initial inventory {float(mc_q0):.2f}M, and the current tier / dark-pool configuration. "
+                            f"Expected PnL and stdev are closed-form {BASE_CCY_LABEL} figures converted at the reference spot. "
+                            "In the second chart, φ is the same risk-aversion parameter currently named γ in the solver."
+                        )
+                    else:
+                        st.info("Choose a γ range and click **Compute frontier**.")
+
+            with path_explorer_tab:
+                if not mc_result.sample_paths:
+                    st.info("No detailed sample paths were retained for this run.")
+                else:
+                    pc1, pc2 = st.columns(2)
+                    selected_path_idx = pc1.selectbox(
+                        "Path",
+                        options=list(range(len(mc_result.sample_paths))),
+                        format_func=lambda i: f"Path {i + 1}",
+                        key="mc_selected_path",
+                    )
+                    selected_path = mc_result.sample_paths[int(selected_path_idx)]
+                    quote_sizes = sorted({series.size for series in selected_path.quote_series})
+                    quote_size = pc2.selectbox(
+                        "Quote size to display",
+                        options=quote_sizes,
+                        index=0,
+                        format_func=lambda z: f"{z:g}M",
+                        key="mc_quote_size",
+                    )
+
+                    pm1, pm2, pm3, pm4 = st.columns(4)
+                    pm1.metric(
+                        f"Path PnL [{BASE_CCY_LABEL}]",
+                        _format_ccy(float(mc_result.pnl_base_ccy[int(selected_path_idx)])),
+                    )
+                    pm2.metric("Final inventory", f"{mc_result.final_inventory[int(selected_path_idx)]:.2f}M")
+                    pm3.metric("Fills", f"{mc_result.trade_count[int(selected_path_idx)]}")
+                    pm4.metric("Final spot", f"{mc_result.final_spot[int(selected_path_idx)]:.6f}")
+
+                    st.plotly_chart(make_inventory_path_figure(selected_path), use_container_width=True)
+                    st.plotly_chart(
+                        make_spot_quote_path_figure(selected_path, float(quote_size)),
+                        use_container_width=True,
+                    )
+
+                    fc1, fc2 = st.columns([1, 2])
+                    with fc1:
+                        st.plotly_chart(make_fill_counts_figure(selected_path), use_container_width=True)
+                    with fc2:
+                        st.markdown("**Fill tape**")
+                        tape = fill_tape_frame(selected_path)
+                        if tape.empty:
+                            st.info("No fills on this path.")
+                        else:
+                            st.dataframe(tape, use_container_width=True, hide_index=True, height=350)
+
+                    st.caption(
+                        "Inventory is event-level and steps exactly at fills. Spot and quote lines are regular display snapshots; "
+                        "the underlying fill simulation remains continuous-time/event-driven. Fill markers show the actual execution price and size."
+                    )
+    else:
+        st.info("Choose the Monte Carlo settings and click **Run Monte Carlo**.")
 
 st.caption("Pure Python + NumPy implementation. Restart Streamlit after editing the model code.")

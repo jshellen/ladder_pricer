@@ -514,3 +514,213 @@ class TestInventoryBoundaryPadding(unittest.TestCase):
         # Generator rows sum to zero because every allowed transition is
         # represented inside the solved domain.
         self.assertTrue(np.allclose(L.sum(axis=1), 0.0, atol=1e-12))
+
+class TestMonteCarloPnL(unittest.TestCase):
+
+    def _build_small_solver(self):
+        config = lp.SolverConfig(
+            q_grid=[-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0],
+            spot=1.1,
+            spot_drift=0.0,
+            spread=10.0 / 10_000.0,
+        )
+        tier = lp.MDPTier(
+            name="mc",
+            sizes=[1.0, 2.0],
+            flow_curve=lp.LogisticFlowCurve(
+                A0=0.15, theta=0.0, beta=0.0, shift=0.2,
+                steepness=8.0, volume_shift=0.01,
+            ),
+            markout_model=lp.SaturatingMarkoutModel(
+                impact_scale=0.5 / 10_000.0, size_exponent=0.5, tau=0.5,
+            ),
+            delta_min=-5.0,
+            delta_max=5.0,
+        )
+        solver = lp.HJBLadderSolver(
+            config=config,
+            penalty=lp.QuadraticInventoryPenalty(
+                lp.CarryCost(risk_aversion=0.1, sigma=10.0 / 10_000.0)
+            ),
+            internalization_time=lp.PolynomialInternalizationTime(4.0, 0.07, 0.0084),
+            mdp_tiers=[tier],
+        )
+        solver.solve()
+        return solver
+
+    def _build_tier3_regression_solver(self):
+        config = lp.SolverConfig(
+            q_grid=PIECEWISE_GRID, spot=11.5, spot_drift=0.0, spread=20.0 / 10_000.0
+        )
+
+        def tier(name, sizes, A0, theta, beta, steepness, shift, volume_shift, impact_pips, tau):
+            return lp.MDPTier(
+                name=name, sizes=sizes,
+                flow_curve=lp.LogisticFlowCurve(
+                    A0=A0, theta=theta, beta=beta, shift=shift,
+                    steepness=steepness, volume_shift=volume_shift,
+                ),
+                markout_model=lp.SaturatingMarkoutModel(
+                    impact_scale=impact_pips / 10_000.0, size_exponent=0.5, tau=tau,
+                ),
+                delta_min=-10.0, delta_max=100.0, use_markout=True,
+            )
+
+        tiers = [
+            tier("Tier 1", [1, 2, 3, 5, 10, 20], 0.0155, 0.144, 0.0857, 8.42, 0.52, 0.026, 1.0, 0.5),
+            tier("Tier 2", [1, 2, 3, 5, 10, 20], 0.0232, 0.303, 0.122, 2.86, 0.48, 0.020, 1.0, 0.5),
+            tier("Tier 3", [1], 1.0, 0.144, 0.0857, 20.0, 0.52, 0.026, 4.0, 0.10),
+        ]
+        solver = lp.HJBLadderSolver(
+            config=config,
+            penalty=lp.QuadraticInventoryPenalty(
+                lp.CarryCost(risk_aversion=0.1, sigma=20.0 / 10_000.0)
+            ),
+            internalization_time=lp.PolynomialInternalizationTime(4.0, 0.070, 0.0084),
+            mdp_tiers=tiers,
+        )
+        solver.solve()
+        return solver
+
+    def test_closed_form_is_finite(self):
+        solver = self._build_small_solver()
+        benchmark = solver.closed_form_expected_pnl(10.0, 0.0)
+        self.assertTrue(np.isfinite(benchmark.expected_pnl_quote_ccy))
+
+    def test_full_session_closed_form_is_real_and_finite(self):
+        solver = self._build_small_solver()
+        benchmark = solver.closed_form_expected_pnl(570.0, 0.0)
+        self.assertTrue(np.isfinite(benchmark.expected_pnl_quote_ccy))
+        self.assertTrue(np.isfinite(benchmark.expected_pnl_rate_quote_ccy_per_min))
+
+    def test_tier3_full_session_uses_impact_aware_closed_form(self):
+        solver = self._build_tier3_regression_solver()
+        benchmark = solver.closed_form_expected_pnl(570.0, 0.0)
+        # Regression for the exact EURSEK settings that previously displayed
+        # ~EUR 2.68k from the obsolete per-fill markout approximation. The
+        # impact-aware first moment is ~EUR 4.60k.
+        self.assertAlmostEqual(
+            benchmark.expected_pnl_base_ccy_at_reference_spot, 4603.94, delta=5.0
+        )
+
+    def test_tier3_closed_form_terminal_pnl_standard_deviation(self):
+        solver = self._build_tier3_regression_solver()
+        stats = solver.closed_form_pnl_statistics(570.0, sigma=20.0 / 10_000.0, initial_inventory=0.0)
+        # Exact second-moment regression for the EURSEK/Tier-3 setup.
+        self.assertAlmostEqual(
+            stats.expected_pnl_base_ccy_at_reference_spot, 4603.94, delta=5.0
+        )
+        self.assertAlmostEqual(
+            stats.std_pnl_base_ccy_at_reference_spot, 12451.39, delta=10.0
+        )
+        self.assertGreater(stats.variance_pnl_quote_ccy, 0.0)
+
+    def test_closed_form_second_moment_matches_monte_carlo_standard_deviation(self):
+        solver = self._build_small_solver()
+        horizon = 30.0
+        sigma = 10.0 / 10_000.0
+        stats = solver.closed_form_pnl_statistics(horizon, sigma=sigma, initial_inventory=0.0)
+        mean_only = solver.closed_form_expected_pnl(horizon, 0.0)
+        self.assertAlmostEqual(
+            stats.expected_pnl_quote_ccy, mean_only.expected_pnl_quote_ccy, delta=1e-3
+        )
+        mc = solver.simulate_pnl(
+            horizon, 2000, sigma=sigma, initial_inventory=0.0,
+            initial_spot=solver.config.spot, seed=77, sample_paths=0, sample_points=3,
+        )
+        mc_std = float(np.std(np.asarray(mc.pnl_quote_ccy, dtype=float), ddof=1))
+        self.assertLess(
+            abs(mc_std - stats.std_pnl_quote_ccy),
+            0.08 * stats.std_pnl_quote_ccy,
+        )
+
+    def test_closed_form_mean_matches_zero_brownian_monte_carlo_with_markout(self):
+        solver = self._build_small_solver()
+        horizon = 60.0
+        benchmark = solver.closed_form_expected_pnl(horizon, 0.0)
+        mc = solver.simulate_pnl(
+            horizon, 4000, sigma=0.0, initial_inventory=0.0,
+            initial_spot=solver.config.spot, seed=314159, sample_paths=0, sample_points=3,
+        )
+        pnl = np.asarray(mc.pnl_quote_ccy, dtype=float)
+        se = float(np.std(pnl, ddof=1) / np.sqrt(len(pnl)))
+        # Closed form is the exact first moment of the MC dynamics. Allow a
+        # few Monte Carlo standard errors for sampling noise.
+        self.assertLess(abs(float(np.mean(pnl)) - benchmark.expected_pnl_quote_ccy), 5.0 * se + 1e-6)
+
+    def test_monte_carlo_is_seed_reproducible(self):
+        solver = self._build_small_solver()
+        a = solver.simulate_pnl(5.0, 25, sigma=10.0 / 10_000.0, seed=99, sample_paths=2, sample_points=10)
+        b = solver.simulate_pnl(5.0, 25, sigma=10.0 / 10_000.0, seed=99, sample_paths=2, sample_points=10)
+        self.assertEqual(a.pnl_quote_ccy, b.pnl_quote_ccy)
+        self.assertEqual(a.pnl_base_ccy, b.pnl_base_ccy)
+        self.assertEqual(a.final_inventory, b.final_inventory)
+        self.assertEqual(len(a.sample_times), 2)
+        self.assertEqual(len(a.sample_times[0]), 10)
+
+
+    def test_monte_carlo_base_currency_pnl_uses_final_spot(self):
+        solver = self._build_small_solver()
+        result = solver.simulate_pnl(8.0, 20, sigma=10.0 / 10_000.0, seed=123, sample_paths=1, sample_points=9)
+        self.assertEqual(len(result.pnl_base_ccy), len(result.pnl_quote_ccy))
+        for pnl_quote, pnl_base, final_spot in zip(result.pnl_quote_ccy, result.pnl_base_ccy, result.final_spot):
+            self.assertGreater(final_spot, 0.0)
+            self.assertAlmostEqual(pnl_base, pnl_quote / final_spot, delta=1e-9)
+
+    def test_closed_form_base_currency_benchmark_uses_reference_spot(self):
+        solver = self._build_small_solver()
+        benchmark = solver.closed_form_expected_pnl(30.0, 0.0)
+        self.assertGreater(benchmark.reference_spot, 0.0)
+        self.assertAlmostEqual(
+            benchmark.expected_pnl_base_ccy_at_reference_spot,
+            benchmark.expected_pnl_quote_ccy / benchmark.reference_spot,
+            delta=1e-9,
+        )
+
+    def test_inventory_confidence_band_uses_all_paths(self):
+        solver = self._build_small_solver()
+        result = solver.simulate_pnl(8.0, 100, sigma=10.0 / 10_000.0, seed=17, sample_paths=2, sample_points=17)
+        self.assertEqual(len(result.inventory_sample_times), 17)
+        self.assertEqual(len(result.inventory_ci_lower), 17)
+        self.assertEqual(len(result.inventory_median), 17)
+        self.assertEqual(len(result.inventory_ci_upper), 17)
+        lower = np.asarray(result.inventory_ci_lower)
+        median = np.asarray(result.inventory_median)
+        upper = np.asarray(result.inventory_ci_upper)
+        self.assertTrue(np.all(lower <= median + 1e-12))
+        self.assertTrue(np.all(median <= upper + 1e-12))
+        self.assertAlmostEqual(lower[0], 0.0, delta=1e-12)
+        self.assertAlmostEqual(median[0], 0.0, delta=1e-12)
+        self.assertAlmostEqual(upper[0], 0.0, delta=1e-12)
+        # Only two detailed paths are retained, so the percentile arrays cannot
+        # simply be an envelope over the path-explorer subset.
+        self.assertEqual(len(result.sample_paths), 2)
+
+    def test_detailed_sample_path_records_inventory_quotes_and_fill_tape(self):
+        solver = self._build_small_solver()
+        result = solver.simulate_pnl(8.0, 10, sigma=10.0 / 10_000.0, seed=7, sample_paths=1, sample_points=17)
+        self.assertEqual(len(result.sample_paths), 1)
+        path = result.sample_paths[0]
+        self.assertEqual(len(path.times), 17)
+        self.assertEqual(len(path.spots), 17)
+        self.assertEqual(len(path.inventories), 17)
+        self.assertEqual(len(path.quote_series), 4)  # 1 tier x 2 sides x 2 sizes
+        self.assertTrue(all(len(series.prices) == 17 for series in path.quote_series))
+        self.assertEqual(path.inventory_event_times[0], 0.0)
+        self.assertEqual(path.inventory_event_values[0], 0.0)
+        self.assertEqual(len(path.inventory_event_times), len(path.fills) + 1)
+        self.assertEqual(len(path.inventory_event_values), len(path.fills) + 1)
+        for fill in path.fills:
+            self.assertTrue(0.0 <= fill.time_minutes <= 8.0)
+            self.assertIn(fill.side, {"bid", "ask"})
+            self.assertTrue(np.isfinite(fill.execution_price))
+            self.assertAlmostEqual(
+                fill.inventory_after - fill.inventory_before,
+                fill.size if fill.side == "bid" else -fill.size,
+                delta=1e-12,
+            )
+
+
+def test_pnl_benchmark_version_is_exported():
+    assert hasattr(lp, "PNL_BENCHMARK_VERSION")
+    assert lp.PNL_BENCHMARK_VERSION == "impact-aware-v3-second-moment"

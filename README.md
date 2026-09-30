@@ -70,11 +70,13 @@ The polynomial internalization-time model is separate from the inventory penalty
 
 ## RFQ flow and analytical quote
 
-For size $z$,
+For size $z$, all RFQ intensities are expressed **per minute**. In particular, $A_0$ is the per-minute intensity scale and
 
 $$
-\lambda(\delta,z)=A(z)L(\delta,z),
+\lambda(\delta,z)=A(z)L(\delta,z)
 $$
+
+is the resulting fill intensity in fills per minute.
 
 with
 
@@ -173,7 +175,7 @@ policy, not from rows updated earlier in the same Howard pass.
 From the repository root:
 
 ```bash
-python -m pip install -e .
+python -m pip install -e ".[app]"
 ```
 
 The only package dependency of `ladder_pricer` itself is NumPy. The Streamlit app additionally requires its normal UI/plotting dependencies (`streamlit`, `pandas`, `plotly`).
@@ -181,7 +183,7 @@ The only package dependency of `ladder_pricer` itself is NumPy. The Streamlit ap
 Run the app with:
 
 ```bash
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
 ## Minimal example
@@ -242,3 +244,43 @@ print(solution.diagnostics.iterations_used)
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+
+## Policy and Monte Carlo tabs
+
+The Streamlit center panel is split into two top-level tabs:
+
+- **Policy** keeps the existing HJB diagnostics, tier views, quote surfaces, markout curves, volume-premium ladders and dark-pool policy.
+- **Monte Carlo** simulates fills, inventory, spot and realized mark-to-market PnL under the solved policy.
+
+The Streamlit Monte Carlo represents one core trading session from **07:45 to 17:15**, i.e. **570 minutes**. The simulation clock therefore uses the same minute unit as RFQ intensities, dark-pool intensities, internalization time, markout decay and spot drift. Volatility is expressed per square-root minute.
+
+The Monte Carlo spot process uses the same volatility and base drift as the pricing model. Each MDP fill creates an adverse expected-drift impulse
+
+$$
+b(u)=-\operatorname{sign}(\Delta q)\frac{a z^\beta}{\tau}e^{-u/\tau},
+$$
+
+so integrating the drift after a fill reproduces exactly the saturating markout curve
+
+$$
+m(z,u)=a z^\beta(1-e^{-u/\tau}).
+$$
+
+Brownian noise is added independently. Realized PnL is execution cashflow plus final inventory marked to the simulated spot; the artificial quadratic inventory penalty is **not** subtracted from PnL.
+
+The Monte Carlo tab also reports deterministic finite-horizon **closed-form PnL moments**. The mean uses the same post-fill exponential spot-impact dynamics as the Monte Carlo: for each distinct impact timescale, the benchmark augments the inventory Markov chain with the expected remaining impact conditional on inventory state. The standard deviation extends this to all degree-two moments, including impact-impact and PnL-impact cross moments, jump-reward variance, and the Brownian inventory-risk term $\sigma^2 q^2$. This captures the fact that post-trade impact marks the desk's entire current inventory, including cross-effects with subsequent fills. The resulting SEK mean and variance are exact for the fixed-policy Monte Carlo dynamics. The artificial inventory penalty is excluded from realized PnL.
+
+The obsolete approximation that charged each fill an independent `size × markout` cost has been removed. Streamlit's Monte Carlo cache includes `PNL_BENCHMARK_VERSION` plus the solved policy/model state, so results from an older PnL implementation are automatically invalidated after a code hot-reload or model change.
+
+Inside Monte Carlo, **Distribution** shows the aggregate PnL distribution plus inventory paths with the median and an empirical 95% simulation interval (2.5th–97.5th percentiles) computed from all simulated paths. **Path explorer** lets the user inspect an individual retained path. It shows the exact event-level inventory path, simulated spot, bid/ask quote prices by MDP tier for a selected ticket size, execution markers, fill counts by tier and side, and a full fill tape with time, tier, side, size, execution price, spot and before/after inventory. RFQ fills remain continuous-time/event-driven; regular spot/quote snapshots are only for display.
+
+## Monte Carlo PnL currency
+
+The solver keeps its natural internal units: inventory and RFQ sizes are in millions of base currency (EUR for EURSEK), while cash and mark-to-market PnL are in millions of quote currency (SEK for EURSEK). The Monte Carlo reporting layer converts each simulated path to base-currency PnL using the path's final spot:
+
+```text
+PnL_EUR = PnL_SEK / EURSEK_T
+```
+
+Thus the Streamlit Monte Carlo histogram and risk statistics are reported in EUR. The closed-form mean and standard deviation are first computed exactly in quote currency and then converted at the reference spot. They are comparable EUR benchmarks, but they are not the exact moments of the nonlinear random pathwise conversion $\Pi_T^{SEK}/S_T$.
