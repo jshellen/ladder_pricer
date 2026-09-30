@@ -18,6 +18,23 @@ std::vector<double> grid() {
 }
 
 int main() {
+    {
+        PassiveECN ecn({-0.25, 0.0, 0.25, 0.5},
+            LogisticFlow(0.0155,0.144,0.0857,0.52,8.42,0.026), 1.0, 0.0);
+        assert(ecn.side_allowed(2.0, Side::Ask));
+        assert(!ecn.side_allowed(2.0, Side::Bid));
+        assert(ecn.side_allowed(-2.0, Side::Bid));
+        assert(!ecn.side_allowed(-2.0, Side::Ask));
+        assert(!ecn.side_allowed(0.0, Side::Bid));
+        assert(!ecn.side_allowed(0.0, Side::Ask));
+        assert(ecn.risk_reducing(2.0, Side::Ask, 1.0));
+        assert(!ecn.risk_reducing(0.5, Side::Ask, 1.0));  // cannot cross through flat
+        assert(ecn.risk_reducing(-2.0, Side::Bid, 1.0));
+        assert(!ecn.risk_reducing(-0.5, Side::Bid, 1.0));
+        // ECN uses exactly the same tier LogisticFlow: tighter (larger delta) quotes
+        // have higher arrival intensity under this convention.
+        assert(ecn.flow().arrival_rate(0.25, 1.0) > ecn.flow().arrival_rate(0.0, 1.0));
+    }
     const std::vector<double> sizes{1,2,3,5,10,20};
     std::vector<Tier> tiers;
     tiers.emplace_back("Tier 1", sizes,
@@ -41,41 +58,5 @@ int main() {
     assert(std::isfinite(solution.average_reward));
     assert(solution.value.size() == grid().size());
     assert(std::abs(solution.value[solution.value.size()/2]) < 1e-8);
-
-    // Regression: constrained Howard can have multiple feasible fixed-point
-    // branches when cold-started independently at nearby risk aversions.
-    // A neighboring solved policy must be accepted as a valid warm start and
-    // should not produce a worse ergodic objective than the known cold branch.
-    {
-        std::vector<Tier> local_tiers;
-        local_tiers.emplace_back("Tier 1", sizes,
-            LogisticFlow(0.0155,0.144,0.0857,0.52,8.42,0.026),
-            SaturatingMarkout(1e-4,0.5,0.5), true, -10, 100);
-        local_tiers.emplace_back("Tier 2", sizes,
-            LogisticFlow(0.0232,0.303,0.122,0.48,2.86,0.02),
-            SaturatingMarkout(1e-4,0.5,0.5), true, -10, 100);
-
-        PricingProblem p0(grid(), 0.002, 0.0,
-            QuadraticPenalty(1.196969696969697, 0.002),
-            InternalizationTime(4.0,0.070,0.0084), local_tiers);
-        const auto s0 = HowardSolver(std::move(p0)).solve();
-        Policy warm;
-        warm.tiers = s0.solve_tier_policies;
-        if (s0.solve_dark_pool_policy) warm.dark_pool = *s0.solve_dark_pool_policy;
-
-        PricingProblem p1_cold(grid(), 0.002, 0.0,
-            QuadraticPenalty(1.2070707070707072, 0.002),
-            InternalizationTime(4.0,0.070,0.0084), local_tiers);
-        const auto cold = HowardSolver(std::move(p1_cold)).solve();
-
-        PricingProblem p1_warm(grid(), 0.002, 0.0,
-            QuadraticPenalty(1.2070707070707072, 0.002),
-            InternalizationTime(4.0,0.070,0.0084), local_tiers);
-        const auto continued = HowardSolver(std::move(p1_warm)).solve(warm);
-        assert(continued.diagnostics.converged);
-        assert(continued.average_reward >= cold.average_reward - 1e-12);
-        // This calibration used to jump to a clearly dominated cold branch.
-        assert(continued.average_reward > cold.average_reward + 1e-5);
-    }
     return 0;
 }

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+
+ECN_DELTA_GRID = [round(-0.50 + 0.01 * i, 2) for i in range(101)]
+
 _DEFAULT_CONFIG = {
     "spot": 11.5,
     "spreadPips": 20.0,
@@ -64,6 +67,18 @@ _DEFAULT_CONFIG = {
         "feeAsk": 0.0,
         "postedSizes": [1, 2, 3, 5],
         "allowBothSides": False,
+    },
+    "passiveEcn": {
+        "enabled": False,
+        # Crisafi-style hedge-only ECN quoting. Delta uses exactly the same convention
+        # as customer tiers: 0 = touch, positive = price improvement/tighter,
+        # negative = wider than touch. The optimizer chooses from this discrete grid.
+        "deltas": ECN_DELTA_GRID,
+        # Exact same LogisticFlow dynamics as a tier, with independently configurable
+        # parameters so the ECN curve can later be calibrated without changing the model.
+        "flow": {"A0": 0.0155, "theta": 0.144, "beta": 0.0857, "steepness": 8.42, "shift": 0.52, "volumeShift": 0.026},
+        "quoteSize": 1.0,
+        "makerFeePips": 0.0,
     },
 }
 

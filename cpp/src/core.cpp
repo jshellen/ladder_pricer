@@ -347,12 +347,41 @@ bool DarkPool::side_allowed(double inventory, Side side) const noexcept {
            (inventory < -kTolerance && side == Side::Bid);
 }
 
+PassiveECN::PassiveECN(std::vector<double> deltas, LogisticFlow flow,
+                       double quote_size, double maker_fee)
+    : deltas_(std::move(deltas)), flow_(std::move(flow)),
+      quote_size_(quote_size), maker_fee_(maker_fee) {
+    require(!deltas_.empty(), "passive ECN deltas must not be empty");
+    require(quote_size_ > 0.0, "passive ECN quote size must be positive");
+    require(maker_fee_ >= 0.0, "passive ECN maker fee must be nonnegative");
+    for (std::size_t i = 1; i < deltas_.size(); ++i) {
+        require(deltas_[i] > deltas_[i - 1] + kTolerance,
+                "passive ECN deltas must be strictly increasing");
+    }
+}
+
+bool PassiveECN::side_allowed(double inventory, Side side) const noexcept {
+    return (inventory > kTolerance && side == Side::Ask) ||
+           (inventory < -kTolerance && side == Side::Bid);
+}
+
+bool PassiveECN::risk_reducing(double inventory, Side side, double size) const noexcept {
+    if (size <= 0.0 || !side_allowed(inventory, side)) return false;
+    const double change = direction(side) * size;
+    const double after = inventory + change;
+    // Crisafi-style ECN controls are hedges only: an ECN fill may not cross through
+    // zero and create a position on the other side.
+    return std::abs(after) <= std::abs(inventory) + kTolerance &&
+           inventory * after >= -kTolerance;
+}
+
 // ---------------------------------------------------------------------------
 // Problem
 // ---------------------------------------------------------------------------
 
 double PricingProblem::max_inventory_jump(const std::vector<Tier>& tiers,
-                                          const std::optional<DarkPool>& dark_pool) {
+                                          const std::optional<DarkPool>& dark_pool,
+                                          const std::optional<PassiveECN>& passive_ecn) {
     double out = 0.0;
     for (const auto& tier : tiers) {
         out = std::max(out, tier.sizes().back());
@@ -360,6 +389,7 @@ double PricingProblem::max_inventory_jump(const std::vector<Tier>& tiers,
     if (dark_pool && !dark_pool->posted_sizes().empty()) {
         out = std::max(out, dark_pool->posted_sizes().back());
     }
+    if (passive_ecn) out = std::max(out, passive_ecn->quote_size());
     return out;
 }
 
@@ -369,13 +399,15 @@ PricingProblem::PricingProblem(std::vector<double> operational_inventory_grid,
                                QuadraticPenalty penalty,
                                InternalizationTime internalization_time,
                                std::vector<Tier> tiers,
-                               std::optional<DarkPool> dark_pool)
-    : grid_(std::move(operational_inventory_grid), max_inventory_jump(tiers, dark_pool)),
+                               std::optional<DarkPool> dark_pool,
+                               std::optional<PassiveECN> passive_ecn)
+    : grid_(std::move(operational_inventory_grid), max_inventory_jump(tiers, dark_pool, passive_ecn)),
       spread_(spread), spot_drift_(spot_drift), penalty_(std::move(penalty)),
       internalization_time_(std::move(internalization_time)), tiers_(std::move(tiers)),
-      dark_pool_(std::move(dark_pool)) {
+      dark_pool_(std::move(dark_pool)), passive_ecn_(std::move(passive_ecn)) {
     require(spread_ > 0.0, "spread must be positive");
-    require(!tiers_.empty() || dark_pool_.has_value(), "problem must contain at least one venue");
+    require(!tiers_.empty() || dark_pool_.has_value() || passive_ecn_.has_value(),
+            "problem must contain at least one venue");
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +623,15 @@ Policy PolicyBuilder::initial_policy() const {
         }
         policy.dark_pool = std::move(p);
     }
+    if (problem_.passive_ecn()) {
+        PassiveECNPolicy p;
+        p.q_grid = q_grid;
+        p.bid_depth.assign(q_grid.size(), 0.0);
+        p.ask_depth.assign(q_grid.size(), 0.0);
+        p.bid_active.assign(q_grid.size(), false);
+        p.ask_active.assign(q_grid.size(), false);
+        policy.passive_ecn = std::move(p);
+    }
     return policy;
 }
 
@@ -638,6 +679,43 @@ DarkPoolPolicy PolicyBuilder::improve_dark_pool(const std::vector<double>& value
                 policy.ask_size[i] = active ? best_size : 0.0;
                 policy.ask_active[i] = active;
             }
+        }
+    }
+    return policy;
+}
+
+PassiveECNPolicy PolicyBuilder::improve_passive_ecn(const std::vector<double>& value) const {
+    const auto& venue = *problem_.passive_ecn();
+    const auto& q_grid = problem_.grid().states();
+    PassiveECNPolicy policy;
+    policy.q_grid = q_grid;
+    policy.bid_depth.assign(q_grid.size(), 0.0);
+    policy.ask_depth.assign(q_grid.size(), 0.0);
+    policy.bid_active.assign(q_grid.size(), false);
+    policy.ask_active.assign(q_grid.size(), false);
+    const double z = venue.quote_size();
+    for (Side side : {Side::Bid, Side::Ask}) {
+        const double dir = direction(side);
+        for (std::size_t i = 0; i < q_grid.size(); ++i) {
+            const double q = q_grid[i];
+            if (!venue.risk_reducing(q, side, z) || !problem_.grid().admissible(q, dir * z)) continue;
+            const double hq = problem_.grid().interpolate(value, q);
+            double best_value = 0.0;  // OFF is always available.
+            double best_depth = 0.0;
+            bool active = false;
+            for (std::size_t j = 0; j < venue.deltas().size(); ++j) {
+                const double delta = venue.deltas()[j];
+                const double rate = venue.flow().arrival_rate(delta, z);
+                const double edge = z * (problem_.spread() * (0.5 - delta) - venue.maker_fee());
+                const double candidate = rate * (edge + problem_.grid().interpolate(value, q + dir * z) - hq);
+                if (candidate > best_value + kTolerance) {
+                    best_value = candidate;
+                    best_depth = delta;
+                    active = true;
+                }
+            }
+            if (side == Side::Bid) { policy.bid_active[i] = active; policy.bid_depth[i] = best_depth; }
+            else { policy.ask_active[i] = active; policy.ask_depth[i] = best_depth; }
         }
     }
     return policy;
@@ -713,6 +791,9 @@ Policy PolicyBuilder::improve(const std::vector<double>& value, const Policy& pr
 
     if (problem_.dark_pool()) {
         improved.dark_pool = improve_dark_pool(value);
+    }
+    if (problem_.passive_ecn()) {
+        improved.passive_ecn = improve_passive_ecn(value);
     }
     return improved;
 }
@@ -812,6 +893,20 @@ std::vector<double> BellmanModel::rhs(const std::vector<double>& value, const Po
                 for (const auto& [fill, rate] : venue.arrivals(side).fill_rates(u)) {
                     total += rate * (grid.interpolate(value, q + dir * fill) - hq - venue.fee(side) * fill);
                 }
+            }
+        }
+        if (problem_.passive_ecn() && policy.passive_ecn) {
+            const auto& venue = *problem_.passive_ecn();
+            const auto& p = *policy.passive_ecn;
+            const double z = venue.quote_size();
+            for (Side side : {Side::Bid, Side::Ask}) {
+                const bool active = side == Side::Bid ? p.bid_active[i] : p.ask_active[i];
+                const double depth = side == Side::Bid ? p.bid_depth[i] : p.ask_depth[i];
+                if (!active) continue;
+                const double rate = venue.flow().arrival_rate(depth, z);
+                const double dir = direction(side);
+                const double edge = z * (problem_.spread() * (0.5 - depth) - venue.maker_fee());
+                total += rate * (edge + grid.interpolate(value, q + dir * z) - hq);
             }
         }
         out[i] = total;

@@ -97,4 +97,19 @@ def build_config(values: Mapping[str, Any]) -> dict[str, Any]:
         "postedSizes": parse_numbers(values.get("dp-sizes", "")),
         "allowBothSides": checked(values.get("dp-both")),
     }
+    ecn_default = cfg["passiveEcn"]
+    cfg["passiveEcn"] = {
+        "enabled": checked(values.get("ecn-enabled")),
+        "deltas": list(ecn_default["deltas"]),
+        "flow": {
+            "A0": _number(values, "ecn-A0") if values.get("ecn-A0") is not None else ecn_default["flow"]["A0"],
+            "theta": _number(values, "ecn-theta") if values.get("ecn-theta") is not None else ecn_default["flow"]["theta"],
+            "beta": _number(values, "ecn-beta") if values.get("ecn-beta") is not None else ecn_default["flow"]["beta"],
+            "steepness": _number(values, "ecn-steep") if values.get("ecn-steep") is not None else ecn_default["flow"]["steepness"],
+            "shift": _number(values, "ecn-shift") if values.get("ecn-shift") is not None else ecn_default["flow"]["shift"],
+            "volumeShift": _number(values, "ecn-vshift") if values.get("ecn-vshift") is not None else ecn_default["flow"]["volumeShift"],
+        },
+        "quoteSize": _number(values, "ecn-size") if values.get("ecn-size") is not None else ecn_default["quoteSize"],
+        "makerFeePips": _number(values, "ecn-fee") if values.get("ecn-fee") is not None else ecn_default["makerFeePips"],
+    }
     return cfg

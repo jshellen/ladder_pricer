@@ -512,6 +512,120 @@ def dark_pool_table(solution: dict[str, Any]) -> html.Table | html.Div:
     return _simple_table(["Inventory","Bid posted size","Ask posted size"],rows)
 
 
+def _passive_ecn_tier_like(cfg: dict[str, Any]) -> tuple[dict[str, Any], float]:
+    e = cfg.get("passiveEcn", {})
+    z = float(e.get("quoteSize", 1.0))
+    return {"flow": e.get("flow", {}), "sizes": [z]}, z
+
+
+def passive_ecn_parameter_table(cfg: dict[str, Any]) -> html.Table:
+    e = cfg.get("passiveEcn", {})
+    tier_like, z = _passive_ecn_tier_like(cfg)
+    rows = [[
+        f"{z:g}",
+        f"{_activity(tier_like, z):.6g}",
+        f"{_delta50(tier_like, z):.4f}",
+        f"{float(e['flow']['steepness']):.4g}",
+        f"{float(e.get('makerFeePips', 0.0)):.4f}",
+        ", ".join(f"{float(x):g}" for x in e.get("deltas", [])),
+    ]]
+    return _simple_table(
+        ["Quote size [M]", "A(z) [1/min]", "δ50(z)", "Steepness", "Maker fee [pips]", "Allowed δ"],
+        rows,
+    )
+
+
+def passive_ecn_fill_figure(cfg: dict[str, Any]) -> go.Figure:
+    e=cfg.get("passiveEcn", {})
+    tier_like, z = _passive_ecn_tier_like(cfg)
+    grid=np.linspace(-1.0, 1.0, 160)
+    fig=go.Figure()
+    fig.add_trace(go.Scatter(x=grid, y=_arrival_rate(tier_like, grid, z), mode="lines", name=f"{z:g}M ECN"))
+    deltas=np.asarray(e.get("deltas", []), dtype=float)
+    if deltas.size:
+        fig.add_trace(go.Scatter(x=deltas, y=_arrival_rate(tier_like, deltas, z), mode="markers", name="Allowed deltas"))
+    fig.update_layout(title="Flow curve λ(δ,z) · Passive ECN", xaxis_title="δ", yaxis_title="Fill intensity [1/min]", template="trinity_dark")
+    return fig
+
+
+def passive_ecn_hit_ratio_figure(cfg: dict[str, Any]) -> go.Figure:
+    e=cfg.get("passiveEcn", {})
+    tier_like, z = _passive_ecn_tier_like(cfg)
+    grid=np.linspace(-1.0, 1.0, 160)
+    fig=go.Figure()
+    fig.add_trace(go.Scatter(x=grid, y=_hit_ratio(tier_like, grid, z), mode="lines", name=f"{z:g}M ECN"))
+    deltas=np.asarray(e.get("deltas", []), dtype=float)
+    if deltas.size:
+        fig.add_trace(go.Scatter(x=deltas, y=_hit_ratio(tier_like, deltas, z), mode="markers", name="Allowed deltas"))
+    fig.update_layout(title="Hit ratios HR(δ,z) · Passive ECN", xaxis_title="δ", yaxis_title="Hit ratio", yaxis_range=[0,1], template="trinity_dark")
+    return fig
+
+
+def passive_ecn_implied_hit_ratio_figure(solution: dict[str, Any], cfg: dict[str, Any]) -> go.Figure:
+    e = solution.get("passiveEcn") if solution else None
+    fig = go.Figure()
+    if not e:
+        fig.add_annotation(text="Passive ECN disabled", showarrow=False)
+    else:
+        tier_like, z = _passive_ecn_tier_like(cfg)
+        q = np.asarray(e["qGrid"], dtype=float)
+        bid_delta = np.asarray(e["bidDelta"], dtype=float)
+        ask_delta = np.asarray(e["askDelta"], dtype=float)
+        bid_active = np.asarray(e["bidActive"], dtype=bool)
+        ask_active = np.asarray(e["askActive"], dtype=bool)
+        bid_hr = np.where(bid_active, _hit_ratio(tier_like, bid_delta, z), np.nan)
+        ask_hr = np.where(ask_active, _hit_ratio(tier_like, ask_delta, z), np.nan)
+        fig.add_trace(go.Scatter(x=q, y=bid_hr, mode="lines+markers", name="Bid hedge", line=dict(color=BID_COLOR, shape="hv"), marker=dict(color=BID_COLOR)))
+        fig.add_trace(go.Scatter(x=q, y=ask_hr, mode="lines+markers", name="Ask hedge", line=dict(color=ASK_COLOR, shape="hv"), marker=dict(color=ASK_COLOR)))
+    fig.update_layout(title="Implied hit ratios vs inventory · Passive ECN", xaxis_title="Inventory q [EUR M]", yaxis_title="Hit ratio", yaxis_range=[0,1], template="trinity_dark")
+    return fig
+
+
+def passive_ecn_quote_inventory_figure(solution: dict[str, Any], cfg: dict[str, Any]) -> go.Figure:
+    e = solution.get("passiveEcn") if solution else None
+    fig = go.Figure()
+    if not e:
+        fig.add_annotation(text="Passive ECN disabled", showarrow=False)
+    else:
+        spread_pips = float(cfg["spreadPips"])
+        q = np.asarray(e["qGrid"], dtype=float)
+        bid_delta = np.asarray(e["bidDelta"], dtype=float)
+        ask_delta = np.asarray(e["askDelta"], dtype=float)
+        bid_active = np.asarray(e["bidActive"], dtype=bool)
+        ask_active = np.asarray(e["askActive"], dtype=bool)
+        bid_px = np.where(bid_active, _quote_vs_mid_pips(bid_delta, "bid", spread_pips), np.nan)
+        ask_px = np.where(ask_active, _quote_vs_mid_pips(ask_delta, "ask", spread_pips), np.nan)
+        fig.add_trace(go.Scatter(x=q, y=bid_px, mode="lines+markers", name="Bid hedge", line=dict(color=BID_COLOR, shape="hv"), marker=dict(color=BID_COLOR)))
+        fig.add_trace(go.Scatter(x=q, y=ask_px, mode="lines+markers", name="Ask hedge", line=dict(color=ASK_COLOR, shape="hv"), marker=dict(color=ASK_COLOR)))
+        fig.add_hline(y=0, line_dash="dot")
+    fig.update_layout(title="Quotes vs inventory · Passive ECN", xaxis_title="Inventory q [EUR M]", yaxis_title="Quote relative to mid [pips]", template="trinity_dark")
+    return fig
+
+
+def passive_ecn_policy_figure(solution: dict[str, Any]) -> go.Figure:
+    e=solution.get("passiveEcn") if solution else None
+    fig=go.Figure()
+    if not e:
+        fig.add_annotation(text="Passive ECN disabled", showarrow=False)
+    else:
+        q=e["qGrid"]
+        bid=[float(x) if bool(a) else None for x,a in zip(e["bidDelta"],e["bidActive"])]
+        ask=[float(x) if bool(a) else None for x,a in zip(e["askDelta"],e["askActive"])]
+        fig.add_trace(go.Scatter(x=q,y=bid,mode="lines+markers",name="Bid hedge",line_shape="hv",line_color=BID_COLOR))
+        fig.add_trace(go.Scatter(x=q,y=ask,mode="lines+markers",name="Ask hedge",line_shape="hv",line_color=ASK_COLOR))
+    fig.update_layout(title="Optimal passive ECN delta vs inventory",xaxis_title="Inventory q [EUR M]",yaxis_title="δ (tier convention)",template="trinity_dark")
+    return fig
+
+def passive_ecn_table(solution: dict[str, Any]) -> html.Table | html.Div:
+    e=solution.get("passiveEcn") if solution else None
+    if not e:
+        return html.Div("Passive ECN disabled",className="muted-note")
+    rows=[]
+    for q,bd,ba,ad,aa in zip(e["qGrid"],e["bidDelta"],e["bidActive"],e["askDelta"],e["askActive"]):
+        rows.append([f"{q:g}", f"{bd:g}" if ba else "OFF", f"{ad:g}" if aa else "OFF"])
+    return _simple_table(["Inventory","Bid δ","Ask δ"],rows)
+
+
 DEFAULT = default_config()
 
 sidebar = html.Aside([
@@ -571,6 +685,23 @@ sidebar = html.Aside([
         text_input("Posted sizes", "dp-sizes", ", ".join(str(x) for x in DEFAULT["darkPool"]["postedSizes"])),
         checkbox("Both sides simultaneously", "dp-both", DEFAULT["darkPool"]["allowBothSides"]),
     ]),
+    panel("Passive ECN hedge (Crisafi)", [
+        checkbox("Enabled", "ecn-enabled", DEFAULT["passiveEcn"]["enabled"]),
+        html.Div("Discrete δ grid: −0.50 to +0.50 in 0.01 increments (101 quote actions) + NONE", className="muted-note"),
+        html.Div([
+            number_input("A0", "ecn-A0", DEFAULT["passiveEcn"]["flow"]["A0"], 0.001),
+            number_input("θ", "ecn-theta", DEFAULT["passiveEcn"]["flow"]["theta"], 0.01),
+            number_input("β", "ecn-beta", DEFAULT["passiveEcn"]["flow"]["beta"], 0.01),
+            number_input("Steepness", "ecn-steep", DEFAULT["passiveEcn"]["flow"]["steepness"], 0.1),
+            number_input("Shift", "ecn-shift", DEFAULT["passiveEcn"]["flow"]["shift"], 0.01),
+            number_input("Volume shift", "ecn-vshift", DEFAULT["passiveEcn"]["flow"]["volumeShift"], 0.001),
+        ], className="grid-2"),
+        html.Div([
+            number_input("Quote size [M]", "ecn-size", DEFAULT["passiveEcn"]["quoteSize"], 0.25),
+            number_input("Maker fee [pips]", "ecn-fee", DEFAULT["passiveEcn"]["makerFeePips"], 0.1),
+        ], className="grid-2"),
+        html.Div("ECN uses the exact same LogisticFlow and δ convention as a tier: δ=0 is touch, positive δ is tighter/price-improving, negative δ is wider. The optimizer chooses NONE or one discrete δ, and ECN fills may only reduce |inventory|.", className="muted-note"),
+    ]),
     html.Button("Solve Howard", id="solve", className="primary-button"),
 ], className="sidebar")
 
@@ -618,6 +749,20 @@ policy_tab = html.Div([
                 html.Div(id="dp-policy-table", className="table-wrap tall-table"),
             ]),
         ], className="subtab-inner diagnostics-stack"), className="dash-tab", selected_className="dash-tab dash-tab-selected"),
+        dcc.Tab(label="Passive ECN", value="ecn", children=html.Div([
+            diagnostic_expander("ECN parameters", [
+                html.Div(id="ecn-parameter-table", className="table-wrap"),
+            ]),
+            diagnostic_expander("Flow curves", graph("ecn-fill-chart")),
+            diagnostic_expander("Hit ratios", graph("ecn-hit-ratio-chart")),
+            diagnostic_expander("Implied hit ratios vs inventory", graph("ecn-implied-hit-chart")),
+            diagnostic_expander("Quotes vs inventory", graph("ecn-quote-inventory-chart")),
+            diagnostic_expander("Optimal quote delta", [
+                graph("ecn-policy-chart"),
+                html.Div("Passive ECN policy", className="card-title table-section-title"),
+                html.Div(id="ecn-policy-table", className="table-wrap tall-table"),
+            ]),
+        ], className="subtab-inner tier-diagnostics-stack"), className="dash-tab", selected_className="dash-tab dash-tab-selected"),
     ], className="tabs policy-tabs"),
 ], className="tab-inner")
 
@@ -714,6 +859,11 @@ for component_id in (
     "dp-p0b", "dp-p0a", "dp-fb", "dp-fa", "dp-sizes", "dp-both",
 ):
     CONFIG_FIELDS.append((component_id, State(component_id, "value")))
+for component_id in (
+    "ecn-enabled", "ecn-A0", "ecn-theta", "ecn-beta", "ecn-steep",
+    "ecn-shift", "ecn-vshift", "ecn-size", "ecn-fee",
+):
+    CONFIG_FIELDS.append((component_id, State(component_id, "value")))
 
 CONFIG_KEYS = [key for key, _ in CONFIG_FIELDS]
 CONFIG_STATES = [state for _, state in CONFIG_FIELDS]
@@ -804,6 +954,33 @@ def render_dark_pool_diagnostics(solution, cfg):
     return (
         dark_pool_arrival_figure(cfg), dark_pool_full_fill_figure(cfg),
         dark_pool_policy_figure(solution), dark_pool_table(solution),
+    )
+
+
+@app.callback(
+    Output("ecn-fill-chart", "figure"), Output("ecn-hit-ratio-chart", "figure"),
+    Output("ecn-implied-hit-chart", "figure"), Output("ecn-quote-inventory-chart", "figure"),
+    Output("ecn-policy-chart", "figure"), Output("ecn-parameter-table", "children"),
+    Output("ecn-policy-table", "children"),
+    Input("solution-store", "data"), Input("config-store", "data"),
+)
+def render_passive_ecn_diagnostics(solution, cfg):
+    if not solution or not cfg:
+        return (go.Figure(),) * 5 + (html.Div("Solve the model first"), html.Div("Solve the model first"))
+    if not cfg.get("passiveEcn", {}).get("enabled", False):
+        disabled = go.Figure()
+        disabled.add_annotation(text="Passive ECN disabled", showarrow=False)
+        disabled.update_layout(template="trinity_dark")
+        note = html.Div("Passive ECN disabled", className="muted-note")
+        return disabled, disabled, disabled, disabled, disabled, note, note
+    return (
+        passive_ecn_fill_figure(cfg),
+        passive_ecn_hit_ratio_figure(cfg),
+        passive_ecn_implied_hit_ratio_figure(solution, cfg),
+        passive_ecn_quote_inventory_figure(solution, cfg),
+        passive_ecn_policy_figure(solution),
+        passive_ecn_parameter_table(cfg),
+        passive_ecn_table(solution),
     )
 
 
@@ -961,10 +1138,7 @@ def run_frontier(_clicks, cfg, lo, hi, points, log_values, q0):
         if not 0 < lo < hi or n < 3:
             raise ValueError("Require 0 < φ min < φ max and at least 3 points")
         gammas = np.geomspace(lo, hi, n) if checked(log_values) else np.linspace(lo, hi, n)
-        current_gamma = float(cfg["gamma"])
-        if lo <= current_gamma <= hi:
-            gammas = np.append(gammas, current_gamma)
-        gammas = np.unique(gammas).tolist()
+        gammas = np.unique(np.append(gammas, float(cfg["gamma"]))).tolist()
         frontier = ENGINES.get(cfg).frontier(gammas, SESSION_HORIZON, float(q0))
         return frontier, "Efficient frontier complete", "status ready"
     except Exception as exc:

@@ -159,6 +159,20 @@ PnlStatistics PnlAnalytics::statistics(double horizon, double sigma, double q0) 
                 }
             }
         }
+        if(problem_.passive_ecn() && solution_.solve_passive_ecn_policy){
+            const auto& venue=*problem_.passive_ecn(); const auto& p=*solution_.solve_passive_ecn_policy;
+            const double z=venue.quote_size();
+            for(Side side:{Side::Bid,Side::Ask}){
+                const bool active=side==Side::Bid?p.bid_active[i]:p.ask_active[i];
+                const double depth=side==Side::Bid?p.bid_depth[i]:p.ask_depth[i];
+                if(!active) continue;
+                const double rate=venue.flow().arrival_rate(depth,z); const double dir=direction(side);
+                if(rate<=0.0) continue;
+                std::vector<double> shift(nvars,0.0);
+                shift[static_cast<std::size_t>(pnlvar)]=z*(problem_.spread()*(0.5-depth)-venue.maker_fee());
+                events.push_back({q+dir*z,rate,std::move(shift)});
+            }
+        }
 
         for(const auto& event:events){
             const auto w=weights(qgrid,event.target_q);

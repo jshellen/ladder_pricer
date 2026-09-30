@@ -94,6 +94,16 @@ std::optional<DarkPool> build_dark_pool(const py::dict& cfg) {
         numbers(cfg[py::str("postedSizes")]), boolean(cfg, "allowBothSides"));
 }
 
+std::optional<PassiveECN> build_passive_ecn(const py::dict& cfg) {
+    if (!boolean(cfg, "enabled")) return std::nullopt;
+    const py::dict flow = py::cast<py::dict>(cfg[py::str("flow")]);
+    return PassiveECN(
+        numbers(cfg[py::str("deltas")]),
+        LogisticFlow(number(flow, "A0"), number(flow, "theta"), number(flow, "beta"),
+                     number(flow, "shift"), number(flow, "steepness"), number(flow, "volumeShift")),
+        number(cfg, "quoteSize"), number(cfg, "makerFeePips") / 10000.0);
+}
+
 PricingProblem build_problem(const py::dict& cfg, std::optional<double> gamma_override = std::nullopt) {
     std::vector<Tier> tiers;
     const py::list tier_cfgs = py::cast<py::list>(cfg[py::str("tiers")]);
@@ -110,8 +120,9 @@ PricingProblem build_problem(const py::dict& cfg, std::optional<double> gamma_ov
                               number(markout, "sizeExponent"), number(markout, "tauMinutes")),
             boolean(tier, "useMarkout"), number(tier, "deltaMin"), number(tier, "deltaMax"));
     }
-    if (tiers.empty() && !boolean(py::cast<py::dict>(cfg[py::str("darkPool")]), "enabled")) {
-        throw std::invalid_argument("enable at least one pricing tier or the dark pool");
+    if (tiers.empty() && !boolean(py::cast<py::dict>(cfg[py::str("darkPool")]), "enabled")
+        && !boolean(py::cast<py::dict>(cfg[py::str("passiveEcn")]), "enabled")) {
+        throw std::invalid_argument("enable at least one pricing tier, dark pool, or passive ECN");
     }
 
     const py::dict internal = py::cast<py::dict>(cfg[py::str("internalization")]);
@@ -124,7 +135,8 @@ PricingProblem build_problem(const py::dict& cfg, std::optional<double> gamma_ov
         QuadraticPenalty(gamma, sigma),
         InternalizationTime(number(internal, "tau0"), number(internal, "tau1"), number(internal, "tau2")),
         std::move(tiers),
-        build_dark_pool(py::cast<py::dict>(cfg[py::str("darkPool")])));
+        build_dark_pool(py::cast<py::dict>(cfg[py::str("darkPool")])),
+        build_passive_ecn(py::cast<py::dict>(cfg[py::str("passiveEcn")])));
 }
 
 py::list matrix_value(const std::vector<std::vector<double>>& matrix) {
@@ -175,6 +187,29 @@ py::dict solution_value(const Solution& solution, const PricingProblem& problem)
         out["darkPool"] = std::move(dark);
     } else {
         out["darkPool"] = py::none();
+    }
+
+    if (solution.passive_ecn_policy && problem.passive_ecn()) {
+        const auto& policy = *solution.passive_ecn_policy;
+        const auto& venue = *problem.passive_ecn();
+        py::dict ecn;
+        ecn["qGrid"] = policy.q_grid;
+        ecn["bidDelta"] = policy.bid_depth;
+        ecn["askDelta"] = policy.ask_depth;
+        ecn["bidActive"] = policy.bid_active;
+        ecn["askActive"] = policy.ask_active;
+        ecn["deltas"] = venue.deltas();
+        std::vector<double> fill_rates;
+        fill_rates.reserve(venue.deltas().size());
+        for (double delta : venue.deltas()) {
+            fill_rates.push_back(venue.flow().arrival_rate(delta, venue.quote_size()));
+        }
+        ecn["fillRates"] = fill_rates;
+        ecn["quoteSize"] = venue.quote_size();
+        ecn["makerFeePips"] = venue.maker_fee() * 10000.0;
+        out["passiveEcn"] = std::move(ecn);
+    } else {
+        out["passiveEcn"] = py::none();
     }
     return out;
 }
@@ -281,43 +316,17 @@ public:
             double std;
             double ratio;
             int iterations;
-            double average_reward;
         };
-        if (gamma_values.empty()) return py::list();
-
-        // Solve the frontier as a continuation problem in risk aversion.
-        // The trader shape constraints couple quote actions across inventory
-        // states.  Cold-starting every gamma independently can therefore land
-        // Howard iteration on different feasible fixed-point branches even when
-        // each individual solve has a tiny Bellman residual.  Adjacent frontier
-        // points should instead start from the previously accepted full policy.
-        std::vector<double> gammas = gamma_values;
-        std::sort(gammas.begin(), gammas.end());
-        gammas.erase(std::unique(gammas.begin(), gammas.end()), gammas.end());
-
         std::vector<Point> points;
-        points.reserve(gammas.size());
-        std::optional<Policy> warm_policy;
-
-        for (const double gamma : gammas) {
+        points.reserve(gamma_values.size());
+        for (const double gamma : gamma_values) {
+            // Reading the Python config requires the GIL. Heavy numerical work does not.
             PricingProblem problem = build_problem(config_, gamma);
             Solution solution;
-            {
-                py::gil_scoped_release release;
-                HowardSolver solver(problem);
-                solution = warm_policy ? solver.solve(*warm_policy) : solver.solve();
-            }
-
-            Policy accepted;
-            accepted.tiers = solution.solve_tier_policies;
-            if (solution.solve_dark_pool_policy) {
-                accepted.dark_pool = *solution.solve_dark_pool_policy;
-            }
-            warm_policy = std::move(accepted);
-
             PnlStatistics statistics;
             {
                 py::gil_scoped_release release;
+                solution = HowardSolver(problem).solve();
                 statistics = PnlAnalytics(problem, solution, reference_spot_)
                                  .statistics(horizon_minutes, sigma, initial_inventory);
             }
@@ -329,10 +338,8 @@ public:
                     ? statistics.expected_base_ccy / statistics.std_base_ccy
                     : 0.0,
                 solution.diagnostics.iterations,
-                solution.average_reward,
             });
         }
-
         py::list out;
         for (const auto& point : points) {
             py::dict item;
@@ -341,7 +348,6 @@ public:
             item["std"] = point.std;
             item["ratio"] = point.ratio;
             item["iterations"] = point.iterations;
-            item["averageReward"] = point.average_reward;
             out.append(std::move(item));
         }
         return out;

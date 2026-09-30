@@ -25,6 +25,7 @@ The C++17 library contains:
 - hidden inventory solve buffer;
 - saturating adverse-selection markout;
 - dark-pool controls;
+- optional Crisafi-style passive ECN hedge control: `NONE` or one of 101 tier-style quote deltas from −0.50 to +0.50 in 0.01 increments, using the exact same `LogisticFlow` fill dynamics and delta convention as customer tiers, with strictly risk-reducing fills;
 - event-driven fills with an independent continuous market-price process;
 - corrected impact-aware closed-form terminal PnL mean and standard deviation.
 
@@ -59,6 +60,19 @@ The application has three main work areas:
 - Streamlit-style Tier Diagnostics presented as a single vertical stack of collapsible sections;
 - diagnostic order: tier parameters → flow curves → hit ratios → implied hit ratios → markouts → quotes vs inventory → bid surface → ask surface → volume premium / ladder table;
 - consistent side colors throughout diagnostics: **bid = blue**, **ask = red**.
+
+### Passive ECN hedge
+
+The optional passive ECN module is deliberately reduced-form and does not use `xfills`.
+It uses the exact same `LogisticFlow::arrival_rate(delta, size)` fill dynamics as a customer
+tier. The user supplies the usual tier-style flow parameters and a discrete set of allowed
+quote deltas. The delta convention is identical to tiers: `delta = 0` quotes at touch,
+positive delta improves/tightens the quote, and negative delta widens beyond touch.
+At every inventory state the Howard improvement compares `NONE` with each supplied delta.
+ECN quotes are hedge-only: positive inventory may only post an ask, negative inventory may
+only post a bid, flat inventory posts nothing, and a fill is never allowed to cross through
+zero and create risk on the opposite side. The ECN execution edge is also computed with the
+same tier formula, `size * spread * (0.5 - delta)`, less any configured maker fee.
 
 ### Monte Carlo
 
@@ -232,13 +246,7 @@ not silently shift tier parameters. The regression tests in
 
 The Policy → Dark pool tab mirrors the Streamlit-style diagnostic layout: plots are stacked vertically in independent collapsible sections for arrival-size density, full-fill probability, and the solved dark-pool policy (with its table).
 
-### Efficient-frontier continuation
 
-The efficient-frontier sweep is solved by continuation in risk aversion: after the
-first requested risk-aversion value is solved, each neighboring value is warm-started
-from the previous full policy. This is intentional. The trader ladder shape constraints
-couple actions across inventory states, so independently cold-started Howard solves can
-converge to different feasible fixed-point branches despite tiny Bellman residuals.
-Continuation removes this branch-hopping artifact and is substantially faster for dense
-frontier sweeps. The current risk-aversion value is added to the sweep only when it lies
-inside the requested frontier interval.
+### UI diagnostics
+
+- **Passive ECN diagnostics** mirror Tier Diagnostics where applicable: parameters, flow curves, hit ratios, implied hit ratios vs inventory, quotes vs inventory, and the discrete optimal delta policy. The ECN action grid is fixed at −0.50 to +0.50 in 0.01 increments (plus `NONE`).

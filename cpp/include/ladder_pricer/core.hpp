@@ -199,6 +199,26 @@ private:
     double min_fill_value_;
 };
 
+
+class PassiveECN {
+public:
+    PassiveECN(std::vector<double> deltas, LogisticFlow flow,
+               double quote_size, double maker_fee);
+
+    const std::vector<double>& deltas() const noexcept { return deltas_; }
+    const LogisticFlow& flow() const noexcept { return flow_; }
+    double quote_size() const noexcept { return quote_size_; }
+    double maker_fee() const noexcept { return maker_fee_; }
+    bool side_allowed(double inventory, Side side) const noexcept;
+    bool risk_reducing(double inventory, Side side, double size) const noexcept;
+
+private:
+    std::vector<double> deltas_;
+    LogisticFlow flow_;
+    double quote_size_;
+    double maker_fee_;
+};
+
 struct LadderPolicy {
     std::vector<double> q_grid;
     std::vector<double> sizes;
@@ -214,9 +234,18 @@ struct DarkPoolPolicy {
     std::vector<bool> ask_active;
 };
 
+struct PassiveECNPolicy {
+    std::vector<double> q_grid;
+    std::vector<double> bid_depth;
+    std::vector<double> ask_depth;
+    std::vector<bool> bid_active;
+    std::vector<bool> ask_active;
+};
+
 struct Policy {
     std::vector<LadderPolicy> tiers;
     std::optional<DarkPoolPolicy> dark_pool;
+    std::optional<PassiveECNPolicy> passive_ecn;
 };
 
 class PricingProblem {
@@ -227,7 +256,8 @@ public:
                    QuadraticPenalty penalty,
                    InternalizationTime internalization_time,
                    std::vector<Tier> tiers,
-                   std::optional<DarkPool> dark_pool = std::nullopt);
+                   std::optional<DarkPool> dark_pool = std::nullopt,
+                   std::optional<PassiveECN> passive_ecn = std::nullopt);
 
     const InventoryGrid& grid() const noexcept { return grid_; }
     double spread() const noexcept { return spread_; }
@@ -236,11 +266,13 @@ public:
     const InternalizationTime& internalization_time() const noexcept { return internalization_time_; }
     const std::vector<Tier>& tiers() const noexcept { return tiers_; }
     const std::optional<DarkPool>& dark_pool() const noexcept { return dark_pool_; }
+    const std::optional<PassiveECN>& passive_ecn() const noexcept { return passive_ecn_; }
 
 
 private:
     static double max_inventory_jump(const std::vector<Tier>& tiers,
-                                     const std::optional<DarkPool>& dark_pool);
+                                     const std::optional<DarkPool>& dark_pool,
+                                     const std::optional<PassiveECN>& passive_ecn);
 
     InventoryGrid grid_;
     double spread_;
@@ -249,6 +281,7 @@ private:
     InternalizationTime internalization_time_;
     std::vector<Tier> tiers_;
     std::optional<DarkPool> dark_pool_;
+    std::optional<PassiveECN> passive_ecn_;
 };
 
 struct SolverDiagnostics {
@@ -269,10 +302,12 @@ struct Solution {
     // Operational policies are convenient for pricing/UI use.
     std::vector<LadderPolicy> tier_policies;
     std::optional<DarkPoolPolicy> dark_pool_policy;
+    std::optional<PassiveECNPolicy> passive_ecn_policy;
 
     // Full hidden-grid policies are retained for simulation and diagnostics.
     std::vector<LadderPolicy> solve_tier_policies;
     std::optional<DarkPoolPolicy> solve_dark_pool_policy;
+    std::optional<PassiveECNPolicy> solve_passive_ecn_policy;
     double average_reward = 0.0;
     double hard_inventory_limit = 0.0;
     SolverDiagnostics diagnostics;
@@ -327,6 +362,7 @@ private:
                                          const LadderBounds& bounds) const;
     std::vector<double> gaps(const std::vector<double>& row) const;
     DarkPoolPolicy improve_dark_pool(const std::vector<double>& value) const;
+    PassiveECNPolicy improve_passive_ecn(const std::vector<double>& value) const;
 
     const PricingProblem& problem_;
 };

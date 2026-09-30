@@ -53,3 +53,12 @@ def test_checked_dash_checklist_values():
     assert checked(["on"]) is True
     assert checked([]) is False
     assert checked(None) is False
+
+
+def test_passive_ecn_uses_fixed_dense_delta_grid():
+    cfg = build_config(ui_values_from_default())
+    deltas = cfg["passiveEcn"]["deltas"]
+    assert len(deltas) == 101
+    assert deltas[0] == -0.50
+    assert deltas[-1] == 0.50
+    assert all(abs((b - a) - 0.01) < 1e-12 for a, b in zip(deltas, deltas[1:]))

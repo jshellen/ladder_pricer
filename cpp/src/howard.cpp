@@ -63,6 +63,10 @@ double max_abs_policy(const Policy& policy) {
         out = std::max(out, max_abs(policy.dark_pool->bid_size));
         out = std::max(out, max_abs(policy.dark_pool->ask_size));
     }
+    if (policy.passive_ecn) {
+        out = std::max(out, max_abs(policy.passive_ecn->bid_depth));
+        out = std::max(out, max_abs(policy.passive_ecn->ask_depth));
+    }
     return out;
 }
 
@@ -97,6 +101,20 @@ DarkPoolPolicy slice_policy(const DarkPoolPolicy& policy,
     for (auto i : indices) {
         out.bid_size.push_back(policy.bid_size[i]);
         out.ask_size.push_back(policy.ask_size[i]);
+        out.bid_active.push_back(policy.bid_active[i]);
+        out.ask_active.push_back(policy.ask_active[i]);
+    }
+    return out;
+}
+
+PassiveECNPolicy slice_policy(const PassiveECNPolicy& policy,
+                              const std::vector<std::size_t>& indices,
+                              const std::vector<double>& q_grid) {
+    PassiveECNPolicy out;
+    out.q_grid = q_grid;
+    for (auto i : indices) {
+        out.bid_depth.push_back(policy.bid_depth[i]);
+        out.ask_depth.push_back(policy.ask_depth[i]);
         out.bid_active.push_back(policy.bid_active[i]);
         out.ask_active.push_back(policy.ask_active[i]);
     }
@@ -152,6 +170,21 @@ HowardSolver::AffineOperator HowardSolver::fixed_policy_operator(const Policy& p
                 }
             }
         }
+
+        if (problem_.passive_ecn() && policy.passive_ecn) {
+            const auto& venue = *problem_.passive_ecn();
+            const auto& p = *policy.passive_ecn;
+            const double z = venue.quote_size();
+            for (Side side : {Side::Bid, Side::Ask}) {
+                const bool active = side == Side::Bid ? p.bid_active[i] : p.ask_active[i];
+                const double depth = side == Side::Bid ? p.bid_depth[i] : p.ask_depth[i];
+                if (!active) continue;
+                const double rate = venue.flow().arrival_rate(depth, z);
+                const double dir = direction(side);
+                op.reward[i] += rate * z * (problem_.spread() * (0.5 - depth) - venue.maker_fee());
+                add_transition(op.generator, states, i, q + dir * z, rate);
+            }
+        }
     }
     return op;
 }
@@ -189,9 +222,15 @@ double HowardSolver::policy_change(const Policy& lhs, const Policy& rhs) {
             out = std::max(out, std::abs(lhs.dark_pool->bid_size[i] - rhs.dark_pool->bid_size[i]));
             out = std::max(out, std::abs(lhs.dark_pool->ask_size[i] - rhs.dark_pool->ask_size[i]));
             if (lhs.dark_pool->bid_active[i] != rhs.dark_pool->bid_active[i] ||
-                lhs.dark_pool->ask_active[i] != rhs.dark_pool->ask_active[i]) {
-                out = std::max(out, 1.0);
-            }
+                lhs.dark_pool->ask_active[i] != rhs.dark_pool->ask_active[i]) out = std::max(out, 1.0);
+        }
+    }
+    if (lhs.passive_ecn && rhs.passive_ecn) {
+        for (std::size_t i = 0; i < lhs.passive_ecn->bid_depth.size(); ++i) {
+            out = std::max(out, std::abs(lhs.passive_ecn->bid_depth[i] - rhs.passive_ecn->bid_depth[i]));
+            out = std::max(out, std::abs(lhs.passive_ecn->ask_depth[i] - rhs.passive_ecn->ask_depth[i]));
+            if (lhs.passive_ecn->bid_active[i] != rhs.passive_ecn->bid_active[i] ||
+                lhs.passive_ecn->ask_active[i] != rhs.passive_ecn->ask_active[i]) out = std::max(out, 1.0);
         }
     }
     return out;
@@ -199,11 +238,7 @@ double HowardSolver::policy_change(const Policy& lhs, const Policy& rhs) {
 
 double HowardSolver::policy_scale(const Policy& policy) { return max_abs_policy(policy); }
 
-Solution HowardSolver::solve() const { return solve_impl(nullptr); }
-
-Solution HowardSolver::solve(const Policy& initial_policy) const { return solve_impl(&initial_policy); }
-
-Solution HowardSolver::solve_impl(const Policy* initial_policy) const {
+Solution HowardSolver::solve() const {
     const auto& grid = problem_.grid();
     const auto& states = grid.states();
     const auto& op_indices = grid.operational_indices();
@@ -211,8 +246,7 @@ Solution HowardSolver::solve_impl(const Policy* initial_policy) const {
 
     PolicyBuilder builder(problem_);
     BellmanModel bellman(problem_);
-    Policy policy = initial_policy ? *initial_policy : builder.initial_policy();
-    if (policy.tiers.size() != problem_.tiers().size()) throw std::invalid_argument("initial policy tier count mismatch");
+    Policy policy = builder.initial_policy();
     std::vector<double> h(states.size(), 0.0);
     double rho = 0.0;
 
@@ -270,6 +304,10 @@ Solution HowardSolver::solve_impl(const Policy* initial_policy) const {
     if (policy.dark_pool) {
         solution.solve_dark_pool_policy = *policy.dark_pool;
         solution.dark_pool_policy = slice_policy(*policy.dark_pool, op_indices, grid.operational_states());
+    }
+    if (policy.passive_ecn) {
+        solution.solve_passive_ecn_policy = *policy.passive_ecn;
+        solution.passive_ecn_policy = slice_policy(*policy.passive_ecn, op_indices, grid.operational_states());
     }
     return solution;
 }

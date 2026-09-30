@@ -16,6 +16,7 @@ std::string side_name(Side side) { return side == Side::Bid ? "bid" : "ask"; }
 
 struct Event {
     bool dark = false;
+    bool ecn = false;
     std::size_t tier = 0;
     Side side = Side::Bid;
     double size = 0.0;
@@ -64,7 +65,7 @@ std::vector<Event> events(const PricingProblem& problem, const Solution& solutio
                 if (!problem.grid().admissible(q, dir * z)) continue;
                 const double delta = policy_delta(policy, side, j, q);
                 const double rate = tier.flow().arrival_rate(delta, z);
-                if (rate > 0.0) out.push_back({false, k, side, z, delta, 0.0, rate});
+                if (rate > 0.0) out.push_back({false, false, k, side, z, delta, 0.0, rate});
             }
         }
     }
@@ -77,9 +78,23 @@ std::vector<Event> events(const PricingProblem& problem, const Solution& solutio
             if (u <= 0 || !problem.grid().admissible(q, dir * u)) continue;
             for (const auto& [fill, rate] : venue.arrivals(side).fill_rates(u)) {
                 if (rate > 0.0 && problem.grid().admissible(q, dir * fill)) {
-                    out.push_back({true, 0, side, static_cast<double>(fill), 0.0, venue.fee(side), rate});
+                    out.push_back({true, false, 0, side, static_cast<double>(fill), 0.0, venue.fee(side), rate});
                 }
             }
+        }
+    }
+    if (problem.passive_ecn() && solution.solve_passive_ecn_policy) {
+        const auto& venue = *problem.passive_ecn();
+        const auto& policy = *solution.solve_passive_ecn_policy;
+        const std::size_t i = bracket_left(policy.q_grid, q);
+        const double z = venue.quote_size();
+        for (Side side : {Side::Bid, Side::Ask}) {
+            const bool active = side == Side::Bid ? policy.bid_active[i] : policy.ask_active[i];
+            const double depth = side == Side::Bid ? policy.bid_depth[i] : policy.ask_depth[i];
+            const double dir = direction(side);
+            if (!active || !problem.grid().admissible(q, dir * z)) continue;
+            const double rate = venue.flow().arrival_rate(depth, z);
+            if (rate > 0.0) out.push_back({false, true, 0, side, z, depth, venue.maker_fee(), rate});
         }
     }
     return out;
@@ -249,17 +264,18 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
             const double dir = direction(chosen->side);
             double execution = spot;
             if (!chosen->dark) {
+                // Passive ECN and customer tiers use exactly the same delta convention.
                 execution = chosen->side == Side::Bid
                     ? spot - problem_.spread() * (0.5 - chosen->delta)
                     : spot + problem_.spread() * (0.5 - chosen->delta);
             }
             if (chosen->side == Side::Bid) cash -= chosen->size * execution;
             else cash += chosen->size * execution;
-            if (chosen->dark) cash -= chosen->fee * chosen->size;
+            if (chosen->dark || chosen->ecn) cash -= chosen->fee * chosen->size;
             q += dir * chosen->size;
             ++trades;
 
-            if (!chosen->dark) {
+            if (!chosen->dark && !chosen->ecn) {
                 const auto& tier = problem_.tiers()[chosen->tier];
                 if (tier.use_markout()) {
                     impacts[tier.markout().tau_minutes()] += -dir * tier.markout().asymptotic(chosen->size);
@@ -268,7 +284,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
 
             if (retain) {
                 detailed.fills.push_back({t,
-                    chosen->dark ? "Dark pool" : problem_.tiers()[chosen->tier].name(),
+                    chosen->dark ? "Dark pool" : (chosen->ecn ? "Passive ECN" : problem_.tiers()[chosen->tier].name()),
                     side_name(chosen->side), chosen->size, execution, before, q});
                 // Keep an explicit event point so fills line up exactly with the price
                 // path and quote state even when they occur between market-clock ticks.
