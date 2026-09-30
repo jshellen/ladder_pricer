@@ -1,286 +1,233 @@
-# Ladder Pricer — pure Python Howard solver
+# Trinity 2.0 — C++ Howard engine + Python + Dash
 
-This repository implements a stationary continuous-time HJB / average-reward inventory-control model for RFQ ladder pricing, with an optional dark-pool channel.
+This is the Python/Dash application architecture for the Trinity ladder pricer:
 
-The implementation is now **pure Python + NumPy**. There is no C++, pybind11, CMake, Boost, SciPy, or compiled extension.
+```text
+C++ pricing engine
+      ↓ pybind11
+thin Python façade
+      ↓
+Dash + Plotly UI
+```
 
-## Solver
+All pricing mathematics remain in C++. Python owns application state/caching and Dash owns presentation.
 
-The only solver is exact Howard policy iteration:
+The repository also preserves the last trusted pure-Python numerical implementation under `python_reference/`. It is isolated from the production import path and is kept only as a readable reference/regression oracle and emergency fallback.
 
-1. Hold the current quote/dark-pool policy fixed.
-2. Build the fixed-policy affine Bellman operator
+## Numerical core
 
-   $$
-   R^\pi(h)=c^\pi+L^\pi h.
-   $$
+The C++17 library contains:
 
-3. Solve the ergodic Poisson equation
+- stationary continuous-time HJB;
+- Howard policy iteration;
+- analytical logistic/Lambert-W quote improvement;
+- inventory ladder level/gap constraints;
+- hidden inventory solve buffer;
+- saturating adverse-selection markout;
+- dark-pool controls;
+- event-driven fills with an independent continuous market-price process;
+- corrected impact-aware closed-form terminal PnL mean and standard deviation.
 
-   $$
-   \rho^\pi \mathbf 1=c^\pi+L^\pi h^\pi,
-   \qquad h^\pi(0)=0.
-   $$
+The Dash layer does **not** implement pricing mathematics.
 
-4. Improve RFQ quotes analytically using the logistic-flow Lambert-$W$ solution.
-5. Apply the within-row size-ladder rule: larger sizes cannot quote tighter than the preceding rung.
-6. Enforce trader-shaped cross-inventory rules on both the **level** and **slope** of each ladder. Moving away from zero inventory, every rung becomes less aggressive on the inventory-increasing side and more aggressive on the inventory-reducing side; simultaneously, volume-premium gaps widen on the inventory-increasing side and flatten on the inventory-reducing side.
-7. Cross-inventory bounds are taken from the previous complete policy (Jacobi-style), avoiding order-dependent cascading within one Howard improvement pass.
-8. A greedy row proposal is accepted only if it improves that row's fixed-$h$ Hamiltonian relative to a feasible row under the shape constraints.
-9. Repeat until both the Bellman residual and the policy change are at floating-point scale.
+## Python API
 
-There is no pseudo-time step, discount rate, damping factor, optimizer tolerance, or user-selected iteration count.
+The public Python boundary is intentionally small:
 
+```python
+from trinity import Engine, default_config
 
-## Inventory domain and boundary
+config = default_config()
+engine = Engine(config)
 
-`SolverConfig.q_grid` is the **operational pricing grid**: the inventory range returned in the solution and shown in Streamlit. It is not used as an extrapolation boundary.
+solution = engine.solve()
+stats = engine.statistics(570, initial_inventory=0)
+mc = engine.simulate(570, paths=1000, initial_inventory=0, seed=12345)
+frontier = engine.frontier([0.01, 0.03, 0.1, 0.3], 570, initial_inventory=0)
+```
 
-Let
+`Engine` is a thin façade over the native pybind11 extension. Heavy calls release the Python GIL. A small Dash-side cache keeps solved engines alive across UI callbacks.
 
-$$
-z_{\max}=\max\{\text{RFQ sizes, dark-pool posted sizes}\}.
-$$
+## Dash application
 
-The Howard solver automatically constructs a hidden symmetric solve grid with hard limit
+The application has three main work areas:
 
-$$
-Q_{\mathrm{hard}}=Q_{\mathrm{operational}}+z_{\max}.
-$$
+### Policy
 
-Therefore every allowed fill starting from the operational range lands inside a state for which $h(q)$ is explicitly solved. Internal interpolation is bounded: attempting to evaluate $h$ outside the hidden solve domain is an error, not a linear extrapolation.
+- convergence diagnostics;
+- continuation value `h(q)` and internalization-time overview;
+- Streamlit-style Tier Diagnostics presented as a single vertical stack of collapsible sections;
+- diagnostic order: tier parameters → flow curves → hit ratios → implied hit ratios → markouts → quotes vs inventory → bid surface → ask surface → volume premium / ladder table;
+- consistent side colors throughout diagnostics: **bid = blue**, **ask = red**.
 
-At the hidden hard edge, an RFQ or dark-pool action that could increase inventory beyond $Q_{\mathrm{hard}}$ is inadmissible. Inventory-reducing actions remain available. The trader level/gap shape constraints are enforced on the operational pricing surface; the hidden buffer exists only to provide economically defined continuation values.
+### Monte Carlo
 
-The returned `HJBSolution` exposes both views:
+- MC mean and standard deviation;
+- exact closed-form mean and standard deviation;
+- PnL histogram;
+- inventory median + 95% interval;
+- retained path inventory and spot/fill plots;
+- retained spot paths evolve on an internal 15-second market clock even between fills;
+- separate event/spot RNG streams keep fills and PnL invariant to UI sampling density;
+- fill tape.
 
-- `solution.q_grid`, `solution.h`: operational/display grid;
-- `solution.solve_q_grid`, `solution.h_solve`: hidden Howard solve grid;
-- `solution.hard_inventory_limit`: hard absolute inventory limit.
+## Monte Carlo market clock
 
-## Inventory penalty
+RFQ and dark-pool fills remain asynchronous continuous-time events, but the spot
+process is not tied to those events. The production C++ simulator advances spot
+on an internal 15-second market clock using the configured Brownian volatility,
+exogenous drift and outstanding exponential markout impulses. Fill events can
+occur between those market ticks and are inserted at their exact event times.
 
-The running inventory penalty is the standard quadratic form
+The event-arrival RNG and spot RNG are independent. The regular inventory/output
+sampling grid therefore affects only what is returned to the UI; changing
+`sample_points` cannot change the fill sequence, terminal inventory, terminal
+spot or path PnL for a fixed seed.
 
-$$
-C(q)=\gamma\sigma^2q^2.
-$$
+## Efficient frontier
 
-The polynomial internalization-time model is separate from the inventory penalty. It provides the horizon at which the saturating adverse markout is evaluated; it is not multiplied into the running inventory penalty.
-
-## RFQ flow and analytical quote
-
-For size $z$, all RFQ intensities are expressed **per minute**. In particular, $A_0$ is the per-minute intensity scale and
-
-$$
-\lambda(\delta,z)=A(z)L(\delta,z)
-$$
-
-is the resulting fill intensity in fills per minute.
-
-with
-
-$$
-A(z)=A_0z^{-\theta-\beta z},
-$$
-
-and logistic hit ratio
-
-$$
-L(\delta,z)=\frac{1}{1+\exp[-\kappa(\delta-c_z)]}.
-$$
-
-For a fixed continuation value, each unconstrained rung optimum is available in closed form via the principal Lambert-$W$ branch. The code evaluates $W_0(e^x)$ with a small self-contained Newton solve in log space, so no special-function dependency is required.
-
-## Markout model
-
-Markout is represented as a positive adverse-selection cost:
-
-$$
-m(z,t)=a z^{\beta}\left(1-e^{-t/\tau}\right).
-$$
-
-Here $a$ is the eventual markout of a unit-size trade, $\beta$ controls how eventual impact grows with trade size, and $\tau$ controls how quickly the impact is realized. The curve starts at zero, rises fastest immediately after the trade, and saturates at
-
-$$
-M(z)=a z^{\beta}.
-$$
-
-The RFQ fill payoff therefore uses
-
-$$
-\lambda(\delta,z)\left[z s(0.5-\delta)-z m(z,t)+h(q')-h(q)\right].
-$$
-
-A larger positive markout always makes the trade less attractive. In the Streamlit app, $a$ is entered in pips and $\tau$ in minutes. Markout time and internalization time therefore use the same time unit throughout the model.
-
-## Ladder constraints
-
-Within every inventory row, larger sizes cannot quote tighter:
-
-$$
-\delta_{z_1}(q)\ge\delta_{z_2}(q)\ge\cdots,
-\qquad z_1<z_2<\cdots.
-$$
-
-Define the adjacent volume premium
-
-$$
-g_j(q)=\delta_{z_j}(q)-\delta_{z_{j+1}}(q)\ge0.
-$$
-
-The cross-inventory rule is symmetric and controls both the **level** of each
-rung and the **slope** of the ladder.
-
-For a long position ($q>0$), bids increase inventory while asks reduce it.
-Moving from $q_i$ to the next larger inventory $q_{i+1}$:
-
-$$
-\delta_z^{bid}(q_{i+1})\le\delta_z^{bid}(q_i),
-\qquad
-g_j^{bid}(q_{i+1})\ge g_j^{bid}(q_i),
-$$
-
-$$
-\delta_z^{ask}(q_{i+1})\ge\delta_z^{ask}(q_i),
-\qquad
-g_j^{ask}(q_{i+1})\le g_j^{ask}(q_i).
-$$
-
-Thus every bid price moves lower and the bid ladder fans out; every ask price
-also moves lower (larger ask delta) and the ask ladder flattens.
-
-For a short position the rules mirror:
-
-$$
-\delta_z^{ask}(q_{i-1})\le\delta_z^{ask}(q_i),
-\qquad
-g_j^{ask}(q_{i-1})\ge g_j^{ask}(q_i),
-$$
-
-$$
-\delta_z^{bid}(q_{i-1})\ge\delta_z^{bid}(q_i),
-\qquad
-g_j^{bid}(q_{i-1})\le g_j^{bid}(q_i),
-\qquad q_{i-1}<q_i\le0.
-$$
-
-So, as inventory becomes more extreme, the **wrong-way ladder shifts away and
-steepens**, while the **right-way ladder shifts toward the market and
-flattens**. Cross-inventory bounds are applied from the previous complete
-policy, not from rows updated earlier in the same Howard pass.
+- closed-form PnL standard deviation vs expected PnL;
+- risk parameter `φ` / `γ` vs `E[PnL] / Std[PnL]`;
+- underlying frontier table and Howard iteration counts.
 
 ## Install
 
-From the repository root:
+A normal Python environment with a C++17 compiler is enough. No Emscripten, Node, React, Boost, Eigen or SciPy are required.
+
+On macOS, install Xcode command-line tools if needed:
 
 ```bash
-python -m pip install -e ".[app]"
+xcode-select --install
 ```
 
-The only package dependency of `ladder_pricer` itself is NumPy. The Streamlit app additionally requires its normal UI/plotting dependencies (`streamlit`, `pandas`, `plotly`).
-
-Run the app with:
+Then from the project directory:
 
 ```bash
-python -m streamlit run app.py
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
 ```
 
-## Minimal example
+`pip install -e .` installs Dash/Plotly/NumPy, installs pybind11 as a build dependency, and compiles the native C++ extension for your machine.
 
-```python
-import ladder_pricer as lp
-
-config = lp.SolverConfig(
-    q_grid=list(range(-20, 21)),
-    spot=1.0,
-    spot_drift=0.0,
-    spread=20 / 10_000,
-)
-
-flow = lp.LogisticFlowCurve(
-    A0=0.0155,
-    theta=0.144,
-    beta=0.0857,
-    shift=0.52,
-    steepness=8.42,
-    volume_shift=0.026,
-)
-
-markout = lp.SaturatingMarkoutModel(
-    impact_scale=1.0 / 10_000,  # 1 pip eventual impact at 1M
-    size_exponent=0.5,
-    tau=0.5,                    # minutes
-)
-
-tier = lp.MDPTier(
-    name="Tier 1",
-    sizes=[1, 2, 3, 5, 10, 20],
-    flow_curve=flow,
-    markout_model=markout,
-    delta_min=-10,
-    delta_max=100,
-)
-
-penalty = lp.QuadraticInventoryPenalty(
-    lp.CarryCost(risk_aversion=0.01, sigma=20 / 10_000)
-)
-
-internalization_time = lp.PolynomialInternalizationTime(4.0, 0.070, 0.0084)
-
-solution = lp.HJBLadderSolver(
-    config,
-    penalty,
-    internalization_time,
-    [tier],
-).solve()
-
-print(solution.average_reward)
-print(solution.diagnostics.iterations_used)
-```
-
-## Tests
+## Run
 
 ```bash
-python -m unittest discover -s tests -v
+source .venv/bin/activate
+./run_dash.sh
 ```
 
+or:
 
-## Policy and Monte Carlo tabs
+```bash
+python app.py
+```
 
-The Streamlit center panel is split into two top-level tabs:
-
-- **Policy** keeps the existing HJB diagnostics, tier views, quote surfaces, markout curves, volume-premium ladders and dark-pool policy.
-- **Monte Carlo** simulates fills, inventory, spot and realized mark-to-market PnL under the solved policy.
-
-The Streamlit Monte Carlo represents one core trading session from **07:45 to 17:15**, i.e. **570 minutes**. The simulation clock therefore uses the same minute unit as RFQ intensities, dark-pool intensities, internalization time, markout decay and spot drift. Volatility is expressed per square-root minute.
-
-The Monte Carlo spot process uses the same volatility and base drift as the pricing model. Each MDP fill creates an adverse expected-drift impulse
-
-$$
-b(u)=-\operatorname{sign}(\Delta q)\frac{a z^\beta}{\tau}e^{-u/\tau},
-$$
-
-so integrating the drift after a fill reproduces exactly the saturating markout curve
-
-$$
-m(z,u)=a z^\beta(1-e^{-u/\tau}).
-$$
-
-Brownian noise is added independently. Realized PnL is execution cashflow plus final inventory marked to the simulated spot; the artificial quadratic inventory penalty is **not** subtracted from PnL.
-
-The Monte Carlo tab also reports deterministic finite-horizon **closed-form PnL moments**. The mean uses the same post-fill exponential spot-impact dynamics as the Monte Carlo: for each distinct impact timescale, the benchmark augments the inventory Markov chain with the expected remaining impact conditional on inventory state. The standard deviation extends this to all degree-two moments, including impact-impact and PnL-impact cross moments, jump-reward variance, and the Brownian inventory-risk term $\sigma^2 q^2$. This captures the fact that post-trade impact marks the desk's entire current inventory, including cross-effects with subsequent fills. The resulting SEK mean and variance are exact for the fixed-policy Monte Carlo dynamics. The artificial inventory penalty is excluded from realized PnL.
-
-The obsolete approximation that charged each fill an independent `size × markout` cost has been removed. Streamlit's Monte Carlo cache includes `PNL_BENCHMARK_VERSION` plus the solved policy/model state, so results from an older PnL implementation are automatically invalidated after a code hot-reload or model change.
-
-Inside Monte Carlo, **Distribution** shows the aggregate PnL distribution plus inventory paths with the median and an empirical 95% simulation interval (2.5th–97.5th percentiles) computed from all simulated paths. **Path explorer** lets the user inspect an individual retained path. It shows the exact event-level inventory path, simulated spot, bid/ask quote prices by MDP tier for a selected ticket size, execution markers, fill counts by tier and side, and a full fill tape with time, tier, side, size, execution price, spot and before/after inventory. RFQ fills remain continuous-time/event-driven; regular spot/quote snapshots are only for display.
-
-## Monte Carlo PnL currency
-
-The solver keeps its natural internal units: inventory and RFQ sizes are in millions of base currency (EUR for EURSEK), while cash and mark-to-market PnL are in millions of quote currency (SEK for EURSEK). The Monte Carlo reporting layer converts each simulated path to base-currency PnL using the path's final spot:
+Then open:
 
 ```text
-PnL_EUR = PnL_SEK / EURSEK_T
+http://127.0.0.1:8050
 ```
 
-Thus the Streamlit Monte Carlo histogram and risk statistics are reported in EUR. The closed-form mean and standard deviation are first computed exactly in quote currency and then converted at the reference spot. They are comparable EUR benchmarks, but they are not the exact moments of the nonlinear random pathwise conversion $\Pi_T^{SEK}/S_T$.
+## Native C++ regression tests
+
+The numerical core can also be tested without Python:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/test_howard
+./build/test_analytics
+./build/test_simulation
+```
+
+Expected reference outputs for the Tier-3 EURSEK stress calibration are approximately:
+
+```text
+rho        = 5.01762e-05
+mean PnL   = 4603.94 EUR
+PnL stdev  = 12451.4 EUR
+```
+
+## Project layout
+
+```text
+cpp/
+  include/ladder_pricer/     # clean C++ domain/numerics API
+  src/                       # implementation + pybind11 adapter
+  tests/                     # native regression tests
+python/trinity/
+  engine.py                  # tiny Python façade
+  service.py                 # server-side engine cache
+  defaults.py                # UI defaults
+assets/
+  style.css                  # Dash application styling
+app.py                       # Dash layout and callbacks
+setup.py                     # native extension build
+pyproject.toml               # build dependencies
+```
+
+## Pure-Python reference solver
+
+The production backend remains C++, but the previous numerical Python implementation is retained deliberately:
+
+```text
+python_reference/
+├── ladder_pricer/__init__.py   # complete pure-Python Howard engine
+├── tests/                      # original numerical regression tests
+├── compare_with_cpp.py         # side-by-side C++ vs Python check
+└── README.md
+```
+
+It is outside the normal `python/` package tree, so installing/running Trinity does not import it.
+
+To run its tests explicitly:
+
+```bash
+PYTHONPATH=python_reference python -m pytest -q python_reference/tests
+```
+
+After the main C++ extension is installed, compare the two implementations with:
+
+```bash
+python python_reference/compare_with_cpp.py
+```
+
+The reference implementation should not be used by the Dash application; C++ remains the canonical production numerical backend.
+
+
+## Visualization parity with the Streamlit research app
+
+The Dash application now carries the full diagnostic plot set from the previous Streamlit version:
+
+- continuation value `h(q)`
+- Howard Bellman-residual and value-change convergence histories
+- internalization time vs inventory
+- tier flow curves and logistic hit-ratio curves
+- implied hit ratios under the solved policy
+- saturating markout curves by size
+- quotes vs inventory across all rungs
+- bid and ask 3D quote surfaces
+- volume-premium ladder at a selected inventory
+- flow/markout parameter and ladder tables
+- dark-pool fill-size density, full-fill probability and solved posted-size policy
+- Monte Carlo PnL distribution and inventory confidence band
+- exact event-time retained inventory path
+- spot + tier quotes + executed fills for a selected ticket size
+- fill counts by tier and side, plus the fill tape
+- efficient frontier and risk-adjusted PnL vs phi
+
+C++ remains the production numerical backend. The diagnostic plots are computed in Python from the solved C++ policy and the same model configuration; no pricing mathematics has been duplicated into Dash callbacks.
+
+## Dash configuration mapping
+
+Dash control values are converted to the numerical model by component ID in
+`python/trinity/ui_config.py`. The model configuration no longer depends on the
+positional ordering of callback states, so adding or reordering UI controls does
+not silently shift tier parameters. The regression tests in
+`tests/test_ui_config.py` cover the markout checkbox / impact-parameter mapping.
+
+### Dark-pool diagnostics layout
+
+The Policy → Dark pool tab mirrors the Streamlit-style diagnostic layout: plots are stacked vertically in independent collapsible sections for arrival-size density, full-fill probability, and the solved dark-pool policy (with its table).

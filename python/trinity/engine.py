@@ -1,0 +1,53 @@
+from __future__ import annotations
+
+from copy import deepcopy
+import threading
+from typing import Any, Iterable
+
+from . import _native
+
+
+class Engine:
+    """Small Python façade around the C++ pricing engine.
+
+    The model is configured once. Heavy numerical work remains entirely in C++.
+    """
+
+    def __init__(self, config: dict[str, Any]):
+        self.config = deepcopy(config)
+        self._native = _native.Engine(self.config)
+        self._lock = threading.RLock()
+
+    def solve(self) -> dict[str, Any]:
+        with self._lock:
+            return self._native.solve()
+
+    def statistics(self, horizon_minutes: float = 570.0, initial_inventory: float = 0.0) -> dict[str, Any]:
+        with self._lock:
+            return self._native.statistics(float(horizon_minutes), float(initial_inventory))
+
+    def simulate(
+        self,
+        horizon_minutes: float = 570.0,
+        paths: int = 1000,
+        initial_inventory: float = 0.0,
+        seed: int = 12345,
+        retained_paths: int = 6,
+        sample_points: int = 191,
+    ) -> dict[str, Any]:
+        with self._lock:
+            return self._native.simulate(
+                float(horizon_minutes), int(paths), float(initial_inventory), int(seed),
+                int(retained_paths), int(sample_points),
+            )
+
+    def frontier(
+        self,
+        gamma_values: Iterable[float],
+        horizon_minutes: float = 570.0,
+        initial_inventory: float = 0.0,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            return self._native.frontier(
+                [float(x) for x in gamma_values], float(horizon_minutes), float(initial_inventory)
+            )
