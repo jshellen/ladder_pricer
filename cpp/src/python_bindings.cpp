@@ -281,17 +281,43 @@ public:
             double std;
             double ratio;
             int iterations;
+            double average_reward;
         };
+        if (gamma_values.empty()) return py::list();
+
+        // Solve the frontier as a continuation problem in risk aversion.
+        // The trader shape constraints couple quote actions across inventory
+        // states.  Cold-starting every gamma independently can therefore land
+        // Howard iteration on different feasible fixed-point branches even when
+        // each individual solve has a tiny Bellman residual.  Adjacent frontier
+        // points should instead start from the previously accepted full policy.
+        std::vector<double> gammas = gamma_values;
+        std::sort(gammas.begin(), gammas.end());
+        gammas.erase(std::unique(gammas.begin(), gammas.end()), gammas.end());
+
         std::vector<Point> points;
-        points.reserve(gamma_values.size());
-        for (const double gamma : gamma_values) {
-            // Reading the Python config requires the GIL. Heavy numerical work does not.
+        points.reserve(gammas.size());
+        std::optional<Policy> warm_policy;
+
+        for (const double gamma : gammas) {
             PricingProblem problem = build_problem(config_, gamma);
             Solution solution;
+            {
+                py::gil_scoped_release release;
+                HowardSolver solver(problem);
+                solution = warm_policy ? solver.solve(*warm_policy) : solver.solve();
+            }
+
+            Policy accepted;
+            accepted.tiers = solution.solve_tier_policies;
+            if (solution.solve_dark_pool_policy) {
+                accepted.dark_pool = *solution.solve_dark_pool_policy;
+            }
+            warm_policy = std::move(accepted);
+
             PnlStatistics statistics;
             {
                 py::gil_scoped_release release;
-                solution = HowardSolver(problem).solve();
                 statistics = PnlAnalytics(problem, solution, reference_spot_)
                                  .statistics(horizon_minutes, sigma, initial_inventory);
             }
@@ -303,8 +329,10 @@ public:
                     ? statistics.expected_base_ccy / statistics.std_base_ccy
                     : 0.0,
                 solution.diagnostics.iterations,
+                solution.average_reward,
             });
         }
+
         py::list out;
         for (const auto& point : points) {
             py::dict item;
@@ -313,6 +341,7 @@ public:
             item["std"] = point.std;
             item["ratio"] = point.ratio;
             item["iterations"] = point.iterations;
+            item["averageReward"] = point.average_reward;
             out.append(std::move(item));
         }
         return out;

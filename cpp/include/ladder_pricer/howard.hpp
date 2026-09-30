@@ -11,6 +11,7 @@ public:
 
     const PricingProblem& problem() const noexcept { return problem_; }
     Solution solve() const;
+    Solution solve(const Policy& initial_policy) const;
 
 private:
     struct AffineOperator {
@@ -23,6 +24,7 @@ private:
 
     static double policy_change(const Policy& lhs, const Policy& rhs);
     static double policy_scale(const Policy& policy);
+    Solution solve_impl(const Policy* initial_policy) const;
 
     PricingProblem problem_;
 };

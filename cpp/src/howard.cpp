@@ -199,7 +199,11 @@ double HowardSolver::policy_change(const Policy& lhs, const Policy& rhs) {
 
 double HowardSolver::policy_scale(const Policy& policy) { return max_abs_policy(policy); }
 
-Solution HowardSolver::solve() const {
+Solution HowardSolver::solve() const { return solve_impl(nullptr); }
+
+Solution HowardSolver::solve(const Policy& initial_policy) const { return solve_impl(&initial_policy); }
+
+Solution HowardSolver::solve_impl(const Policy* initial_policy) const {
     const auto& grid = problem_.grid();
     const auto& states = grid.states();
     const auto& op_indices = grid.operational_indices();
@@ -207,7 +211,8 @@ Solution HowardSolver::solve() const {
 
     PolicyBuilder builder(problem_);
     BellmanModel bellman(problem_);
-    Policy policy = builder.initial_policy();
+    Policy policy = initial_policy ? *initial_policy : builder.initial_policy();
+    if (policy.tiers.size() != problem_.tiers().size()) throw std::invalid_argument("initial policy tier count mismatch");
     std::vector<double> h(states.size(), 0.0);
     double rho = 0.0;
 

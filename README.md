@@ -231,3 +231,14 @@ not silently shift tier parameters. The regression tests in
 ### Dark-pool diagnostics layout
 
 The Policy → Dark pool tab mirrors the Streamlit-style diagnostic layout: plots are stacked vertically in independent collapsible sections for arrival-size density, full-fill probability, and the solved dark-pool policy (with its table).
+
+### Efficient-frontier continuation
+
+The efficient-frontier sweep is solved by continuation in risk aversion: after the
+first requested risk-aversion value is solved, each neighboring value is warm-started
+from the previous full policy. This is intentional. The trader ladder shape constraints
+couple actions across inventory states, so independently cold-started Howard solves can
+converge to different feasible fixed-point branches despite tiny Bellman residuals.
+Continuation removes this branch-hopping artifact and is substantially faster for dense
+frontier sweeps. The current risk-aversion value is added to the sweep only when it lies
+inside the requested frontier interval.

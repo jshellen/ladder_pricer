@@ -961,7 +961,10 @@ def run_frontier(_clicks, cfg, lo, hi, points, log_values, q0):
         if not 0 < lo < hi or n < 3:
             raise ValueError("Require 0 < φ min < φ max and at least 3 points")
         gammas = np.geomspace(lo, hi, n) if checked(log_values) else np.linspace(lo, hi, n)
-        gammas = np.unique(np.append(gammas, float(cfg["gamma"]))).tolist()
+        current_gamma = float(cfg["gamma"])
+        if lo <= current_gamma <= hi:
+            gammas = np.append(gammas, current_gamma)
+        gammas = np.unique(gammas).tolist()
         frontier = ENGINES.get(cfg).frontier(gammas, SESSION_HORIZON, float(q0))
         return frontier, "Efficient frontier complete", "status ready"
     except Exception as exc:
