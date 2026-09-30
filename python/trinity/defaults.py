@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 
-ECN_DELTA_GRID = [round(-0.50 + 0.01 * i, 2) for i in range(101)]
+ECN_DELTA_GRID = [round(-0.50 + 0.005 * i, 3) for i in range(201)]
 
 _DEFAULT_CONFIG = {
     "spot": 11.5,
@@ -12,12 +12,9 @@ _DEFAULT_CONFIG = {
     "sigmaPips": 20.0,
     "gamma": 0.1,
     "grid": {
-        "mode": "piecewise",
+        "mode": "uniform",
         "maxAbs": 20.0,
         "step": 1.0,
-        "fineHalfWidth": 3.0,
-        "fineStep": 0.25,
-        "coarseStep": 1.0,
     },
     "internalization": {"tau0": 4.0, "tau1": 0.070, "tau2": 0.0084},
     "tiers": [
@@ -69,16 +66,16 @@ _DEFAULT_CONFIG = {
         "allowBothSides": False,
     },
     "passiveEcn": {
-        "enabled": False,
+        "enabled": True,
         # Crisafi-style hedge-only ECN quoting. Delta uses exactly the same convention
         # as customer tiers: 0 = touch, positive = price improvement/tighter,
         # negative = wider than touch. The optimizer chooses from this discrete grid.
         "deltas": ECN_DELTA_GRID,
         # Exact same LogisticFlow dynamics as a tier, with independently configurable
         # parameters so the ECN curve can later be calibrated without changing the model.
-        "flow": {"A0": 0.0155, "theta": 0.144, "beta": 0.0857, "steepness": 8.42, "shift": 0.52, "volumeShift": 0.026},
+        "flow": {"A0": 1.0, "theta": 0.144, "beta": 0.0857, "steepness": 30.0, "shift": 0.52, "volumeShift": 0.026},
         "quoteSize": 1.0,
-        "makerFeePips": 0.0,
+        "makerFeePips": 3.0,
     },
 }
 

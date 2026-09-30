@@ -518,6 +518,62 @@ def _passive_ecn_tier_like(cfg: dict[str, Any]) -> tuple[dict[str, Any], float]:
     return {"flow": e.get("flow", {}), "sizes": [z]}, z
 
 
+def _ecn_step_line(q: np.ndarray, values: np.ndarray, active: np.ndarray, side: str) -> tuple[list[float | None], list[float | None], np.ndarray, np.ndarray]:
+    q = np.asarray(q, dtype=float)
+    values = np.asarray(values, dtype=float)
+    active = np.asarray(active, dtype=bool)
+    mask = active & np.isfinite(values)
+    x_mark = q[mask]
+    y_mark = values[mask]
+    if x_mark.size == 0:
+        return [], [], x_mark, y_mark
+
+    if x_mark.size == 1:
+        step = 1.0
+    else:
+        step = float(np.median(np.diff(x_mark)))
+        if not np.isfinite(step) or step <= 0.0:
+            step = 1.0
+    half = 0.5 * step
+
+    left_edges = x_mark - half
+    right_edges = x_mark + half
+
+    x_line: list[float | None] = [float(left_edges[0]), float(right_edges[0])]
+    y_line: list[float | None] = [float(y_mark[0]), float(y_mark[0])]
+
+    for i in range(1, x_mark.size):
+        li = float(left_edges[i])
+        ri = float(right_edges[i])
+        yi_prev = float(y_mark[i - 1])
+        yi = float(y_mark[i])
+        prev_right = float(right_edges[i - 1])
+        if abs(li - prev_right) <= 1e-12:
+            x_line.extend([li, ri])
+            y_line.extend([yi, yi])
+        else:
+            x_line.extend([None, li, ri])
+            y_line.extend([None, yi, yi])
+
+    return x_line, y_line, x_mark, y_mark
+
+
+def _add_ecn_inventory_trace(fig: go.Figure, q: np.ndarray, values: np.ndarray, active: np.ndarray,
+                             name: str, color: str, side: str) -> None:
+    x_line, y_line, x_mark, y_mark = _ecn_step_line(q, values, active, side)
+    if len(x_line) == 0:
+        return
+    fig.add_trace(go.Scatter(
+        x=x_line, y=y_line, mode="lines", name=name,
+        line=dict(color=color), legendgroup=name,
+    ))
+    fig.add_trace(go.Scatter(
+        x=x_mark, y=y_mark, mode="markers", name=name,
+        marker=dict(color=color), legendgroup=name, showlegend=False,
+        hovertemplate="Inventory %{x:g}<br>Value %{y:g}<extra></extra>",
+    ))
+
+
 def passive_ecn_parameter_table(cfg: dict[str, Any]) -> html.Table:
     e = cfg.get("passiveEcn", {})
     tier_like, z = _passive_ecn_tier_like(cfg)
@@ -575,8 +631,8 @@ def passive_ecn_implied_hit_ratio_figure(solution: dict[str, Any], cfg: dict[str
         ask_active = np.asarray(e["askActive"], dtype=bool)
         bid_hr = np.where(bid_active, _hit_ratio(tier_like, bid_delta, z), np.nan)
         ask_hr = np.where(ask_active, _hit_ratio(tier_like, ask_delta, z), np.nan)
-        fig.add_trace(go.Scatter(x=q, y=bid_hr, mode="lines+markers", name="Bid hedge", line=dict(color=BID_COLOR, shape="hv"), marker=dict(color=BID_COLOR)))
-        fig.add_trace(go.Scatter(x=q, y=ask_hr, mode="lines+markers", name="Ask hedge", line=dict(color=ASK_COLOR, shape="hv"), marker=dict(color=ASK_COLOR)))
+        _add_ecn_inventory_trace(fig, q, bid_hr, bid_active, "Bid hedge", BID_COLOR, "bid")
+        _add_ecn_inventory_trace(fig, q, ask_hr, ask_active, "Ask hedge", ASK_COLOR, "ask")
     fig.update_layout(title="Implied hit ratios vs inventory · Passive ECN", xaxis_title="Inventory q [EUR M]", yaxis_title="Hit ratio", yaxis_range=[0,1], template="trinity_dark")
     return fig
 
@@ -595,8 +651,8 @@ def passive_ecn_quote_inventory_figure(solution: dict[str, Any], cfg: dict[str, 
         ask_active = np.asarray(e["askActive"], dtype=bool)
         bid_px = np.where(bid_active, _quote_vs_mid_pips(bid_delta, "bid", spread_pips), np.nan)
         ask_px = np.where(ask_active, _quote_vs_mid_pips(ask_delta, "ask", spread_pips), np.nan)
-        fig.add_trace(go.Scatter(x=q, y=bid_px, mode="lines+markers", name="Bid hedge", line=dict(color=BID_COLOR, shape="hv"), marker=dict(color=BID_COLOR)))
-        fig.add_trace(go.Scatter(x=q, y=ask_px, mode="lines+markers", name="Ask hedge", line=dict(color=ASK_COLOR, shape="hv"), marker=dict(color=ASK_COLOR)))
+        _add_ecn_inventory_trace(fig, q, bid_px, bid_active, "Bid hedge", BID_COLOR, "bid")
+        _add_ecn_inventory_trace(fig, q, ask_px, ask_active, "Ask hedge", ASK_COLOR, "ask")
         fig.add_hline(y=0, line_dash="dot")
     fig.update_layout(title="Quotes vs inventory · Passive ECN", xaxis_title="Inventory q [EUR M]", yaxis_title="Quote relative to mid [pips]", template="trinity_dark")
     return fig
@@ -608,11 +664,13 @@ def passive_ecn_policy_figure(solution: dict[str, Any]) -> go.Figure:
     if not e:
         fig.add_annotation(text="Passive ECN disabled", showarrow=False)
     else:
-        q=e["qGrid"]
-        bid=[float(x) if bool(a) else None for x,a in zip(e["bidDelta"],e["bidActive"])]
-        ask=[float(x) if bool(a) else None for x,a in zip(e["askDelta"],e["askActive"])]
-        fig.add_trace(go.Scatter(x=q,y=bid,mode="lines+markers",name="Bid hedge",line_shape="hv",line_color=BID_COLOR))
-        fig.add_trace(go.Scatter(x=q,y=ask,mode="lines+markers",name="Ask hedge",line_shape="hv",line_color=ASK_COLOR))
+        q = np.asarray(e["qGrid"], dtype=float)
+        bid = np.asarray([float(x) if bool(a) else np.nan for x, a in zip(e["bidDelta"], e["bidActive"])], dtype=float)
+        ask = np.asarray([float(x) if bool(a) else np.nan for x, a in zip(e["askDelta"], e["askActive"])], dtype=float)
+        bid_active = np.asarray(e["bidActive"], dtype=bool)
+        ask_active = np.asarray(e["askActive"], dtype=bool)
+        _add_ecn_inventory_trace(fig, q, bid, bid_active, "Bid hedge", BID_COLOR, "bid")
+        _add_ecn_inventory_trace(fig, q, ask, ask_active, "Ask hedge", ASK_COLOR, "ask")
     fig.update_layout(title="Optimal passive ECN delta vs inventory",xaxis_title="Inventory q [EUR M]",yaxis_title="δ (tier convention)",template="trinity_dark")
     return fig
 
@@ -634,17 +692,10 @@ sidebar = html.Aside([
         html.Div([html.Strong("Trinity 2.0"), html.Span("C++ Howard / Python / Dash")], className="brand-copy"),
     ], className="brand"),
     panel("Global", [
-        select("Inventory grid", "grid-mode", [
-            {"label": "Piecewise", "value": "piecewise"},
-            {"label": "Uniform", "value": "uniform"},
-        ], DEFAULT["grid"]["mode"]),
         html.Div([
-            number_input("Max |q|", "qmax", DEFAULT["grid"]["maxAbs"], 0.5),
-            number_input("Uniform step", "qstep", DEFAULT["grid"]["step"], 0.25),
-            number_input("Fine half-width", "qfinehalf", DEFAULT["grid"]["fineHalfWidth"], 0.5),
-            number_input("Fine step", "qfinestep", DEFAULT["grid"]["fineStep"], 0.05),
-            number_input("Coarse step", "qcoarsestep", DEFAULT["grid"]["coarseStep"], 0.25),
+            number_input("Max |q| [M]", "qmax", DEFAULT["grid"]["maxAbs"], 1.0),
         ], className="grid-2"),
+        html.Div("Inventory grid is fixed to uniform 1M spacing.", className="muted-note"),
     ], True),
     panel("Spot & risk", [
         html.Div([
@@ -687,7 +738,7 @@ sidebar = html.Aside([
     ]),
     panel("Passive ECN hedge (Crisafi)", [
         checkbox("Enabled", "ecn-enabled", DEFAULT["passiveEcn"]["enabled"]),
-        html.Div("Discrete δ grid: −0.50 to +0.50 in 0.01 increments (101 quote actions) + NONE", className="muted-note"),
+        html.Div("Discrete δ grid: −0.50 to +0.50 in 0.005 increments (201 quote actions) + NONE", className="muted-note"),
         html.Div([
             number_input("A0", "ecn-A0", DEFAULT["passiveEcn"]["flow"]["A0"], 0.001),
             number_input("θ", "ecn-theta", DEFAULT["passiveEcn"]["flow"]["theta"], 0.01),
@@ -841,8 +892,7 @@ app.layout = html.Div([
 
 
 CONFIG_FIELDS = [
-    ("grid-mode", State("grid-mode", "value")), ("qmax", State("qmax", "value")), ("qstep", State("qstep", "value")),
-    ("qfinehalf", State("qfinehalf", "value")), ("qfinestep", State("qfinestep", "value")), ("qcoarsestep", State("qcoarsestep", "value")),
+    ("qmax", State("qmax", "value")),
     ("spot", State("spot", "value")), ("spread", State("spread", "value")), ("drift", State("drift", "value")),
     ("sigma", State("sigma", "value")), ("gamma", State("gamma", "value")), ("tau0", State("tau0", "value")),
     ("tau1", State("tau1", "value")), ("tau2", State("tau2", "value")),

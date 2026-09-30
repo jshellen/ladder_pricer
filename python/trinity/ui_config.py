@@ -37,12 +37,9 @@ def build_config(values: Mapping[str, Any]) -> dict[str, Any]:
     cfg = default_config()
 
     cfg["grid"] = {
-        "mode": str(values.get("grid-mode", cfg["grid"]["mode"])),
+        "mode": "uniform",
         "maxAbs": _number(values, "qmax"),
-        "step": _number(values, "qstep"),
-        "fineHalfWidth": _number(values, "qfinehalf"),
-        "fineStep": _number(values, "qfinestep"),
-        "coarseStep": _number(values, "qcoarsestep"),
+        "step": 1.0,
     }
     cfg["spot"] = _number(values, "spot")
     cfg["spreadPips"] = _number(values, "spread")

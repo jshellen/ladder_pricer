@@ -12,25 +12,8 @@ def build_uniform_centered_q_grid(q_abs_max: float, q_step: float) -> np.ndarray
     return np.concatenate((-pos[:0:-1], pos))
 
 
-def build_piecewise_centered_q_grid(
-    q_abs_max: float, fine_half_width: float, fine_step: float, coarse_step: float
-) -> np.ndarray:
-    inner = np.arange(0.0, fine_half_width + 0.5 * fine_step, fine_step, dtype=float)
-    inner = inner[inner <= fine_half_width + 1e-12]
-    outer = np.arange(
-        fine_half_width + coarse_step, q_abs_max + 0.5 * coarse_step, coarse_step, dtype=float
-    )
-    outer = outer[outer <= q_abs_max + 1e-12]
-    pos = np.unique(np.round(np.concatenate((inner, outer)), 12))
-    if not np.isclose(pos[-1], q_abs_max, atol=1e-10, rtol=0.0):
-        pos = np.append(pos, q_abs_max)
-    return np.concatenate((-pos[:0:-1], pos))
-
 
 UNIFORM_GRID = build_uniform_centered_q_grid(q_abs_max=20.0, q_step=1.0).tolist()
-PIECEWISE_GRID = build_piecewise_centered_q_grid(
-    q_abs_max=20.0, fine_half_width=3.0, fine_step=0.25, coarse_step=1.0
-).tolist()
 SIZES = [1, 2, 3, 5, 10, 20]
 
 
@@ -286,9 +269,9 @@ class TestHowardSolverUniform(unittest.TestCase):
 
 class TestProductionLikeHowardSolve(unittest.TestCase):
 
-    def test_piecewise_two_tier_calibration_converges_without_solver_knobs(self):
+    def test_uniform_two_tier_calibration_converges_without_solver_knobs(self):
         config = lp.SolverConfig()
-        config.q_grid = PIECEWISE_GRID
+        config.q_grid = UNIFORM_GRID
         config.spot = 11.5
         config.spot_drift = 0.0
         config.spread = 20.0 / 10_000.0
@@ -327,7 +310,7 @@ class TestLowPenaltyHoward(unittest.TestCase):
 
     def _solve(self, gamma: float):
         config = lp.SolverConfig()
-        config.q_grid = PIECEWISE_GRID
+        config.q_grid = UNIFORM_GRID
         config.spot = 11.5
         config.spot_drift = 0.0
         config.spread = 20.0 / 10_000.0
@@ -550,7 +533,7 @@ class TestMonteCarloPnL(unittest.TestCase):
 
     def _build_tier3_regression_solver(self):
         config = lp.SolverConfig(
-            q_grid=PIECEWISE_GRID, spot=11.5, spot_drift=0.0, spread=20.0 / 10_000.0
+            q_grid=UNIFORM_GRID, spot=11.5, spot_drift=0.0, spread=20.0 / 10_000.0
         )
 
         def tier(name, sizes, A0, theta, beta, steepness, shift, volume_shift, impact_pips, tau):

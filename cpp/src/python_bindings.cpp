@@ -37,39 +37,26 @@ std::vector<double> numbers(const py::handle& value) {
 
 std::vector<double> build_grid(const py::dict& spec) {
     const std::string mode = text(spec, "mode");
-    const double qmax = number(spec, "maxAbs");
-    if (qmax <= 0.0) throw std::invalid_argument("inventory maxAbs must be positive");
-
-    std::vector<double> positive;
-    if (mode == "uniform") {
-        const double step = number(spec, "step");
-        if (step <= 0.0) throw std::invalid_argument("inventory step must be positive");
-        for (double q = 0.0; q <= qmax + 0.5 * step; q += step) {
-            if (q <= qmax + 1e-10) positive.push_back(q);
-        }
-    } else if (mode == "piecewise") {
-        const double half = number(spec, "fineHalfWidth");
-        const double fine = number(spec, "fineStep");
-        const double coarse = number(spec, "coarseStep");
-        if (fine <= 0.0 || coarse <= 0.0 || half < 0.0 || half > qmax) {
-            throw std::invalid_argument("invalid piecewise inventory grid");
-        }
-        for (double q = 0.0; q <= half + 0.5 * fine; q += fine) {
-            if (q <= half + 1e-10) positive.push_back(q);
-        }
-        for (double q = half + coarse; q <= qmax + 0.5 * coarse; q += coarse) {
-            if (q <= qmax + 1e-10) positive.push_back(q);
-        }
-    } else {
-        throw std::invalid_argument("inventory grid mode must be 'uniform' or 'piecewise'");
+    if (mode != "uniform") {
+        throw std::invalid_argument("inventory grid mode must be 'uniform'");
     }
 
-    if (positive.empty() || std::abs(positive.back() - qmax) > 1e-10) positive.push_back(qmax);
+    const double qmax = number(spec, "maxAbs");
+    const double step = number(spec, "step");
+    if (qmax <= 0.0) throw std::invalid_argument("inventory maxAbs must be positive");
+    if (std::abs(step - 1.0) > 1e-12) {
+        throw std::invalid_argument("inventory grid step must be exactly 1.0");
+    }
 
+    const double rounded_qmax = std::round(qmax);
+    if (std::abs(qmax - rounded_qmax) > 1e-12) {
+        throw std::invalid_argument("inventory maxAbs must be an integer on the uniform 1M grid");
+    }
+
+    const int n = static_cast<int>(rounded_qmax);
     std::vector<double> states;
-    states.reserve(2 * positive.size() - 1);
-    for (auto it = positive.rbegin(); it != positive.rend() - 1; ++it) states.push_back(-*it);
-    states.insert(states.end(), positive.begin(), positive.end());
+    states.reserve(static_cast<std::size_t>(2 * n + 1));
+    for (int q = -n; q <= n; ++q) states.push_back(static_cast<double>(q));
     return states;
 }
 

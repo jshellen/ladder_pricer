@@ -5,8 +5,7 @@ from trinity.ui_config import build_config, checked
 def ui_values_from_default():
     cfg = default_config()
     values = {
-        "grid-mode": cfg["grid"]["mode"], "qmax": cfg["grid"]["maxAbs"], "qstep": cfg["grid"]["step"],
-        "qfinehalf": cfg["grid"]["fineHalfWidth"], "qfinestep": cfg["grid"]["fineStep"], "qcoarsestep": cfg["grid"]["coarseStep"],
+        "qmax": cfg["grid"]["maxAbs"],
         "spot": cfg["spot"], "spread": cfg["spreadPips"], "drift": cfg["spotDrift"],
         "sigma": cfg["sigmaPips"], "gamma": cfg["gamma"],
         "tau0": cfg["internalization"]["tau0"], "tau1": cfg["internalization"]["tau1"], "tau2": cfg["internalization"]["tau2"],
@@ -58,7 +57,14 @@ def test_checked_dash_checklist_values():
 def test_passive_ecn_uses_fixed_dense_delta_grid():
     cfg = build_config(ui_values_from_default())
     deltas = cfg["passiveEcn"]["deltas"]
-    assert len(deltas) == 101
+    assert len(deltas) == 201
     assert deltas[0] == -0.50
     assert deltas[-1] == 0.50
-    assert all(abs((b - a) - 0.01) < 1e-12 for a, b in zip(deltas, deltas[1:]))
+    assert all(abs((b - a) - 0.005) < 1e-12 for a, b in zip(deltas, deltas[1:]))
+
+
+def test_inventory_grid_is_fixed_uniform_one_million():
+    values = ui_values_from_default()
+    values["qmax"] = 25
+    cfg = build_config(values)
+    assert cfg["grid"] == {"mode": "uniform", "maxAbs": 25.0, "step": 1.0}

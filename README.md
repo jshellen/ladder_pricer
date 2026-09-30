@@ -25,7 +25,7 @@ The C++17 library contains:
 - hidden inventory solve buffer;
 - saturating adverse-selection markout;
 - dark-pool controls;
-- optional Crisafi-style passive ECN hedge control: `NONE` or one of 101 tier-style quote deltas from −0.50 to +0.50 in 0.01 increments, using the exact same `LogisticFlow` fill dynamics and delta convention as customer tiers, with strictly risk-reducing fills;
+- optional Crisafi-style passive ECN hedge control: `NONE` or one of 201 tier-style quote deltas from −0.50 to +0.50 in 0.005 increments, using the exact same `LogisticFlow` fill dynamics and delta convention as customer tiers, with strictly risk-reducing fills;
 - event-driven fills with an independent continuous market-price process;
 - corrected impact-aware closed-form terminal PnL mean and standard deviation.
 
@@ -249,4 +249,8 @@ The Policy → Dark pool tab mirrors the Streamlit-style diagnostic layout: plot
 
 ### UI diagnostics
 
-- **Passive ECN diagnostics** mirror Tier Diagnostics where applicable: parameters, flow curves, hit ratios, implied hit ratios vs inventory, quotes vs inventory, and the discrete optimal delta policy. The ECN action grid is fixed at −0.50 to +0.50 in 0.01 increments (plus `NONE`).
+- **Passive ECN diagnostics** mirror Tier Diagnostics where applicable: parameters, flow curves, hit ratios, implied hit ratios vs inventory, quotes vs inventory, and the discrete optimal delta policy. The ECN action grid is fixed at −0.50 to +0.50 in 0.005 increments (plus `NONE`).
+- **Inventory grid** is fixed to uniform 1M spacing; only the maximum absolute inventory is configurable.
+
+
+- Inventory grid is fixed to a uniform 1M spacing from `-maxAbs` to `+maxAbs`; the nonuniform/piecewise grid has been removed from the production and reference comparison paths.

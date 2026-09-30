@@ -19,29 +19,22 @@ import ladder_pricer as ref  # noqa: E402
 from trinity import Engine, default_config  # noqa: E402
 
 
-def piecewise_grid(max_abs: float, fine_half_width: float, fine_step: float, coarse_step: float) -> list[float]:
-    inner = np.arange(0.0, fine_half_width + 0.5 * fine_step, fine_step, dtype=float)
-    inner = inner[inner <= fine_half_width + 1e-12]
-    outer = np.arange(fine_half_width + coarse_step, max_abs + 0.5 * coarse_step, coarse_step, dtype=float)
-    outer = outer[outer <= max_abs + 1e-12]
-    pos = np.unique(np.round(np.concatenate((inner, outer)), 12))
-    if not np.isclose(pos[-1], max_abs, atol=1e-10, rtol=0.0):
-        pos = np.append(pos, max_abs)
-    return np.concatenate((-pos[:0:-1], pos)).tolist()
+def uniform_grid(max_abs: float, step: float = 1.0) -> list[float]:
+    if abs(step - 1.0) > 1e-12:
+        raise ValueError("Reference comparison expects the fixed 1M inventory step.")
+    n = int(round(max_abs))
+    if abs(max_abs - n) > 1e-12:
+        raise ValueError("maxAbs must be an integer on the uniform 1M grid.")
+    return [float(q) for q in range(-n, n + 1)]
 
 
 def reference_solver_from_config(cfg: dict) -> ref.HJBLadderSolver:
     grid_cfg = cfg["grid"]
-    if grid_cfg["mode"] != "piecewise":
-        raise NotImplementedError("Comparison helper currently expects the default piecewise grid.")
+    if grid_cfg["mode"] != "uniform":
+        raise NotImplementedError("Comparison helper expects the production uniform inventory grid.")
 
     solver_config = ref.SolverConfig(
-        q_grid=piecewise_grid(
-            float(grid_cfg["maxAbs"]),
-            float(grid_cfg["fineHalfWidth"]),
-            float(grid_cfg["fineStep"]),
-            float(grid_cfg["coarseStep"]),
-        ),
+        q_grid=uniform_grid(float(grid_cfg["maxAbs"]), float(grid_cfg["step"])),
         spot=float(cfg["spot"]),
         spot_drift=float(cfg["spotDrift"]),
         spread=float(cfg["spreadPips"]) / 10_000.0,
