@@ -21,6 +21,40 @@ std::vector<double> grid() {
 }
 
 int main() {
+
+    // Dark-pool ZIP transition rates must represent an exogenous arrival clock
+    // followed by X~ZIP and F=min(X,u).  Positive fill rates therefore sum to
+    // lambda*(1-p0), and the full-fill bucket absorbs the entire upper tail.
+    {
+        const double lambda = 2.0;
+        const double mu = 2.0;
+        const double p0 = 0.25;
+        ZeroInflatedPoissonArrival dist(lambda, mu, p0);
+        const auto rates = dist.fill_rates(2);
+        assert(rates.size() == 2);
+        const double sum_rates = rates[0].second + rates[1].second;
+        assert(std::abs(sum_rates - lambda * (1.0 - p0)) < 1e-12);
+
+        const double pzero = std::exp(-mu);
+        const double positive_norm = 1.0 - pzero;
+        const double p1_cond = (pzero * mu) / positive_norm;
+        const double expected_full = lambda * (1.0 - p0) * (1.0 - p1_cond);
+        assert(std::abs(rates[1].second - expected_full) < 1e-12);
+
+        std::mt19937_64 rng(123456);
+        int zeros = 0;
+        long long positive_sum = 0;
+        int positives = 0;
+        constexpr int draws = 200000;
+        for (int n=0; n<draws; ++n) {
+            const int x = dist.sample_incoming_size(rng);
+            if (x == 0) ++zeros; else { ++positives; positive_sum += x; }
+        }
+        const double zero_freq = static_cast<double>(zeros) / draws;
+        assert(std::abs(zero_freq - p0) < 0.01);
+        assert(positives > 0);
+        assert(static_cast<double>(positive_sum) / positives > 2.0);
+    }
     std::vector<double> sizes{1,2,3,5,10,20};
     std::vector<Tier> tiers;
     tiers.emplace_back("Tier 1", sizes,
@@ -63,7 +97,7 @@ int main() {
     assert(a.times == b.times);
     assert(a.inventories == b.inventories);
     assert(a.spots.size() == b.spots.size());
-    assert(a.spots.size() > 20);  // 15-second market clock over 10 minutes.
+    assert(a.spots.size() > 500);  // One-second market clock over 10 minutes.
     bool moved = false;
     for (std::size_t i=1; i<a.spots.size(); ++i) {
         assert(std::abs(a.spots[i] - b.spots[i]) < 1e-12);

@@ -1,4 +1,4 @@
-"""Trinity 2.0 Python façade over the native C++ Howard engine."""
+"""Python façade over the native C++ Howard engine."""
 
 from .defaults import default_config
 

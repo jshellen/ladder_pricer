@@ -214,6 +214,22 @@ double LogisticFlow::optimal_delta(double size, double spread, double additive_v
     return b - (1.0 + w) / steepness_;
 }
 
+
+ExponentialFlow::ExponentialFlow(double a, double k) : a_(a), k_(k) {
+    require(a_ >= 0.0, "exponential A must be nonnegative");
+    require(k_ > 0.0, "exponential k must be positive");
+}
+
+double ExponentialFlow::arrival_rate(double delta) const {
+    // delta is quote distance from mid in pips. Under the marked ECN process,
+    // each side has market-trade arrival rate A and D~Exp(k), hence the quote
+    // fill intensity is A*P(D>=delta)=A*exp(-k*delta).
+    const double x = -k_ * delta;
+    if (x >= 709.0) return std::numeric_limits<double>::infinity();
+    if (x <= -745.0) return 0.0;
+    return a_ * std::exp(x);
+}
+
 SaturatingMarkout::SaturatingMarkout(double impact_scale, double size_exponent, double tau_minutes)
     : impact_scale_(impact_scale), size_exponent_(size_exponent), tau_minutes_(tau_minutes) {
     require(impact_scale_ >= 0.0, "markout impact scale must be nonnegative");
@@ -250,37 +266,19 @@ double QuadraticPenalty::value(double inventory) const noexcept {
 
 Tier::Tier(std::string name, std::vector<double> sizes, LogisticFlow flow,
            SaturatingMarkout markout, bool use_markout,
-           double delta_min, double delta_max)
+           double delta_min, double delta_max, double fee)
     : name_(std::move(name)), sizes_(std::move(sizes)), flow_(std::move(flow)),
       markout_(std::move(markout)), use_markout_(use_markout),
-      delta_min_(delta_min), delta_max_(delta_max) {
+      delta_min_(delta_min), delta_max_(delta_max), fee_(fee) {
     require(!name_.empty(), "tier name must not be empty");
     require_positive_increasing(sizes_, "tier sizes");
     require(delta_min_ <= delta_max_, "delta_min must not exceed delta_max");
+    require(fee_ >= 0.0, "tier fee must be nonnegative");
 }
 
 // ---------------------------------------------------------------------------
 // Dark pool
 // ---------------------------------------------------------------------------
-
-GeometricArrival::GeometricArrival(double intensity, double probability)
-    : intensity_(intensity), probability_(probability) {
-    require(intensity_ >= 0.0, "arrival intensity must be nonnegative");
-    require(probability_ > 0.0 && probability_ <= 1.0,
-            "geometric probability must lie in (0, 1]");
-}
-
-std::vector<std::pair<int, double>> GeometricArrival::fill_rates(int posted_size) const {
-    require(posted_size > 0, "posted size must be positive");
-    const double r = 1.0 - probability_;
-    std::vector<std::pair<int, double>> out;
-    out.reserve(static_cast<std::size_t>(posted_size));
-    for (int k = 1; k < posted_size; ++k) {
-        out.emplace_back(k, intensity_ * probability_ * std::pow(r, k - 1));
-    }
-    out.emplace_back(posted_size, intensity_ * std::pow(r, posted_size - 1));
-    return out;
-}
 
 ZeroInflatedPoissonArrival::ZeroInflatedPoissonArrival(double intensity, double mean,
                                                        double zero_probability)
@@ -293,37 +291,57 @@ ZeroInflatedPoissonArrival::ZeroInflatedPoissonArrival(double intensity, double 
 
 std::vector<std::pair<int, double>> ZeroInflatedPoissonArrival::fill_rates(int posted_size) const {
     require(posted_size > 0, "posted size must be positive");
-    std::vector<double> pmf(static_cast<std::size_t>(posted_size + 1), 0.0);
-    double p = std::exp(-mean_);
-    pmf[0] = p;
-    for (int k = 1; k <= posted_size; ++k) {
-        p *= mean_ / static_cast<double>(k);
-        pmf[static_cast<std::size_t>(k)] = p;
-    }
-    const double normalizer = std::accumulate(pmf.begin() + 1, pmf.end(), 0.0);
-    if (normalizer <= 1e-15) {
+
+    // Incoming dark-pool orders arrive at intensity_.  Their size is zero with
+    // probability p0; otherwise it is a zero-truncated Poisson(mean_).  If our
+    // posted size is u, the realized fill is min(X, u), so the u bucket absorbs
+    // the entire upper tail X >= u.
+    const double p_zero_pois = std::exp(-mean_);
+    const double positive_norm = 1.0 - p_zero_pois;
+    if (positive_norm <= 1e-15 || intensity_ <= 0.0 || zero_probability_ >= 1.0) {
         return {};
     }
-    const double scale = intensity_ * (1.0 - zero_probability_) / normalizer;
+
+    const double positive_mass = 1.0 - zero_probability_;
     std::vector<std::pair<int, double>> out;
     out.reserve(static_cast<std::size_t>(posted_size));
-    for (int k = 1; k <= posted_size; ++k) {
-        out.emplace_back(k, scale * pmf[static_cast<std::size_t>(k)]);
+
+    double cumulative_positive = 0.0;
+    double p = p_zero_pois;
+    for (int k = 1; k < posted_size; ++k) {
+        p *= mean_ / static_cast<double>(k);
+        const double conditional = p / positive_norm;
+        cumulative_positive += conditional;
+        const double rate = intensity_ * positive_mass * conditional;
+        if (rate > 0.0) out.emplace_back(k, rate);
     }
+
+    const double tail_conditional = std::max(0.0, 1.0 - cumulative_positive);
+    const double full_rate = intensity_ * positive_mass * tail_conditional;
+    if (full_rate > 0.0) out.emplace_back(posted_size, full_rate);
     return out;
 }
 
-DarkPool::DarkPool(std::shared_ptr<ArrivalDistribution> bid_arrivals,
-                   std::shared_ptr<ArrivalDistribution> ask_arrivals,
-                   double bid_fee, double ask_fee,
+int ZeroInflatedPoissonArrival::sample_incoming_size(std::mt19937_64& rng) const {
+    std::uniform_real_distribution<double> uniform(0.0, 1.0);
+    if (uniform(rng) < zero_probability_) return 0;
+
+    std::poisson_distribution<int> poisson(mean_);
+    int size = 0;
+    do {
+        size = poisson(rng);
+    } while (size <= 0);
+    return size;
+}
+
+DarkPool::DarkPool(std::shared_ptr<ArrivalDistribution> arrivals,
+                   double fee,
                    std::vector<double> posted_sizes,
-                   bool allow_both_sides,
                    double min_fill_value)
-    : bid_arrivals_(std::move(bid_arrivals)), ask_arrivals_(std::move(ask_arrivals)),
-      bid_fee_(bid_fee), ask_fee_(ask_fee), posted_sizes_(std::move(posted_sizes)),
-      allow_both_sides_(allow_both_sides), min_fill_value_(min_fill_value) {
-    require(bid_arrivals_ != nullptr && ask_arrivals_ != nullptr,
-            "dark-pool arrival distributions must not be null");
+    : arrivals_(std::move(arrivals)), fee_(fee),
+      posted_sizes_(std::move(posted_sizes)), min_fill_value_(min_fill_value) {
+    require(arrivals_ != nullptr, "dark-pool arrival distribution must not be null");
+    require(fee_ >= 0.0, "dark-pool fee must be nonnegative");
     require_positive_increasing(posted_sizes_, "dark-pool posted sizes");
     for (double u : posted_sizes_) {
         require(std::abs(u - std::round(u)) <= kTolerance,
@@ -331,27 +349,25 @@ DarkPool::DarkPool(std::shared_ptr<ArrivalDistribution> bid_arrivals,
     }
 }
 
-const ArrivalDistribution& DarkPool::arrivals(Side side) const {
-    return side == Side::Bid ? *bid_arrivals_ : *ask_arrivals_;
-}
-
-double DarkPool::fee(Side side) const noexcept {
-    return side == Side::Bid ? bid_fee_ : ask_fee_;
-}
-
 bool DarkPool::side_allowed(double inventory, Side side) const noexcept {
-    if (allow_both_sides_) {
-        return true;
-    }
     return (inventory > kTolerance && side == Side::Ask) ||
            (inventory < -kTolerance && side == Side::Bid);
 }
 
-PassiveECN::PassiveECN(std::vector<double> deltas, LogisticFlow flow,
+bool DarkPool::risk_reducing(double inventory, Side side, double size) const noexcept {
+    if (size <= 0.0 || !side_allowed(inventory, side)) return false;
+    const double change = direction(side) * size;
+    const double after = inventory + change;
+    return std::abs(after) <= std::abs(inventory) + kTolerance &&
+           inventory * after >= -kTolerance;
+}
+
+PassiveECN::PassiveECN(std::vector<double> deltas, ExponentialFlow flow,
                        double quote_size, double maker_fee)
     : deltas_(std::move(deltas)), flow_(std::move(flow)),
       quote_size_(quote_size), maker_fee_(maker_fee) {
     require(!deltas_.empty(), "passive ECN deltas must not be empty");
+    require(deltas_.front() >= -kTolerance, "passive ECN distances must be nonnegative");
     require(quote_size_ > 0.0, "passive ECN quote size must be positive");
     require(maker_fee_ >= 0.0, "passive ECN maker fee must be nonnegative");
     for (std::size_t i = 1; i < deltas_.size(); ++i) {
@@ -369,8 +385,6 @@ bool PassiveECN::risk_reducing(double inventory, Side side, double size) const n
     if (size <= 0.0 || !side_allowed(inventory, side)) return false;
     const double change = direction(side) * size;
     const double after = inventory + change;
-    // Crisafi-style ECN controls are hedges only: an ECN fill may not cross through
-    // zero and create a position on the other side.
     return std::abs(after) <= std::abs(inventory) + kTolerance &&
            inventory * after >= -kTolerance;
 }
@@ -500,7 +514,7 @@ std::vector<double> PolicyBuilder::build_ladder(const Tier& tier,
         const double markout = tier.use_markout()
             ? tier.markout().expected(z, problem_.internalization_time().value(q_next))
             : 0.0;
-        const double additive = -z * markout + grid.interpolate(value, q_next) - hq;
+        const double additive = -z * (markout + tier.fee()) + grid.interpolate(value, q_next) - hq;
         const double unconstrained = tier.flow().optimal_delta(z, problem_.spread(), additive);
         row.push_back(std::clamp(unconstrained, lower, upper));
     }
@@ -536,7 +550,7 @@ double PolicyBuilder::ladder_hamiltonian(const Tier& tier,
             : 0.0;
         const double delta = row_values[j];
         const double rate = tier.flow().arrival_rate(delta, z);
-        total += rate * (z * problem_.spread() * (0.5 - delta)
+        total += rate * (z * (problem_.spread() * (0.5 - delta) - tier.fee())
                          - z * markout
                          + grid.interpolate(value, q_next) - hq);
     }
@@ -609,12 +623,12 @@ Policy PolicyBuilder::initial_policy() const {
         if (!venue.posted_sizes().empty()) {
             const double u = venue.posted_sizes().back();
             for (std::size_t i = 0; i < q_grid.size(); ++i) {
-                if (q_grid[i] < 0.0 && venue.side_allowed(q_grid[i], Side::Bid) &&
+                if (q_grid[i] < 0.0 && venue.risk_reducing(q_grid[i], Side::Bid, u) &&
                     problem_.grid().admissible(q_grid[i], u)) {
                     p.bid_size[i] = u;
                     p.bid_active[i] = true;
                 }
-                if (q_grid[i] > 0.0 && venue.side_allowed(q_grid[i], Side::Ask) &&
+                if (q_grid[i] > 0.0 && venue.risk_reducing(q_grid[i], Side::Ask, u) &&
                     problem_.grid().admissible(q_grid[i], -u)) {
                     p.ask_size[i] = u;
                     p.ask_active[i] = true;
@@ -659,7 +673,8 @@ DarkPoolPolicy PolicyBuilder::improve_dark_pool(const std::vector<double>& value
             double best_value = -std::numeric_limits<double>::infinity();
             for (double u_raw : venue.posted_sizes()) {
                 const int u = static_cast<int>(std::llround(u_raw));
-                if (!problem_.grid().admissible(q, dir * u_raw)) {
+                if (!venue.risk_reducing(q, side, u_raw) ||
+                    !problem_.grid().admissible(q, dir * u_raw)) {
                     continue;
                 }
                 double candidate = 0.0;
@@ -705,8 +720,8 @@ PassiveECNPolicy PolicyBuilder::improve_passive_ecn(const std::vector<double>& v
             bool active = false;
             for (std::size_t j = 0; j < venue.deltas().size(); ++j) {
                 const double delta = venue.deltas()[j];
-                const double rate = venue.flow().arrival_rate(delta, z);
-                const double edge = z * (problem_.spread() * (0.5 - delta) - venue.maker_fee());
+                const double rate = venue.flow().arrival_rate(delta);
+                const double edge = z * (delta / 10000.0 - venue.maker_fee());
                 const double candidate = rate * (edge + problem_.grid().interpolate(value, q + dir * z) - hq);
                 if (candidate > best_value + kTolerance) {
                     best_value = candidate;
@@ -871,7 +886,7 @@ std::vector<double> BellmanModel::rhs(const std::vector<double>& value, const Po
                     const double markout = tier.use_markout()
                         ? tier.markout().expected(z, problem_.internalization_time().value(q_next))
                         : 0.0;
-                    const double fill_value = z * problem_.spread() * (0.5 - delta)
+                    const double fill_value = z * (problem_.spread() * (0.5 - delta) - tier.fee())
                                             - z * markout
                                             + grid.interpolate(value, q_next) - hq;
                     total += rate * fill_value;
@@ -903,9 +918,9 @@ std::vector<double> BellmanModel::rhs(const std::vector<double>& value, const Po
                 const bool active = side == Side::Bid ? p.bid_active[i] : p.ask_active[i];
                 const double depth = side == Side::Bid ? p.bid_depth[i] : p.ask_depth[i];
                 if (!active) continue;
-                const double rate = venue.flow().arrival_rate(depth, z);
+                const double rate = venue.flow().arrival_rate(depth);
                 const double dir = direction(side);
-                const double edge = z * (problem_.spread() * (0.5 - depth) - venue.maker_fee());
+                const double edge = z * (depth / 10000.0 - venue.maker_fee());
                 total += rate * (edge + grid.interpolate(value, q + dir * z) - hq);
             }
         }

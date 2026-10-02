@@ -1,6 +1,6 @@
-# Trinity 2.0 — C++ Howard engine + Python + Dash
+# FX Ladder Pricer — C++ Howard engine + Python + Dash
 
-This is the Python/Dash application architecture for the Trinity ladder pricer:
+This is the Python/Dash application architecture for the FX ladder pricer:
 
 ```text
 C++ pricing engine
@@ -24,8 +24,9 @@ The C++17 library contains:
 - inventory ladder level/gap constraints;
 - hidden inventory solve buffer;
 - saturating adverse-selection markout;
+- per-tier trading fees that enter quote optimization, analytical PnL and Monte Carlo PnL;
 - dark-pool controls;
-- optional Crisafi-style passive ECN hedge control: `NONE` or one of 201 tier-style quote deltas from −0.50 to +0.50 in 0.005 increments, using the exact same `LogisticFlow` fill dynamics and delta convention as customer tiers, with strictly risk-reducing fills;
+- optional Crisafi-style passive ECN hedge control: `NONE` or a quote distance from the moving mid/reference in pips. The default action grid runs from 0 to 20 pips in 0.5-pip increments, and ECN fills are strictly risk-reducing;
 - event-driven fills with an independent continuous market-price process;
 - corrected impact-aware closed-form terminal PnL mean and standard deviation.
 
@@ -58,21 +59,26 @@ The application has three main work areas:
 - convergence diagnostics;
 - continuation value `h(q)` and internalization-time overview;
 - Streamlit-style Tier Diagnostics presented as a single vertical stack of collapsible sections;
-- diagnostic order: tier parameters → flow curves → hit ratios → implied hit ratios → markouts → quotes vs inventory → bid surface → ask surface → volume premium / ladder table;
-- consistent side colors throughout diagnostics: **bid = blue**, **ask = red**.
+- diagnostic order: tier parameters → exogenous RFQ arrival intensity → won-trade intensity → win probabilities → implied win probabilities → markouts → quotes vs inventory → bid surface → ask surface → volume premium / ladder table;
+- consistent side colors throughout diagnostics: **bid = blue**, **ask = red**;
+- each tier exposes a configurable **Fee [pips]**. The fill edge is `size * (spread * (0.5 - delta) - fee)`, so fees directly influence the solved quote ladder as well as realized/analytical PnL.
 
 ### Passive ECN hedge
 
 The optional passive ECN module is deliberately reduced-form and does not use `xfills`.
-It uses the exact same `LogisticFlow::arrival_rate(delta, size)` fill dynamics as a customer
-tier. The user supplies the usual tier-style flow parameters and a discrete set of allowed
-quote deltas. The delta convention is identical to tiers: `delta = 0` quotes at touch,
-positive delta improves/tightens the quote, and negative delta widens beyond touch.
-At every inventory state the Howard improvement compares `NONE` with each supplied delta.
+ECN quotes use their own coordinate system: `delta` is the absolute distance from the moving
+mid/reference, measured directly in pips. Buy and sell ECN market trades are modeled as two
+independent Poisson processes, each with exogenous rate `A`. When a market trade arrives, its
+distance `D` from mid is sampled from `Exp(k)`. An active quote at depth `delta` fills iff
+`D >= delta`, so the implied quote-fill intensity is exactly
+`lambda_fill(delta) = A exp(-k delta)`. Defaults are `A=0.15` trades/min **per side** and
+`k=0.24 1/pip`. The optimizer evaluates `NONE` plus a 0.5-pip grid between configurable
+`minDistancePips` and `maxDistancePips`, which default to 0 and 20 pips.
+At every inventory state the Howard improvement compares `NONE` with every allowed distance.
 ECN quotes are hedge-only: positive inventory may only post an ask, negative inventory may
 only post a bid, flat inventory posts nothing, and a fill is never allowed to cross through
-zero and create risk on the opposite side. The ECN execution edge is also computed with the
-same tier formula, `size * spread * (0.5 - delta)`, less any configured maker fee.
+zero and create risk on the opposite side. A passive ECN fill at distance `delta` earns
+`size * (delta pips - maker fee)` before continuation-value effects.
 
 ### Monte Carlo
 
@@ -81,17 +87,22 @@ same tier formula, `size * spread * (0.5 - delta)`, less any configured maker fe
 - PnL histogram;
 - inventory median + 95% interval;
 - retained path inventory and spot/fill plots;
-- retained spot paths evolve on an internal 15-second market clock even between fills;
+- retained spot paths evolve on an internal one-second market clock even between fills;
 - separate event/spot RNG streams keep fills and PnL invariant to UI sampling density;
 - fill tape.
 
 ## Monte Carlo market clock
 
 RFQ and dark-pool fills remain asynchronous continuous-time events, but the spot
-process is not tied to those events. The production C++ simulator advances spot
-on an internal 15-second market clock using the configured Brownian volatility,
+process is not tied to those events. Retained paths shown in the UI advance spot
+on an internal one-second market clock using the configured Brownian volatility,
 exogenous drift and outstanding exponential markout impulses. Fill events can
-occur between those market ticks and are inserted at their exact event times.
+occur between those one-second ticks and are inserted at their exact event times.
+
+For performance, non-retained Monte Carlo paths propagate spot directly from one
+fill event to the next. Under the current Brownian + deterministic drift/markout
+dynamics this is mathematically equivalent in distribution to subdividing every
+interval into one-second steps, while avoiding a large runtime penalty.
 
 The event-arrival RNG and spot RNG are independent. The regular inventory/output
 sampling grid therefore affects only what is returned to the UI; changing
@@ -194,7 +205,7 @@ python_reference/
 └── README.md
 ```
 
-It is outside the normal `python/` package tree, so installing/running Trinity does not import it.
+It is outside the normal `python/` package tree, so installing/running the application does not import it.
 
 To run its tests explicitly:
 
@@ -240,7 +251,7 @@ Dash control values are converted to the numerical model by component ID in
 `python/trinity/ui_config.py`. The model configuration no longer depends on the
 positional ordering of callback states, so adding or reordering UI controls does
 not silently shift tier parameters. The regression tests in
-`tests/test_ui_config.py` cover the markout checkbox / impact-parameter mapping.
+`tests/test_ui_config.py` cover the markout checkbox / impact-parameter mapping and tier-fee mapping.
 
 ### Dark-pool diagnostics layout
 
@@ -249,8 +260,38 @@ The Policy → Dark pool tab mirrors the Streamlit-style diagnostic layout: plot
 
 ### UI diagnostics
 
-- **Passive ECN diagnostics** mirror Tier Diagnostics where applicable: parameters, flow curves, hit ratios, implied hit ratios vs inventory, quotes vs inventory, and the discrete optimal delta policy. The ECN action grid is fixed at −0.50 to +0.50 in 0.005 increments (plus `NONE`).
+- **Passive ECN diagnostics** show exponential-flow parameters, the flow curve, relative intensity, optimal trade intensity vs inventory, quotes vs inventory, and the discrete optimal distance policy. The ECN action grid is configurable from min to max distance from mid in fixed 0.5-pip increments (plus `NONE`).
 - **Inventory grid** is fixed to uniform 1M spacing; only the maximum absolute inventory is configurable.
 
 
 - Inventory grid is fixed to a uniform 1M spacing from `-maxAbs` to `+maxAbs`; the nonuniform/piecewise grid has been removed from the production and reference comparison paths.
+
+
+### Passive ECN exponential flow
+
+Passive ECN market trades arrive independently on the buy and sell sides at rate `A`. Their distance from mid is `D ~ Exp(k)`, so an active quote at depth `delta` has fill intensity `lambda_fill(delta)=A exp(-k delta)`. Defaults: A=0.15 trades/min per side, k=0.24 1/pip, and a 0-to-20-pip quote grid in 0.5-pip increments.
+
+
+## Dark pool model
+
+The dark pool uses an exogenous incoming-order process on each side. Incoming sell orders
+arrive at `lambda` and can hit our posted bid; incoming buy orders arrive at
+`lambda` and can hit our posted ask. At each arrival, incoming size `X` is sampled
+from the zero-inflated model: size zero with probability `p0`, otherwise a
+zero-truncated Poisson with mean parameter `mu`. If our posted size is `u`, the
+realized fill is `min(X, u)`. Thus an incoming 3M order fills 3M of a 5M post, while
+an incoming 5M order fills all of a 1M post. Dark-pool executions occur at mid.
+The HJB/analytics use the equivalent transition rates implied by this same capped-size
+mechanism. The previous geometric fill-size model has been removed.
+
+
+## Customer RFQs in Monte Carlo
+
+Customer tiers are simulated as a two-stage RFQ process.  For each tier, side,
+and requested size `z`, RFQs arrive exogenously at
+`lambda_RFQ(z) = A0 * z^(-theta - beta*z)`.  Once an RFQ arrives, the current
+quote determines the conditional win probability through the logistic curve.
+Only a won RFQ changes inventory and cash.  The RFQ markout shock is applied on
+every RFQ, including lost RFQs; for a won RFQ, inventory/cash are updated before
+the markout is applied.  The product `lambda_RFQ(z) * p_win(delta,z)` remains
+the won-trade intensity used by the current HJB/closed-form policy machinery.

@@ -23,6 +23,11 @@ double number(const py::dict& object, const char* key) {
     return py::cast<double>(object[py::str(key)]);
 }
 
+double optional_number(const py::dict& object, const char* key, double fallback) {
+    const py::str k(key);
+    return object.contains(k) ? py::cast<double>(object[k]) : fallback;
+}
+
 bool boolean(const py::dict& object, const char* key) {
     return py::cast<bool>(object[py::str(key)]);
 }
@@ -63,22 +68,12 @@ std::vector<double> build_grid(const py::dict& spec) {
 std::optional<DarkPool> build_dark_pool(const py::dict& cfg) {
     if (!boolean(cfg, "enabled")) return std::nullopt;
 
-    const std::string distribution = text(cfg, "distribution");
-    std::shared_ptr<ArrivalDistribution> bid;
-    std::shared_ptr<ArrivalDistribution> ask;
-    if (distribution == "geometric") {
-        bid = std::make_shared<GeometricArrival>(number(cfg, "lambdaBid"), number(cfg, "pBid"));
-        ask = std::make_shared<GeometricArrival>(number(cfg, "lambdaAsk"), number(cfg, "pAsk"));
-    } else if (distribution == "zip") {
-        bid = std::make_shared<ZeroInflatedPoissonArrival>(number(cfg, "lambdaBid"), number(cfg, "muBid"), number(cfg, "p0Bid"));
-        ask = std::make_shared<ZeroInflatedPoissonArrival>(number(cfg, "lambdaAsk"), number(cfg, "muAsk"), number(cfg, "p0Ask"));
-    } else {
-        throw std::invalid_argument("dark-pool distribution must be 'geometric' or 'zip'");
-    }
+    std::shared_ptr<ArrivalDistribution> arrivals = std::make_shared<ZeroInflatedPoissonArrival>(
+        number(cfg, "lambda"), number(cfg, "mu"), number(cfg, "p0"));
 
     return DarkPool(
-        std::move(bid), std::move(ask), number(cfg, "feeBid"), number(cfg, "feeAsk"),
-        numbers(cfg[py::str("postedSizes")]), boolean(cfg, "allowBothSides"));
+        std::move(arrivals), number(cfg, "feePips") / 10000.0,
+        numbers(cfg[py::str("postedSizes")]));
 }
 
 std::optional<PassiveECN> build_passive_ecn(const py::dict& cfg) {
@@ -86,8 +81,7 @@ std::optional<PassiveECN> build_passive_ecn(const py::dict& cfg) {
     const py::dict flow = py::cast<py::dict>(cfg[py::str("flow")]);
     return PassiveECN(
         numbers(cfg[py::str("deltas")]),
-        LogisticFlow(number(flow, "A0"), number(flow, "theta"), number(flow, "beta"),
-                     number(flow, "shift"), number(flow, "steepness"), number(flow, "volumeShift")),
+        ExponentialFlow(number(flow, "A"), number(flow, "k")),
         number(cfg, "quoteSize"), number(cfg, "makerFeePips") / 10000.0);
 }
 
@@ -105,7 +99,8 @@ PricingProblem build_problem(const py::dict& cfg, std::optional<double> gamma_ov
                          number(flow, "shift"), number(flow, "steepness"), number(flow, "volumeShift")),
             SaturatingMarkout(number(markout, "impactScalePips") / 10000.0,
                               number(markout, "sizeExponent"), number(markout, "tauMinutes")),
-            boolean(tier, "useMarkout"), number(tier, "deltaMin"), number(tier, "deltaMax"));
+            boolean(tier, "useMarkout"), number(tier, "deltaMin"), number(tier, "deltaMax"),
+            optional_number(tier, "feePips", 0.0) / 10000.0);
     }
     if (tiers.empty() && !boolean(py::cast<py::dict>(cfg[py::str("darkPool")]), "enabled")
         && !boolean(py::cast<py::dict>(cfg[py::str("passiveEcn")]), "enabled")) {
@@ -151,6 +146,7 @@ py::dict solution_value(const Solution& solution, const PricingProblem& problem)
         tier["sizes"] = solution.tier_policies[k].sizes;
         tier["bid"] = matrix_value(solution.tier_policies[k].bid);
         tier["ask"] = matrix_value(solution.tier_policies[k].ask);
+        tier["feePips"] = problem.tiers()[k].fee() * 10000.0;
         tier_values.append(std::move(tier));
     }
     out["tiers"] = std::move(tier_values);
@@ -164,13 +160,9 @@ py::dict solution_value(const Solution& solution, const PricingProblem& problem)
         dark["bidActive"] = policy.bid_active;
         dark["askActive"] = policy.ask_active;
         dark["postedSizes"] = problem.dark_pool()->posted_sizes();
-        dark["allowBothSides"] = problem.dark_pool()->allow_both_sides();
-        dark["bidIntensity"] = problem.dark_pool()->arrivals(Side::Bid).arrival_intensity();
-        dark["askIntensity"] = problem.dark_pool()->arrivals(Side::Ask).arrival_intensity();
-        dark["bidDistribution"] = problem.dark_pool()->arrivals(Side::Bid).name();
-        dark["askDistribution"] = problem.dark_pool()->arrivals(Side::Ask).name();
-        dark["bidFee"] = problem.dark_pool()->fee(Side::Bid);
-        dark["askFee"] = problem.dark_pool()->fee(Side::Ask);
+        dark["intensity"] = problem.dark_pool()->arrivals(Side::Bid).arrival_intensity();
+        dark["distribution"] = problem.dark_pool()->arrivals(Side::Bid).name();
+        dark["feePips"] = problem.dark_pool()->fee(Side::Bid) * 10000.0;
         out["darkPool"] = std::move(dark);
     } else {
         out["darkPool"] = py::none();
@@ -189,7 +181,7 @@ py::dict solution_value(const Solution& solution, const PricingProblem& problem)
         std::vector<double> fill_rates;
         fill_rates.reserve(venue.deltas().size());
         for (double delta : venue.deltas()) {
-            fill_rates.push_back(venue.flow().arrival_rate(delta, venue.quote_size()));
+            fill_rates.push_back(venue.flow().arrival_rate(delta));
         }
         ecn["fillRates"] = fill_rates;
         ecn["quoteSize"] = venue.quote_size();
@@ -223,14 +215,34 @@ py::dict fill_value(const FillEvent& fill) {
     return out;
 }
 
+
+py::dict ecn_arrival_value(const EcnArrivalEvent& event) {
+    py::dict out;
+    out["time"] = event.time_minutes;
+    out["side"] = event.side;
+    out["referencePrice"] = event.reference_price;
+    out["tradeDistancePips"] = event.trade_distance_pips;
+    out["tradePrice"] = event.trade_price;
+    out["quoteDepthPips"] = event.quote_depth_pips;
+    // Backward-compatible alias used by older UI code.
+    out["depthPips"] = event.quote_depth_pips;
+    out["quoteActive"] = event.quote_active;
+    out["won"] = event.won;
+    return out;
+}
+
 py::dict path_value(const SamplePath& path) {
     py::dict out;
     out["times"] = path.times;
     out["spots"] = path.spots;
     out["inventories"] = path.inventories;
+    out["cashes"] = path.cashes;
     py::list fills;
     for (const auto& fill : path.fills) fills.append(fill_value(fill));
     out["fills"] = std::move(fills);
+    py::list ecn_arrivals;
+    for (const auto& event : path.ecn_arrivals) ecn_arrivals.append(ecn_arrival_value(event));
+    out["ecnArrivals"] = std::move(ecn_arrivals);
     return out;
 }
 
@@ -356,7 +368,7 @@ private:
 }  // namespace ladder_pricer::python
 
 PYBIND11_MODULE(_native, module) {
-    module.doc() = "Trinity 2.0 C++ Howard pricing engine";
+    module.doc() = "C++ Howard pricing engine";
     py::class_<ladder_pricer::python::Engine>(module, "Engine")
         .def(py::init<py::dict>())
         .def("solve", &ladder_pricer::python::Engine::solve)

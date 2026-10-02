@@ -139,7 +139,7 @@ PnlStatistics PnlAnalytics::statistics(double horizon, double sigma, double q0) 
                     const double rate=tier.flow().arrival_rate(deltas[j],z);
                     if(rate<=0.0) continue;
                     std::vector<double> shift(nvars,0.0);
-                    shift[static_cast<std::size_t>(pnlvar)]=z*problem_.spread()*(0.5-deltas[j]);
+                    shift[static_cast<std::size_t>(pnlvar)]=z*(problem_.spread()*(0.5-deltas[j])-tier.fee());
                     if(tier.use_markout()) shift[static_cast<std::size_t>(tau_to_var[tier.markout().tau_minutes()])]=-dir*tier.markout().asymptotic(z);
                     events.push_back({q+dir*z,rate,std::move(shift)});
                 }
@@ -150,7 +150,7 @@ PnlStatistics PnlAnalytics::statistics(double horizon, double sigma, double q0) 
             for(Side side:{Side::Bid,Side::Ask}){
                 const bool active=side==Side::Bid?p.bid_active[i]:p.ask_active[i];
                 const double posted=side==Side::Bid?p.bid_size[i]:p.ask_size[i];
-                if(!active || posted<=0.0) continue;
+                if(!active || posted<=0.0 || !venue.risk_reducing(q, side, posted)) continue;
                 const int u=static_cast<int>(std::llround(posted)); const double dir=direction(side);
                 for(const auto& [fill,rate]:venue.arrivals(side).fill_rates(u)){
                     if(rate<=0.0) continue;
@@ -166,10 +166,10 @@ PnlStatistics PnlAnalytics::statistics(double horizon, double sigma, double q0) 
                 const bool active=side==Side::Bid?p.bid_active[i]:p.ask_active[i];
                 const double depth=side==Side::Bid?p.bid_depth[i]:p.ask_depth[i];
                 if(!active) continue;
-                const double rate=venue.flow().arrival_rate(depth,z); const double dir=direction(side);
+                const double rate=venue.flow().arrival_rate(depth); const double dir=direction(side);
                 if(rate<=0.0) continue;
                 std::vector<double> shift(nvars,0.0);
-                shift[static_cast<std::size_t>(pnlvar)]=z*(problem_.spread()*(0.5-depth)-venue.maker_fee());
+                shift[static_cast<std::size_t>(pnlvar)]=z*(depth/10000.0-venue.maker_fee());
                 events.push_back({q+dir*z,rate,std::move(shift)});
             }
         }

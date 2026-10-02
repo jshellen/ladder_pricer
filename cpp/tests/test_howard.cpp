@@ -19,8 +19,8 @@ std::vector<double> grid() {
 
 int main() {
     {
-        PassiveECN ecn({-0.25, 0.0, 0.25, 0.5},
-            LogisticFlow(0.0155,0.144,0.0857,0.52,8.42,0.026), 1.0, 0.0);
+        PassiveECN ecn({0.0, 0.5, 1.0, 1.5},
+            ExponentialFlow(0.15, 0.24), 1.0, 0.0);
         assert(ecn.side_allowed(2.0, Side::Ask));
         assert(!ecn.side_allowed(2.0, Side::Bid));
         assert(ecn.side_allowed(-2.0, Side::Bid));
@@ -31,9 +31,34 @@ int main() {
         assert(!ecn.risk_reducing(0.5, Side::Ask, 1.0));  // cannot cross through flat
         assert(ecn.risk_reducing(-2.0, Side::Bid, 1.0));
         assert(!ecn.risk_reducing(-0.5, Side::Bid, 1.0));
-        // ECN uses exactly the same tier LogisticFlow: tighter (larger delta) quotes
-        // have higher arrival intensity under this convention.
-        assert(ecn.flow().arrival_rate(0.25, 1.0) > ecn.flow().arrival_rate(0.0, 1.0));
+        // ECN delta is distance from mid in pips: lambda(delta)=A exp(-k delta).
+        assert(std::abs(ecn.flow().arrival_rate(0.0) - 0.15) < 1e-15);
+        assert(ecn.flow().arrival_rate(0.5) < ecn.flow().arrival_rate(0.0));
+        assert(ecn.flow().arrival_rate(1.0) < ecn.flow().arrival_rate(0.5));
+        assert(std::abs(ecn.flow().arrival_rate(10.0) - 0.15 * std::exp(-2.4)) < 1e-15);
+    }
+    {
+        auto arrivals = std::make_shared<ZeroInflatedPoissonArrival>(0.0012, 2.9, 0.7172);
+        DarkPool dark(arrivals, 3e-4, {1.0, 2.0, 3.0, 4.0, 5.0});
+        assert(dark.side_allowed(2.0, Side::Ask));
+        assert(!dark.side_allowed(2.0, Side::Bid));
+        assert(dark.side_allowed(-2.0, Side::Bid));
+        assert(!dark.side_allowed(-2.0, Side::Ask));
+        assert(!dark.side_allowed(0.0, Side::Bid));
+        assert(!dark.side_allowed(0.0, Side::Ask));
+        assert(dark.risk_reducing(2.0, Side::Ask, 2.0));
+        assert(!dark.risk_reducing(2.0, Side::Ask, 3.0));
+        assert(dark.risk_reducing(-2.0, Side::Bid, 2.0));
+        assert(!dark.risk_reducing(-2.0, Side::Bid, 3.0));
+        assert(std::abs(dark.fee(Side::Bid) - dark.fee(Side::Ask)) < 1e-15);
+        assert(std::abs(dark.arrivals(Side::Bid).arrival_intensity() -
+                        dark.arrivals(Side::Ask).arrival_intensity()) < 1e-15);
+    }
+    {
+        Tier fee_tier("Fee tier", {1.0},
+            LogisticFlow(0.1,0.1,0.1,0.5,5.0,0.0),
+            SaturatingMarkout(0.0,0.5,0.5), false, -10.0, 100.0, 2e-4);
+        assert(std::abs(fee_tier.fee() - 2e-4) < 1e-15);
     }
     const std::vector<double> sizes{1,2,3,5,10,20};
     std::vector<Tier> tiers;

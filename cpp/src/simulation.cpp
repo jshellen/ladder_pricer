@@ -17,6 +17,8 @@ std::string side_name(Side side) { return side == Side::Bid ? "bid" : "ask"; }
 struct Event {
     bool dark = false;
     bool ecn = false;
+    bool tier_rfq = false;
+    bool ecn_quote_active = false;
     std::size_t tier = 0;
     Side side = Side::Bid;
     double size = 0.0;
@@ -53,19 +55,19 @@ double dark_posted(const DarkPoolPolicy& policy, Side side, double q) {
     return sizes[i];
 }
 
-std::vector<Event> events(const PricingProblem& problem, const Solution& solution, double q) {
+std::vector<Event> events(const PricingProblem& problem, const Solution& solution, double q, bool record_all_ecn_arrivals) {
     std::vector<Event> out;
     for (std::size_t k = 0; k < problem.tiers().size(); ++k) {
         const auto& tier = problem.tiers()[k];
         const auto& policy = solution.solve_tier_policies[k];
         for (Side side : {Side::Bid, Side::Ask}) {
-            const double dir = direction(side);
             for (std::size_t j = 0; j < tier.sizes().size(); ++j) {
                 const double z = tier.sizes()[j];
-                if (!problem.grid().admissible(q, dir * z)) continue;
+                // Customer RFQs arrive exogenously.  Our quote controls only the
+                // conditional win probability; it must not thin the RFQ event clock.
                 const double delta = policy_delta(policy, side, j, q);
-                const double rate = tier.flow().arrival_rate(delta, z);
-                if (rate > 0.0) out.push_back({false, false, k, side, z, delta, 0.0, rate});
+                const double rate = tier.flow().rfq_arrival_rate(z);
+                if (rate > 0.0) out.push_back({false, false, true, false, k, side, z, delta, tier.fee(), rate});
             }
         }
     }
@@ -75,11 +77,15 @@ std::vector<Event> events(const PricingProblem& problem, const Solution& solutio
         for (Side side : {Side::Bid, Side::Ask}) {
             const double dir = direction(side);
             const int u = static_cast<int>(std::llround(dark_posted(policy, side, q)));
-            if (u <= 0 || !problem.grid().admissible(q, dir * u)) continue;
-            for (const auto& [fill, rate] : venue.arrivals(side).fill_rates(u)) {
-                if (rate > 0.0 && problem.grid().admissible(q, dir * fill)) {
-                    out.push_back({true, false, 0, side, static_cast<double>(fill), 0.0, venue.fee(side), rate});
-                }
+            if (u <= 0 || !venue.risk_reducing(q, side, static_cast<double>(u)) ||
+                !problem.grid().admissible(q, dir * u)) continue;
+
+            // One exogenous market-order clock per side.  When it rings, the
+            // incoming order size is sampled from the ZIP distribution and the
+            // realized fill is min(incoming size, our posted size).
+            const double rate = venue.arrivals(side).arrival_intensity();
+            if (rate > 0.0) {
+                out.push_back({true, false, false, false, 0, side, static_cast<double>(u), 0.0, venue.fee(side), rate});
             }
         }
     }
@@ -88,13 +94,24 @@ std::vector<Event> events(const PricingProblem& problem, const Solution& solutio
         const auto& policy = *solution.solve_passive_ecn_policy;
         const std::size_t i = bracket_left(policy.q_grid, q);
         const double z = venue.quote_size();
+
+        // ECN market trades are a marked Poisson process. Buy and sell trades each
+        // arrive exogenously at rate A. Their distance D from mid is sampled later
+        // from Exp(k). An active passive quote at depth delta fills iff D >= delta,
+        // which implies lambda_fill(delta) = A * P(D >= delta) = A exp(-k delta).
+        // For retained paths we keep both sides even when no quote is active so the
+        // price chart can show market trades that we did not win. Hidden paths may
+        // omit an inactive side because it cannot affect inventory or PnL.
         for (Side side : {Side::Bid, Side::Ask}) {
-            const bool active = side == Side::Bid ? policy.bid_active[i] : policy.ask_active[i];
+            const bool policy_active = side == Side::Bid ? policy.bid_active[i] : policy.ask_active[i];
             const double depth = side == Side::Bid ? policy.bid_depth[i] : policy.ask_depth[i];
             const double dir = direction(side);
-            if (!active || !problem.grid().admissible(q, dir * z)) continue;
-            const double rate = venue.flow().arrival_rate(depth, z);
-            if (rate > 0.0) out.push_back({false, true, 0, side, z, depth, venue.maker_fee(), rate});
+            const bool quote_active = policy_active && problem.grid().admissible(q, dir * z);
+            if (!record_all_ecn_arrivals && !quote_active) continue;
+            const double rate = venue.flow().a();
+            if (rate > 0.0) {
+                out.push_back({false, true, false, quote_active, 0, side, z, depth, venue.maker_fee(), rate});
+            }
         }
     }
     return out;
@@ -139,10 +156,12 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
     }
     if (reference_spot_ <= 0.0) throw std::invalid_argument("reference spot must be positive");
 
-    // The market clock is deliberately independent of the UI/output sampling grid.
-    // Price therefore evolves even when no trade occurs, while changing sample_points
-    // cannot change fills, PnL, or the simulated spot path at event times.
-    constexpr double kMarketStepMinutes = 0.25;  // 15 seconds
+    // Retained paths use a one-second market clock for the interactive price/quote
+    // diagnostics. Non-retained paths can propagate spot exactly from event to event:
+    // with the current Brownian + deterministic drift/markout dynamics, subdividing an
+    // interval does not change its distribution and would only make large MC runs slower.
+    // The clock is independent of the inventory/output sampling grid.
+    constexpr double kMarketStepMinutes = 1.0 / 60.0;  // 1 second
     constexpr std::uint64_t kPathStride = 0x9e3779b97f4a7c15ULL;
     constexpr std::uint64_t kSpotSalt = 0xd1b54a32d192ed03ULL;
 
@@ -179,6 +198,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
             detailed.times.push_back(0.0);
             detailed.spots.push_back(spot);
             detailed.inventories.push_back(q);
+            detailed.cashes.push_back(cash);
         }
 
         // Inventory is piecewise constant, so confidence-band snapshots do not need
@@ -198,7 +218,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
         record_inventory_through(0.0);
 
         while (t < horizon - 1e-12) {
-            const auto ev = events(problem_, solution_, q);
+            const auto ev = events(problem_, solution_, q, retain);
             double total_rate = 0.0;
             for (const auto& e : ev) total_rate += e.rate;
 
@@ -213,10 +233,10 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                 }
             }
 
-            // Evolve the market on its own clock until the next asynchronous fill.
-            // Splitting Brownian motion and the exponential markout drift across these
-            // sub-intervals is exact in distribution; it is not tied to trade arrivals.
-            while (true) {
+            // Evolve retained (plotted) paths on the one-second market clock until the
+            // next asynchronous fill. Hidden MC paths skip these intermediate points and
+            // propagate exactly to the event time below, which is equivalent in law.
+            while (retain) {
                 while (kMarketStepMinutes * static_cast<double>(market_tick) <= t + 1e-12) {
                     ++market_tick;
                 }
@@ -232,6 +252,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                     detailed.times.push_back(t);
                     detailed.spots.push_back(spot);
                     detailed.inventories.push_back(q);
+                    detailed.cashes.push_back(cash);
                 }
             }
 
@@ -249,6 +270,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                     detailed.times.push_back(t);
                     detailed.spots.push_back(spot);
                     detailed.inventories.push_back(q);
+                    detailed.cashes.push_back(cash);
                 }
                 break;
             }
@@ -262,35 +284,122 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
 
             const double before = q;
             const double dir = direction(chosen->side);
-            double execution = spot;
-            if (!chosen->dark) {
-                // Passive ECN and customer tiers use exactly the same delta convention.
-                execution = chosen->side == Side::Bid
-                    ? spot - problem_.spread() * (0.5 - chosen->delta)
-                    : spot + problem_.spread() * (0.5 - chosen->delta);
-            }
-            if (chosen->side == Side::Bid) cash -= chosen->size * execution;
-            else cash += chosen->size * execution;
-            if (chosen->dark || chosen->ecn) cash -= chosen->fee * chosen->size;
-            q += dir * chosen->size;
-            ++trades;
 
-            if (!chosen->dark && !chosen->ecn) {
+            if (chosen->tier_rfq) {
                 const auto& tier = problem_.tiers()[chosen->tier];
+                const bool admissible = problem_.grid().admissible(q, dir * chosen->size);
+                const double p_win = admissible
+                    ? tier.flow().win_probability(chosen->delta, chosen->size)
+                    : 0.0;
+                const bool won = uniform(event_rng) < p_win;
+
+                double execution = spot;
+                if (won) {
+                    // Inventory/cash are updated first for a won RFQ.  The markout
+                    // shock below is then applied to the post-trade inventory state.
+                    execution = chosen->side == Side::Bid
+                        ? spot - problem_.spread() * (0.5 - chosen->delta)
+                        : spot + problem_.spread() * (0.5 - chosen->delta);
+                    if (chosen->side == Side::Bid) cash -= chosen->size * execution;
+                    else cash += chosen->size * execution;
+                    cash -= chosen->fee * chosen->size;
+                    q += dir * chosen->size;
+                    ++trades;
+                }
+
+                // An RFQ is an information event whether or not we win it.
                 if (tier.use_markout()) {
                     impacts[tier.markout().tau_minutes()] += -dir * tier.markout().asymptotic(chosen->size);
+                }
+
+                if (retain && won) {
+                    detailed.fills.push_back({t, tier.name(), side_name(chosen->side),
+                                              chosen->size, execution, before, q});
+                }
+            } else {
+                double execution = spot;
+                double executed_size = chosen->size;
+
+                if (chosen->dark) {
+                    const auto& venue = *problem_.dark_pool();
+                    const int incoming = venue.arrivals(chosen->side).sample_incoming_size(event_rng);
+                    const int posted = static_cast<int>(std::llround(chosen->size));
+                    executed_size = static_cast<double>(std::min(incoming, posted));
+                    if (executed_size <= 0.0) {
+                        // A dark-pool market-order arrival occurred, but the ZIP
+                        // size draw produced zero executable size.  Nothing is
+                        // filled and inventory/cash stay unchanged.
+                        record_inventory_through(t);
+                        if (retain) {
+                            detailed.times.push_back(t);
+                            detailed.spots.push_back(spot);
+                            detailed.inventories.push_back(q);
+                            detailed.cashes.push_back(cash);
+                        }
+                        continue;
+                    }
+                } else if (chosen->ecn) {
+                    const auto& venue = *problem_.passive_ecn();
+
+                    // A parent ECN market trade has arrived. Sample its distance D
+                    // from the contemporaneous mid/reference in pips. Because
+                    // D ~ Exp(k), P(D >= delta) = exp(-k delta), so an active quote
+                    // at depth delta has exactly the HJB fill intensity A exp(-k delta).
+                    std::exponential_distribution<double> distance_distribution(venue.flow().k());
+                    const double trade_distance_pips = distance_distribution(event_rng);
+                    const double signed_distance = trade_distance_pips / 10000.0;
+                    const double trade_price = chosen->side == Side::Bid
+                        ? spot - signed_distance
+                        : spot + signed_distance;
+                    const bool won = chosen->ecn_quote_active && trade_distance_pips + 1e-12 >= chosen->delta;
+
+                    if (retain) {
+                        detailed.ecn_arrivals.push_back({
+                            t, side_name(chosen->side), spot, trade_distance_pips, trade_price,
+                            chosen->delta, chosen->ecn_quote_active, won
+                        });
+                    }
+                    if (!won) {
+                        record_inventory_through(t);
+                        if (retain) {
+                            detailed.times.push_back(t);
+                            detailed.spots.push_back(spot);
+                            detailed.inventories.push_back(q);
+                            detailed.cashes.push_back(cash);
+                        }
+                        continue;
+                    }
+
+                    // We execute passively at our quote, not at the aggressor's limit.
+                    const double quote_distance = chosen->delta / 10000.0;
+                    execution = chosen->side == Side::Bid ? spot - quote_distance : spot + quote_distance;
+                }
+
+                if (chosen->dark && !problem_.dark_pool()->risk_reducing(q, chosen->side, executed_size)) {
+                    throw std::runtime_error("sampled dark-pool fill is not risk reducing");
+                }
+                if (!problem_.grid().admissible(q, dir * executed_size)) {
+                    throw std::runtime_error("sampled passive fill is not admissible");
+                }
+                if (chosen->side == Side::Bid) cash -= executed_size * execution;
+                else cash += executed_size * execution;
+                cash -= chosen->fee * executed_size;
+                q += dir * executed_size;
+                ++trades;
+
+                if (retain) {
+                    detailed.fills.push_back({t, chosen->dark ? "Dark pool" : "Passive ECN",
+                                              side_name(chosen->side), executed_size, execution, before, q});
                 }
             }
 
             if (retain) {
-                detailed.fills.push_back({t,
-                    chosen->dark ? "Dark pool" : (chosen->ecn ? "Passive ECN" : problem_.tiers()[chosen->tier].name()),
-                    side_name(chosen->side), chosen->size, execution, before, q});
-                // Keep an explicit event point so fills line up exactly with the price
-                // path and quote state even when they occur between market-clock ticks.
+                // Keep an explicit event point for every RFQ/fill so the price path also
+                // records markout shocks from RFQs that we did not win.
                 detailed.times.push_back(t);
                 detailed.spots.push_back(spot);
                 detailed.inventories.push_back(q);
+                detailed.cashes.push_back(cash);
             }
             record_inventory_through(t);
         }

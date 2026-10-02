@@ -18,11 +18,24 @@ struct FillEvent {
     double inventory_after = 0.0;
 };
 
+struct EcnArrivalEvent {
+    double time_minutes = 0.0;
+    std::string side;
+    double reference_price = 0.0;
+    double trade_distance_pips = 0.0;
+    double trade_price = 0.0;
+    double quote_depth_pips = 0.0;
+    bool quote_active = false;
+    bool won = false;
+};
+
 struct SamplePath {
     std::vector<double> times;
     std::vector<double> spots;
     std::vector<double> inventories;
+    std::vector<double> cashes;
     std::vector<FillEvent> fills;
+    std::vector<EcnArrivalEvent> ecn_arrivals;
 };
 
 struct MonteCarloResult {

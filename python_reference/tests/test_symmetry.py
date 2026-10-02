@@ -125,8 +125,10 @@ class TestDarkPoolPolicySymmetry(unittest.TestCase):
         dark_pool = lp.DarkPoolVenue(
             lambda_bid=2.0,
             lambda_ask=2.0,
-            p_bid=0.5,
-            p_ask=0.5,
+            mu_bid=2.0,
+            mu_ask=2.0,
+            p0_bid=0.1,
+            p0_ask=0.1,
             fee_per_unit_bid=0.0,
             fee_per_unit_ask=0.0,
             posted_sizes=[1, 2, 3, 5, 10, 20],

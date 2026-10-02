@@ -156,9 +156,10 @@ def _interp_weights_bounded(grid: Sequence[float], x: float) -> tuple[int, float
 class LogisticFlowCurve:
     """RFQ flow curve with all intensities expressed per minute.
 
-    ``A0`` is the per-minute intensity scale. ``arrival_rate(delta, z)``
-    returns the resulting fill intensity in fills per minute after applying
-    the size scaling and logistic hit ratio.
+    ``A0`` is the exogenous RFQ-arrival intensity scale. ``A(z)`` is the
+    customer RFQ arrival rate for size ``z``; the logistic curve is the
+    conditional probability that our quote wins that RFQ.  Their product,
+    ``arrival_rate(delta, z)``, is the derived won-trade intensity.
     """
     A0: float = 1.0
     theta: float = 0.0
@@ -183,8 +184,14 @@ class LogisticFlowCurve:
         e = math.exp(y) if y > -745.0 else 0.0
         return e / (1.0 + e)
 
+    def rfq_arrival_rate(self, z: float) -> float:
+        return self.A(z)
+
+    def win_probability(self, delta: float, z: float) -> float:
+        return self.hit_ratio(delta, z)
+
     def arrival_rate(self, delta: float, z: float) -> float:
-        return self.A(z) * self.hit_ratio(delta, z)
+        return self.rfq_arrival_rate(z) * self.win_probability(delta, z)
 
     @staticmethod
     def lambert_w_exp(x: float) -> float:
@@ -547,44 +554,6 @@ class ArrivalDistribution:
 
 
 @dataclass
-class GeometricArrivalDist(ArrivalDistribution):
-    lambda_: float = 1.0
-    p: float = 0.5
-
-    def __init__(self, lambda_: float = 1.0, p: float = 0.5, **kwargs):
-        if "lambda" in kwargs:
-            lambda_ = kwargs["lambda"]
-        self.lambda_ = float(lambda_)
-        self.p = float(p)
-        self.validate()
-
-    # Compatibility with pybind field named "lambda" via getattr/setattr.
-    def __getattr__(self, name: str):
-        if name == "lambda":
-            return self.lambda_
-        raise AttributeError(name)
-    def __setattr__(self, name: str, value):
-        if name == "lambda":
-            name = "lambda_"
-        object.__setattr__(self, name, value)
-
-    def validate(self) -> None:
-        if self.lambda_ < 0.0:
-            raise ValueError("lambda must be nonnegative")
-        if not (0.0 < self.p <= 1.0):
-            raise ValueError("p must lie in (0,1]")
-
-    def name(self) -> str:
-        return "geometric"
-
-    def fill_rates(self, u: int) -> list[tuple[int, float]]:
-        r = 1.0 - self.p
-        out = [(k, self.lambda_ * self.p * r ** (k - 1)) for k in range(1, u)]
-        out.append((u, self.lambda_ * r ** (u - 1)))
-        return out
-
-
-@dataclass
 class ZeroInflatedPoissonArrivalDist(ArrivalDistribution):
     lambda_arr: float = 1.0
     mu: float = 2.0
@@ -599,21 +568,34 @@ class ZeroInflatedPoissonArrivalDist(ArrivalDistribution):
         return "zero_inflated_poisson"
 
     def fill_rates(self, u: int) -> list[tuple[int, float]]:
-        # Preserve the original implementation: truncate to 1..u and renormalize.
-        pmf = []
-        p = math.exp(-self.mu)
-        for k in range(0, u + 1):
-            if k == 0:
-                pk = p
-            else:
-                p *= self.mu / k
-                pk = p
-            pmf.append(pk)
-        Z = sum(pmf[1:])
-        if Z <= 1e-15:
+        """Transition rates induced by F=min(X,u).
+
+        Arrivals occur at ``lambda_arr``.  X is zero with probability ``p0``;
+        conditional on X>0 it is zero-truncated Poisson(mu).  The full-fill
+        bucket u therefore absorbs the entire upper tail X>=u.
+        """
+        if u <= 0:
             return []
-        scale = self.lambda_arr * (1.0 - self.p0) / Z
-        return [(k, scale * pmf[k]) for k in range(1, u + 1)]
+        positive_norm = 1.0 - math.exp(-self.mu)
+        if positive_norm <= 1e-15 or self.lambda_arr <= 0.0:
+            return []
+        positive_mass = 1.0 - self.p0
+        out=[]
+        cumulative=0.0
+        for k in range(1,u):
+            pk=math.exp(-self.mu+k*math.log(self.mu)-math.lgamma(k+1))/positive_norm
+            cumulative += pk
+            out.append((k,self.lambda_arr*positive_mass*pk))
+        out.append((u,self.lambda_arr*positive_mass*max(0.0,1.0-cumulative)))
+        return out
+
+    def sample_incoming_size(self, rng: np.random.Generator) -> int:
+        if float(rng.random()) < self.p0:
+            return 0
+        x=0
+        while x <= 0:
+            x=int(rng.poisson(self.mu))
+        return x
 
 
 class DarkPoolVenue:
@@ -635,19 +617,22 @@ class DarkPoolVenue:
                 sizes = kwargs.pop("posted_sizes")
         else:
             if args:
-                lb, la, pb, pa, fee_b, fee_a, sizes, *rest = args
+                lb, la, mub, mua, p0b, p0a, fee_b, fee_a, sizes, *rest = args
                 self.allow_both_sides = bool(rest[0]) if len(rest) > 0 else self.allow_both_sides
                 self.min_fill_value = float(rest[1]) if len(rest) > 1 else self.min_fill_value
             else:
                 lb = kwargs.pop("lambda_bid", 1.0); la = kwargs.pop("lambda_ask", 1.0)
-                pb = kwargs.pop("p_bid", 0.5); pa = kwargs.pop("p_ask", 0.5)
+                mub = kwargs.pop("mu_bid", 2.0); mua = kwargs.pop("mu_ask", 2.0)
+                p0b = kwargs.pop("p0_bid", 0.1); p0a = kwargs.pop("p0_ask", 0.1)
                 fee_b = kwargs.pop("fee_per_unit_bid", 0.0); fee_a = kwargs.pop("fee_per_unit_ask", 0.0)
                 sizes = kwargs.pop("posted_sizes", [1.0, 2.0, 3.0])
-            self.dist_bid = GeometricArrivalDist(lb, pb)
-            self.dist_ask = GeometricArrivalDist(la, pa)
+            self.dist_bid = ZeroInflatedPoissonArrivalDist(lb, mub, p0b)
+            self.dist_ask = ZeroInflatedPoissonArrivalDist(la, mua, p0a)
 
         if kwargs:
             raise TypeError(f"unexpected arguments: {', '.join(kwargs)}")
+        if not isinstance(self.dist_bid, ZeroInflatedPoissonArrivalDist) or not isinstance(self.dist_ask, ZeroInflatedPoissonArrivalDist):
+            raise TypeError("dark pool supports ZeroInflatedPoissonArrivalDist only")
         self.fee_per_unit_bid = float(fee_b)
         self.fee_per_unit_ask = float(fee_a)
         self.posted_sizes = list(map(float, sizes))
@@ -655,18 +640,10 @@ class DarkPoolVenue:
 
     @property
     def lambda_bid(self) -> float:
-        return self.dist_bid.lambda_ if isinstance(self.dist_bid, GeometricArrivalDist) else self.dist_bid.lambda_arr
+        return self.dist_bid.lambda_arr
     @property
     def lambda_ask(self) -> float:
-        return self.dist_ask.lambda_ if isinstance(self.dist_ask, GeometricArrivalDist) else self.dist_ask.lambda_arr
-    @property
-    def p_bid(self) -> float:
-        if not isinstance(self.dist_bid, GeometricArrivalDist): raise RuntimeError("p_bid only defined for geometric")
-        return self.dist_bid.p
-    @property
-    def p_ask(self) -> float:
-        if not isinstance(self.dist_ask, GeometricArrivalDist): raise RuntimeError("p_ask only defined for geometric")
-        return self.dist_ask.p
+        return self.dist_ask.lambda_arr
 
     @staticmethod
     def is_integer_like(x: float, tol: float = 1e-10) -> bool:
@@ -2014,12 +1991,12 @@ class HJBLadderSolver:
                 u = int(round(venue.policy.posted_size(q, side)))
                 if u <= 0 or not self._dark_pool_post_admissible(q, u, side):
                     continue
-                for k, rate in dist.fill_rates(u):
-                    if rate <= 0.0 or not self._inventory_transition_admissible(q, direction * k):
-                        continue
+                rate=float(dist.lambda_arr)
+                if rate > 0.0:
                     events.append({
                         "kind": "dark", "side": side, "direction": direction,
-                        "size": float(k), "fee": float(fee), "rate": float(rate),
+                        "size": float(u), "fee": float(fee), "rate": rate,
+                        "dist": dist,
                     })
         return events
 
@@ -2210,6 +2187,11 @@ class HJBLadderSolver:
                 weights /= float(np.sum(weights))
                 event = events[int(rng.choice(len(events), p=weights))]
                 z = float(event["size"])
+                if event["kind"] == "dark":
+                    incoming=int(event["dist"].sample_incoming_size(rng))
+                    z=float(min(incoming,int(round(z))))
+                    if z <= 0.0:
+                        continue
                 direction = float(event["direction"])
                 q_before = float(q)
                 spot_before = float(spot)
@@ -2415,7 +2397,7 @@ __all__ = [
     "Side", "Bid", "Ask", "LogisticFlowCurve", "SaturatingMarkoutModel",
     "CarryCost", "PolynomialInternalizationTime", "QuadraticInventoryPenalty", "QuoteSummary",
     "QuoteMetrics", "QuotePolicy", "DarkPoolPolicy", "MDPTier", "Tier", "ArrivalDistribution",
-    "GeometricArrivalDist", "ZeroInflatedPoissonArrivalDist", "DarkPoolVenue", "SolverConfig",
+    "ZeroInflatedPoissonArrivalDist", "DarkPoolVenue", "SolverConfig",
     "SolverGridMeta", "build_solver_grid_meta", "SolverDiagnostics", "HJBSolution", "HJBLadderSolver",
     "PNL_BENCHMARK_VERSION",
 ]

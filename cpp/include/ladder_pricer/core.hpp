@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -39,9 +40,15 @@ public:
     LogisticFlow(double a0, double theta, double beta, double shift,
                  double steepness, double volume_shift);
 
+    // Exogenous customer RFQ arrival intensity for this size [RFQs/min].
     double scale(double size) const;
+    double rfq_arrival_rate(double size) const { return scale(size); }
     double center(double size) const;
+    // Probability that our quote wins a customer RFQ.
     double hit_ratio(double delta, double size) const;
+    double win_probability(double delta, double size) const { return hit_ratio(delta, size); }
+    // Derived won-trade intensity = RFQ arrival intensity × win probability.
+    // Kept for the HJB / analytics code, which currently works directly with won fills.
     double arrival_rate(double delta, double size) const;
     double optimal_delta(double size, double spread, double additive_value) const;
 
@@ -113,7 +120,7 @@ class Tier {
 public:
     Tier(std::string name, std::vector<double> sizes, LogisticFlow flow,
          SaturatingMarkout markout, bool use_markout,
-         double delta_min, double delta_max);
+         double delta_min, double delta_max, double fee = 0.0);
 
     const std::string& name() const noexcept { return name_; }
     const std::vector<double>& sizes() const noexcept { return sizes_; }
@@ -122,6 +129,7 @@ public:
     bool use_markout() const noexcept { return use_markout_; }
     double delta_min() const noexcept { return delta_min_; }
     double delta_max() const noexcept { return delta_max_; }
+    double fee() const noexcept { return fee_; }
 
 private:
     std::string name_;
@@ -131,29 +139,16 @@ private:
     bool use_markout_;
     double delta_min_;
     double delta_max_;
+    double fee_;
 };
 
 class ArrivalDistribution {
 public:
     virtual ~ArrivalDistribution() = default;
     virtual std::vector<std::pair<int, double>> fill_rates(int posted_size) const = 0;
+    virtual int sample_incoming_size(std::mt19937_64& rng) const = 0;
     virtual double arrival_intensity() const noexcept = 0;
     virtual std::string name() const = 0;
-};
-
-class GeometricArrival final : public ArrivalDistribution {
-public:
-    GeometricArrival(double intensity, double probability);
-
-    std::vector<std::pair<int, double>> fill_rates(int posted_size) const override;
-    double arrival_intensity() const noexcept override { return intensity_; }
-    std::string name() const override { return "geometric"; }
-
-    double probability() const noexcept { return probability_; }
-
-private:
-    double intensity_;
-    double probability_;
 };
 
 class ZeroInflatedPoissonArrival final : public ArrivalDistribution {
@@ -161,6 +156,7 @@ public:
     ZeroInflatedPoissonArrival(double intensity, double mean, double zero_probability);
 
     std::vector<std::pair<int, double>> fill_rates(int posted_size) const override;
+    int sample_incoming_size(std::mt19937_64& rng) const override;
     double arrival_intensity() const noexcept override { return intensity_; }
     std::string name() const override { return "zero_inflated_poisson"; }
 
@@ -175,38 +171,50 @@ private:
 
 class DarkPool {
 public:
-    DarkPool(std::shared_ptr<ArrivalDistribution> bid_arrivals,
-             std::shared_ptr<ArrivalDistribution> ask_arrivals,
-             double bid_fee, double ask_fee,
+    DarkPool(std::shared_ptr<ArrivalDistribution> arrivals,
+             double fee,
              std::vector<double> posted_sizes,
-             bool allow_both_sides = false,
              double min_fill_value = 0.0);
 
-    const ArrivalDistribution& arrivals(Side side) const;
-    double fee(Side side) const noexcept;
+    const ArrivalDistribution& arrivals(Side side) const { (void)side; return *arrivals_; }
+    double fee(Side side) const noexcept { (void)side; return fee_; }
     const std::vector<double>& posted_sizes() const noexcept { return posted_sizes_; }
-    bool allow_both_sides() const noexcept { return allow_both_sides_; }
     double min_fill_value() const noexcept { return min_fill_value_; }
     bool side_allowed(double inventory, Side side) const noexcept;
+    bool risk_reducing(double inventory, Side side, double size) const noexcept;
 
 private:
-    std::shared_ptr<ArrivalDistribution> bid_arrivals_;
-    std::shared_ptr<ArrivalDistribution> ask_arrivals_;
-    double bid_fee_;
-    double ask_fee_;
+    std::shared_ptr<ArrivalDistribution> arrivals_;
+    double fee_;
     std::vector<double> posted_sizes_;
-    bool allow_both_sides_;
     double min_fill_value_;
 };
 
 
+class ExponentialFlow {
+public:
+    ExponentialFlow(double a, double k);
+
+    // ECN delta is absolute distance from the moving reference/mid in pips.
+    // Buy and sell ECN market trades each arrive at exogenous rate A, with
+    // trade distance D ~ Exp(k). Therefore an active quote at depth delta has
+    // fill intensity lambda_fill(delta)=A exp(-k delta).
+    double arrival_rate(double delta) const;
+    double a() const noexcept { return a_; }
+    double k() const noexcept { return k_; }
+
+private:
+    double a_;
+    double k_;
+};
+
 class PassiveECN {
 public:
-    PassiveECN(std::vector<double> deltas, LogisticFlow flow,
+    PassiveECN(std::vector<double> deltas, ExponentialFlow flow,
                double quote_size, double maker_fee);
 
     const std::vector<double>& deltas() const noexcept { return deltas_; }
-    const LogisticFlow& flow() const noexcept { return flow_; }
+    const ExponentialFlow& flow() const noexcept { return flow_; }
     double quote_size() const noexcept { return quote_size_; }
     double maker_fee() const noexcept { return maker_fee_; }
     bool side_allowed(double inventory, Side side) const noexcept;
@@ -214,7 +222,7 @@ public:
 
 private:
     std::vector<double> deltas_;
-    LogisticFlow flow_;
+    ExponentialFlow flow_;
     double quote_size_;
     double maker_fee_;
 };

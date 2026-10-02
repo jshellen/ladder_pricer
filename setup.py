@@ -25,7 +25,7 @@ ext_modules = [
 setup(
     name="trinity-ladder-pricer",
     version="0.1.0",
-    description="Trinity 2.0 FX ladder pricer: C++ Howard engine with Dash UI",
+    description="FX ladder pricer: C++ Howard engine with Dash UI",
     package_dir={"": "python"},
     packages=find_packages("python"),
     ext_modules=ext_modules,

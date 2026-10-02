@@ -149,7 +149,7 @@ HowardSolver::AffineOperator HowardSolver::fixed_policy_operator(const Policy& p
                     const double markout = tier.use_markout()
                         ? tier.markout().expected(z, problem_.internalization_time().value(q_next))
                         : 0.0;
-                    op.reward[i] += rate * (z * problem_.spread() * (0.5 - delta) - z * markout);
+                    op.reward[i] += rate * (z * (problem_.spread() * (0.5 - delta) - tier.fee()) - z * markout);
                     add_transition(op.generator, states, i, q_next, rate);
                 }
             }
@@ -161,7 +161,7 @@ HowardSolver::AffineOperator HowardSolver::fixed_policy_operator(const Policy& p
             for (Side side : {Side::Bid, Side::Ask}) {
                 const bool active = side == Side::Bid ? p.bid_active[i] : p.ask_active[i];
                 const double posted = side == Side::Bid ? p.bid_size[i] : p.ask_size[i];
-                if (!active || posted <= 0.0) continue;
+                if (!active || posted <= 0.0 || !venue.risk_reducing(q, side, posted)) continue;
                 const int u = static_cast<int>(std::llround(posted));
                 const double dir = direction(side);
                 for (const auto& [fill, rate] : venue.arrivals(side).fill_rates(u)) {
@@ -179,9 +179,9 @@ HowardSolver::AffineOperator HowardSolver::fixed_policy_operator(const Policy& p
                 const bool active = side == Side::Bid ? p.bid_active[i] : p.ask_active[i];
                 const double depth = side == Side::Bid ? p.bid_depth[i] : p.ask_depth[i];
                 if (!active) continue;
-                const double rate = venue.flow().arrival_rate(depth, z);
+                const double rate = venue.flow().arrival_rate(depth);
                 const double dir = direction(side);
-                op.reward[i] += rate * z * (problem_.spread() * (0.5 - depth) - venue.maker_fee());
+                op.reward[i] += rate * z * (depth / 10000.0 - venue.maker_fee());
                 add_transition(op.generator, states, i, q + dir * z, rate);
             }
         }

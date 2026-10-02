@@ -14,7 +14,7 @@ from trinity.defaults import default_config
 from trinity.service import ENGINES
 from trinity.ui_config import build_config, checked, parse_numbers
 
-APP_TITLE = "Trinity 2.0"
+APP_TITLE = "FX Ladder Pricer"
 SESSION_HORIZON = 570.0
 BASE_CCY = "EUR"
 QUOTE_CCY = "SEK"
@@ -38,20 +38,33 @@ def session_clock_label(elapsed_minutes: float, seconds: bool = True) -> str:
 
 
 def apply_session_clock_axis(fig: go.Figure, title: str = "Session time") -> go.Figure:
-    tickvals = session_timestamps(SESSION_TIME_TICK_MINUTES)
-    ticktext = [session_clock_label(x, seconds=False) for x in SESSION_TIME_TICK_MINUTES]
+    """Use a real datetime axis whose labels remain useful while zooming.
+
+    A fixed ``tickvals`` array looks tidy at the full-session level but leaves
+    the axis with no labels after zooming between those preselected ticks.
+    Let Plotly choose ticks dynamically and only control how those timestamps
+    are formatted at different zoom levels.
+    """
     fig.update_xaxes(
         type="date",
         title_text=title,
-        tickmode="array",
-        tickvals=tickvals,
-        ticktext=ticktext,
-        hoverformat="%H:%M:%S",
+        tickmode="auto",
+        nticks=12,
+        tickformatstops=[
+            # Very tight inspection: include milliseconds.
+            dict(dtickrange=[None, 1_000], value="%H:%M:%S.%L"),
+            # Intraday quote/fill inspection: always show seconds.
+            dict(dtickrange=[1_000, 3_600_000], value="%H:%M:%S"),
+            # Full-session / long-horizon view: minutes are sufficient.
+            dict(dtickrange=[3_600_000, None], value="%H:%M"),
+        ],
+        hoverformat="%H:%M:%S.%L",
+        automargin=True,
     )
     return fig
 
 # -----------------------------------------------------------------------------
-# Unified Trinity / Streamlit-style dark Plotly theme
+# Unified dark Plotly theme
 # -----------------------------------------------------------------------------
 PLOT_BG = "#0e1117"
 PAPER_BG = "#111821"
@@ -138,16 +151,20 @@ def select(label: str, component_id: str, options, value):
 GRAPH_CONFIG = {"displaylogo": False, "responsive": True}
 
 
-def graph(component_id: str, height: int = 420):
+def graph(component_id: str, height: int = 420, config: dict[str, Any] | None = None):
     """Responsive Plotly graph with a stable card height.
 
     Plot styling is controlled by the global Plotly template.  Keeping the
     container sizing here avoids CSS rules that reach into Plotly's internal
-    SVG layers.
+    SVG layers.  ``config`` can override the shared Plotly interaction
+    settings for graphs that need specialized navigation behavior.
     """
+    graph_config = dict(GRAPH_CONFIG)
+    if config:
+        graph_config.update(config)
     return dcc.Graph(
         id=component_id,
-        config=GRAPH_CONFIG,
+        config=graph_config,
         responsive=True,
         style={"height": f"{int(height)}px", "width": "100%"},
     )
@@ -176,21 +193,25 @@ def tier_panel(index: int, tier: dict[str, Any], open_: bool = False):
         text_input("Sizes [EUR M]", f"{p}-sizes", ", ".join(str(x) for x in tier["sizes"])),
         html.Div("Flow", className="subhead"),
         html.Div([
-            number_input("A0 / min", f"{p}-A0", tier["flow"]["A0"], 0.001),
-            number_input("Theta", f"{p}-theta", tier["flow"]["theta"], 0.001),
-            number_input("Beta", f"{p}-beta", tier["flow"]["beta"], 0.001),
-            number_input("Steepness", f"{p}-steep", tier["flow"]["steepness"], 0.01),
-            number_input("Shift", f"{p}-shift", tier["flow"]["shift"], 0.01),
-            number_input("Volume shift", f"{p}-vshift", tier["flow"]["volumeShift"], 0.001),
+            number_input("A0 / min", f"{p}-A0", tier["flow"]["A0"], "any"),
+            number_input("Theta", f"{p}-theta", tier["flow"]["theta"], "any"),
+            number_input("Beta", f"{p}-beta", tier["flow"]["beta"], "any"),
+            number_input("Steepness", f"{p}-steep", tier["flow"]["steepness"], "any"),
+            number_input("Shift", f"{p}-shift", tier["flow"]["shift"], "any"),
+            number_input("Volume shift", f"{p}-vshift", tier["flow"]["volumeShift"], "any"),
+        ], className="grid-2"),
+        html.Div("Trading economics", className="subhead"),
+        html.Div([
+            number_input("Fee [pips]", f"{p}-fee", tier.get("feePips", 0.0), "any"),
         ], className="grid-2"),
         html.Div("Markout", className="subhead"),
         checkbox("Enabled", f"{p}-markout-enabled", tier["useMarkout"]),
         html.Div([
-            number_input("Scale [pips]", f"{p}-impact", tier["markout"]["impactScalePips"], 0.1),
-            number_input("Size exponent", f"{p}-impact-beta", tier["markout"]["sizeExponent"], 0.05),
-            number_input("Tau [min]", f"{p}-impact-tau", tier["markout"]["tauMinutes"], 0.05),
-            number_input("Delta min", f"{p}-dmin", tier["deltaMin"], 0.5),
-            number_input("Delta max", f"{p}-dmax", tier["deltaMax"], 0.5),
+            number_input("Scale [pips]", f"{p}-impact", tier["markout"]["impactScalePips"], "any"),
+            number_input("Size exponent", f"{p}-impact-beta", tier["markout"]["sizeExponent"], "any"),
+            number_input("Tau [min]", f"{p}-impact-tau", tier["markout"]["tauMinutes"], "any"),
+            number_input("Delta min", f"{p}-dmin", tier["deltaMin"], "any"),
+            number_input("Delta max", f"{p}-dmax", tier["deltaMax"], "any"),
         ], className="grid-2"),
     ], open_)
 
@@ -291,7 +312,20 @@ def flow_curve_figure(tier: dict[str, Any]) -> go.Figure:
     fig = go.Figure()
     for z in tier["sizes"]:
         fig.add_trace(go.Scatter(x=grid, y=_arrival_rate(tier, grid, float(z)), mode="lines", name=f"{float(z):g}M"))
-    fig.update_layout(title=f"Flow curves λ(δ,z) · {tier['name']}", xaxis_title="δ", yaxis_title="Fill intensity [1/min]", template="trinity_dark")
+    fig.update_layout(title=f"Won-trade intensity λ_RFQ(z) × p_win(δ,z) · {tier['name']}", xaxis_title="δ", yaxis_title="Won trades [1/min]", template="trinity_dark")
+    return fig
+
+
+def exogenous_arrival_figure(tier: dict[str, Any]) -> go.Figure:
+    sizes = np.asarray(tier["sizes"], dtype=float)
+    rates = np.asarray([_activity(tier, float(z)) for z in sizes], dtype=float)
+    fig = go.Figure(go.Scatter(x=sizes, y=rates, mode="lines+markers", name="RFQ arrivals"))
+    fig.update_layout(
+        title=f"Exogenous RFQ arrival intensity λ_RFQ(z) · {tier['name']}",
+        xaxis_title="RFQ size [EUR M]",
+        yaxis_title="RFQs [1/min]",
+        template="trinity_dark",
+    )
     return fig
 
 
@@ -300,7 +334,7 @@ def hit_ratio_figure(tier: dict[str, Any]) -> go.Figure:
     fig = go.Figure()
     for z in tier["sizes"]:
         fig.add_trace(go.Scatter(x=grid, y=_hit_ratio(tier, grid, float(z)), mode="lines", name=f"{float(z):g}M"))
-    fig.update_layout(title=f"Hit ratios HR(δ,z) · {tier['name']}", xaxis_title="δ", yaxis_title="Hit ratio", yaxis_range=[0,1], template="trinity_dark")
+    fig.update_layout(title=f"Win probabilities p_win(δ,z) · {tier['name']}", xaxis_title="δ", yaxis_title="Win probability", yaxis_range=[0,1], template="trinity_dark")
     return fig
 
 
@@ -321,7 +355,7 @@ def implied_hit_ratio_figure(solution: dict[str, Any], cfg: dict[str, Any], tier
             x=q, y=_hit_ratio(tier, ask, z), mode="lines", name=f"{z:g}M ask",
             line=dict(color=ASK_COLOR, dash=dash), legendgroup=f"size-{j}",
         ))
-    fig.update_layout(title=f"Implied hit ratios vs inventory · {tier['name']}", xaxis_title="Inventory q [EUR M]", yaxis_title="Hit ratio", yaxis_range=[0,1], template="trinity_dark")
+    fig.update_layout(title=f"Implied win probabilities vs inventory · {tier['name']}", xaxis_title="Inventory q [EUR M]", yaxis_title="Win probability", yaxis_range=[0,1], template="trinity_dark")
     return fig
 
 
@@ -396,9 +430,10 @@ def flow_parameter_table(tier: dict[str, Any]) -> html.Table:
     for z in tier["sizes"]:
         rows.append([
             f"{float(z):g}", f"{_activity(tier,float(z)):.6g}", f"{_delta50(tier,float(z)):.4f}",
-            f"{float(tier['flow']['steepness']):.4g}", f"{float(_markout_pips(tier,float(z),1.0)):.3f}",
+            f"{float(tier['flow']['steepness']):.4g}", f"{float(tier.get('feePips', 0.0)):.3f}",
+            f"{float(_markout_pips(tier,float(z),1.0)):.3f}",
         ])
-    return _simple_table(["Size [M]","A(z) [1/min]","δ50(z)","Steepness","Markout @1m [pips]"], rows)
+    return _simple_table(["Size [M]","λ_RFQ(z) [1/min]","δ50(z)","Steepness","Fee [pips]","Markout @1m [pips]"], rows)
 
 
 def ladder_table(solution: dict[str, Any], cfg: dict[str, Any], tier_index: int, q_value: float) -> html.Table:
@@ -435,7 +470,7 @@ def markout_figure(tier: dict[str, Any]) -> go.Figure:
     fig=go.Figure()
     for z in tier["sizes"]:
         fig.add_trace(go.Scatter(x=t,y=_markout_pips(tier,float(z),t),mode="lines",name=f"{float(z):g}M"))
-    fig.update_layout(title=f"Saturating markout · {tier['name']}",xaxis_title="Time since trade [min]",yaxis_title="Adverse markout [pips]",template="trinity_dark")
+    fig.update_layout(title=f"RFQ markout · {tier['name']}",xaxis_title="Time since trade [min]",yaxis_title="Adverse markout [pips]",template="trinity_dark")
     return fig
 
 
@@ -448,23 +483,26 @@ def convergence_figure(values, title: str, ytitle: str) -> go.Figure:
     return fig
 
 
+def _zip_positive_pmf(mu: float, max_k: int) -> np.ndarray:
+    """Zero-truncated Poisson probabilities for incoming positive sizes 1..max_k."""
+    ks=np.arange(1,max_k+1)
+    raw=np.asarray([math.exp(-mu+int(x)*math.log(mu)-math.lgamma(int(x)+1)) if mu>0 else 0.0 for x in ks],dtype=float)
+    norm=1.0-math.exp(-mu) if mu>0 else 0.0
+    return raw/norm if norm>1e-15 else np.zeros_like(raw)
+
+
 def dark_pool_arrival_figure(cfg: dict[str, Any]) -> go.Figure:
     dp=cfg["darkPool"]
     posted=sorted(int(round(float(u))) for u in dp["postedSizes"])
-    max_size=max(posted) if posted else 1
-    k=np.arange(1,max_size+1)
+    max_size=max((posted[-1] if posted else 1)+5,10)
+    k=np.arange(0,max_size+1)
     fig=go.Figure()
-    if dp["distribution"]=="geometric":
-        for label,p in [("bid",float(dp["pBid"])),("ask",float(dp["pAsk"]))]:
-            y=p*(1-p)**(k-1)
-            fig.add_trace(go.Bar(x=k,y=y,name=label,opacity=.72, marker_color=BID_COLOR if label == "bid" else ASK_COLOR))
-    else:
-        for label,mu,p0 in [("bid",float(dp["muBid"]),float(dp["p0Bid"])),("ask",float(dp["muAsk"]),float(dp["p0Ask"]))]:
-            raw=np.asarray([math.exp(-mu+int(x)*math.log(mu)-math.lgamma(int(x)+1)) if mu>0 else 0 for x in k],dtype=float)
-            z=raw.sum()
-            y=(1-p0)*raw/z if z>1e-15 else np.zeros_like(raw)
-            fig.add_trace(go.Bar(x=k,y=y,name=label,opacity=.72, marker_color=BID_COLOR if label == "bid" else ASK_COLOR))
-    fig.update_layout(title="Dark-pool fill-size density",xaxis_title="Fill size",yaxis_title="Probability",barmode="group",template="trinity_dark")
+    mu=float(dp["mu"]); p0=float(dp["p0"])
+    y=np.zeros_like(k,dtype=float)
+    y[0]=p0
+    y[1:]=(1.0-p0)*_zip_positive_pmf(mu,max_size)
+    fig.add_trace(go.Bar(x=k,y=y,name="bid / ask",opacity=.72))
+    fig.update_layout(title="Dark-pool incoming-order size distribution",xaxis_title="Incoming order size",yaxis_title="Probability",barmode="group",template="trinity_dark")
     return fig
 
 
@@ -472,18 +510,17 @@ def dark_pool_full_fill_figure(cfg: dict[str, Any]) -> go.Figure:
     dp=cfg["darkPool"]
     posted=sorted(int(round(float(u))) for u in dp["postedSizes"])
     fig=go.Figure()
-    if dp["distribution"]=="geometric":
-        for label,p in [("bid",float(dp["pBid"])),("ask",float(dp["pAsk"]))]:
-            fig.add_trace(go.Bar(x=posted,y=[(1-p)**(u-1) for u in posted],name=label,opacity=.72, marker_color=BID_COLOR if label == "bid" else ASK_COLOR))
-    else:
-        for label,mu,p0 in [("bid",float(dp["muBid"]),float(dp["p0Bid"])),("ask",float(dp["muAsk"]),float(dp["p0Ask"]))]:
-            vals=[]
-            for u in posted:
-                ks=np.arange(1,u+1)
-                raw=np.asarray([math.exp(-mu+int(x)*math.log(mu)-math.lgamma(int(x)+1)) if mu>0 else 0 for x in ks],dtype=float)
-                vals.append((1-p0)*raw[-1]/raw.sum() if raw.sum()>1e-15 else 0.0)
-            fig.add_trace(go.Bar(x=posted,y=vals,name=label,opacity=.72, marker_color=BID_COLOR if label == "bid" else ASK_COLOR))
-    fig.update_layout(title="Dark-pool P(full fill)",xaxis_title="Posted size",yaxis_title="Probability",barmode="group",template="trinity_dark")
+    mu=float(dp["mu"]); p0=float(dp["p0"]); vals=[]
+    positive_norm=1.0-math.exp(-mu) if mu>0 else 0.0
+    for u in posted:
+        if positive_norm<=1e-15:
+            vals.append(0.0)
+            continue
+        below=sum(math.exp(-mu+k*math.log(mu)-math.lgamma(k+1)) for k in range(1,u))
+        tail=max(0.0,1.0-below/positive_norm)
+        vals.append((1.0-p0)*tail)
+    fig.add_trace(go.Bar(x=posted,y=vals,name="bid / ask",opacity=.72))
+    fig.update_layout(title="Dark-pool P(full fill = incoming size ≥ posted size)",xaxis_title="Posted size",yaxis_title="Probability per arrival",barmode="group",template="trinity_dark")
     return fig
 
 
@@ -512,10 +549,11 @@ def dark_pool_table(solution: dict[str, Any]) -> html.Table | html.Div:
     return _simple_table(["Inventory","Bid posted size","Ask posted size"],rows)
 
 
-def _passive_ecn_tier_like(cfg: dict[str, Any]) -> tuple[dict[str, Any], float]:
-    e = cfg.get("passiveEcn", {})
-    z = float(e.get("quoteSize", 1.0))
-    return {"flow": e.get("flow", {}), "sizes": [z]}, z
+def _ecn_arrival_rate(cfg: dict[str, Any], delta_pips):
+    flow = cfg.get("passiveEcn", {}).get("flow", {})
+    A = float(flow.get("A", 0.0))
+    k = float(flow.get("k", 1.0))
+    return A * np.exp(np.clip(-k * np.asarray(delta_pips, dtype=float), -745.0, 709.0))
 
 
 def _ecn_step_line(q: np.ndarray, values: np.ndarray, active: np.ndarray, side: str) -> tuple[list[float | None], list[float | None], np.ndarray, np.ndarray]:
@@ -576,44 +614,59 @@ def _add_ecn_inventory_trace(fig: go.Figure, q: np.ndarray, values: np.ndarray, 
 
 def passive_ecn_parameter_table(cfg: dict[str, Any]) -> html.Table:
     e = cfg.get("passiveEcn", {})
-    tier_like, z = _passive_ecn_tier_like(cfg)
+    flow = e.get("flow", {})
+    z = float(e.get("quoteSize", 1.0))
     rows = [[
         f"{z:g}",
-        f"{_activity(tier_like, z):.6g}",
-        f"{_delta50(tier_like, z):.4f}",
-        f"{float(e['flow']['steepness']):.4g}",
+        f"{float(flow.get('A', 0.0)):.6g}",
+        f"{float(flow.get('k', 0.0)):.4g}",
         f"{float(e.get('makerFeePips', 0.0)):.4f}",
-        ", ".join(f"{float(x):g}" for x in e.get("deltas", [])),
+        f"{float(e.get('minDistancePips', 0.0)):g}",
+        f"{float(e.get('maxDistancePips', 0.0)):g}",
+        "0.5",
     ]]
     return _simple_table(
-        ["Quote size [M]", "A(z) [1/min]", "δ50(z)", "Steepness", "Maker fee [pips]", "Allowed δ"],
+        ["Quote size [M]", "A = ECN arrivals/side [trades/min]", "k [1/pip]", "Maker fee [pips]",
+         "Min distance [pips]", "Max distance [pips]", "Grid step [pips]"],
         rows,
     )
 
 
 def passive_ecn_fill_figure(cfg: dict[str, Any]) -> go.Figure:
-    e=cfg.get("passiveEcn", {})
-    tier_like, z = _passive_ecn_tier_like(cfg)
-    grid=np.linspace(-1.0, 1.0, 160)
-    fig=go.Figure()
-    fig.add_trace(go.Scatter(x=grid, y=_arrival_rate(tier_like, grid, z), mode="lines", name=f"{z:g}M ECN"))
-    deltas=np.asarray(e.get("deltas", []), dtype=float)
+    e = cfg.get("passiveEcn", {})
+    z = float(e.get("quoteSize", 1.0))
+    lo = float(e.get("minDistancePips", 0.0))
+    hi = float(e.get("maxDistancePips", 20.0))
+    grid = np.linspace(lo, hi, 240)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=grid, y=_ecn_arrival_rate(cfg, grid), mode="lines", name=f"{z:g}M ECN"))
+    deltas = np.asarray(e.get("deltas", []), dtype=float)
     if deltas.size:
-        fig.add_trace(go.Scatter(x=deltas, y=_arrival_rate(tier_like, deltas, z), mode="markers", name="Allowed deltas"))
-    fig.update_layout(title="Flow curve λ(δ,z) · Passive ECN", xaxis_title="δ", yaxis_title="Fill intensity [1/min]", template="trinity_dark")
+        fig.add_trace(go.Scatter(x=deltas, y=_ecn_arrival_rate(cfg, deltas), mode="markers", name="0.5-pip grid"))
+    fig.update_layout(title="Implied ECN fill intensity λ_fill(δ)=A exp(−kδ)",
+                      xaxis_title="Quote distance from mid δ [pips]", yaxis_title="Fill intensity [trades/min]",
+                      template="trinity_dark")
+    fig.update_xaxes(range=[lo, hi])
     return fig
 
 
 def passive_ecn_hit_ratio_figure(cfg: dict[str, Any]) -> go.Figure:
-    e=cfg.get("passiveEcn", {})
-    tier_like, z = _passive_ecn_tier_like(cfg)
-    grid=np.linspace(-1.0, 1.0, 160)
-    fig=go.Figure()
-    fig.add_trace(go.Scatter(x=grid, y=_hit_ratio(tier_like, grid, z), mode="lines", name=f"{z:g}M ECN"))
-    deltas=np.asarray(e.get("deltas", []), dtype=float)
+    e = cfg.get("passiveEcn", {})
+    flow = e.get("flow", {})
+    k = float(flow.get("k", 1.0))
+    z = float(e.get("quoteSize", 1.0))
+    lo = float(e.get("minDistancePips", 0.0))
+    hi = float(e.get("maxDistancePips", 20.0))
+    grid = np.linspace(lo, hi, 240)
+    relative = np.exp(np.clip(-k * grid, -745.0, 709.0))
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=grid, y=relative, mode="lines", name=f"{z:g}M ECN"))
+    deltas = np.asarray(e.get("deltas", []), dtype=float)
     if deltas.size:
-        fig.add_trace(go.Scatter(x=deltas, y=_hit_ratio(tier_like, deltas, z), mode="markers", name="Allowed deltas"))
-    fig.update_layout(title="Hit ratios HR(δ,z) · Passive ECN", xaxis_title="δ", yaxis_title="Hit ratio", yaxis_range=[0,1], template="trinity_dark")
+        fig.add_trace(go.Scatter(x=deltas, y=np.exp(np.clip(-k * deltas, -745.0, 709.0)), mode="markers", name="0.5-pip grid"))
+    fig.update_layout(title="ECN reach probability P(D ≥ δ)=exp(−kδ)", xaxis_title="Quote distance from mid δ [pips]",
+                      yaxis_title="Reach probability", template="trinity_dark")
+    fig.update_xaxes(range=[lo, hi])
     return fig
 
 
@@ -623,17 +676,16 @@ def passive_ecn_implied_hit_ratio_figure(solution: dict[str, Any], cfg: dict[str
     if not e:
         fig.add_annotation(text="Passive ECN disabled", showarrow=False)
     else:
-        tier_like, z = _passive_ecn_tier_like(cfg)
         q = np.asarray(e["qGrid"], dtype=float)
         bid_delta = np.asarray(e["bidDelta"], dtype=float)
         ask_delta = np.asarray(e["askDelta"], dtype=float)
         bid_active = np.asarray(e["bidActive"], dtype=bool)
         ask_active = np.asarray(e["askActive"], dtype=bool)
-        bid_hr = np.where(bid_active, _hit_ratio(tier_like, bid_delta, z), np.nan)
-        ask_hr = np.where(ask_active, _hit_ratio(tier_like, ask_delta, z), np.nan)
-        _add_ecn_inventory_trace(fig, q, bid_hr, bid_active, "Bid hedge", BID_COLOR, "bid")
-        _add_ecn_inventory_trace(fig, q, ask_hr, ask_active, "Ask hedge", ASK_COLOR, "ask")
-    fig.update_layout(title="Implied hit ratios vs inventory · Passive ECN", xaxis_title="Inventory q [EUR M]", yaxis_title="Hit ratio", yaxis_range=[0,1], template="trinity_dark")
+        bid_lam = np.where(bid_active, _ecn_arrival_rate(cfg, bid_delta), np.nan)
+        ask_lam = np.where(ask_active, _ecn_arrival_rate(cfg, ask_delta), np.nan)
+        _add_ecn_inventory_trace(fig, q, bid_lam, bid_active, "Bid hedge", BID_COLOR, "bid")
+        _add_ecn_inventory_trace(fig, q, ask_lam, ask_active, "Ask hedge", ASK_COLOR, "ask")
+    fig.update_layout(title="Fill intensity vs inventory · Passive ECN", xaxis_title="Inventory q [EUR M]", yaxis_title="Trade intensity [trades/min]", template="trinity_dark")
     return fig
 
 
@@ -643,14 +695,13 @@ def passive_ecn_quote_inventory_figure(solution: dict[str, Any], cfg: dict[str, 
     if not e:
         fig.add_annotation(text="Passive ECN disabled", showarrow=False)
     else:
-        spread_pips = float(cfg["spreadPips"])
         q = np.asarray(e["qGrid"], dtype=float)
         bid_delta = np.asarray(e["bidDelta"], dtype=float)
         ask_delta = np.asarray(e["askDelta"], dtype=float)
         bid_active = np.asarray(e["bidActive"], dtype=bool)
         ask_active = np.asarray(e["askActive"], dtype=bool)
-        bid_px = np.where(bid_active, _quote_vs_mid_pips(bid_delta, "bid", spread_pips), np.nan)
-        ask_px = np.where(ask_active, _quote_vs_mid_pips(ask_delta, "ask", spread_pips), np.nan)
+        bid_px = np.where(bid_active, -bid_delta, np.nan)
+        ask_px = np.where(ask_active, ask_delta, np.nan)
         _add_ecn_inventory_trace(fig, q, bid_px, bid_active, "Bid hedge", BID_COLOR, "bid")
         _add_ecn_inventory_trace(fig, q, ask_px, ask_active, "Ask hedge", ASK_COLOR, "ask")
         fig.add_hline(y=0, line_dash="dot")
@@ -671,7 +722,7 @@ def passive_ecn_policy_figure(solution: dict[str, Any]) -> go.Figure:
         ask_active = np.asarray(e["askActive"], dtype=bool)
         _add_ecn_inventory_trace(fig, q, bid, bid_active, "Bid hedge", BID_COLOR, "bid")
         _add_ecn_inventory_trace(fig, q, ask, ask_active, "Ask hedge", ASK_COLOR, "ask")
-    fig.update_layout(title="Optimal passive ECN delta vs inventory",xaxis_title="Inventory q [EUR M]",yaxis_title="δ (tier convention)",template="trinity_dark")
+    fig.update_layout(title="Optimal passive ECN distance vs inventory",xaxis_title="Inventory q [EUR M]",yaxis_title="Distance from mid [pips]",template="trinity_dark")
     return fig
 
 def passive_ecn_table(solution: dict[str, Any]) -> html.Table | html.Div:
@@ -681,7 +732,7 @@ def passive_ecn_table(solution: dict[str, Any]) -> html.Table | html.Div:
     rows=[]
     for q,bd,ba,ad,aa in zip(e["qGrid"],e["bidDelta"],e["bidActive"],e["askDelta"],e["askActive"]):
         rows.append([f"{q:g}", f"{bd:g}" if ba else "OFF", f"{ad:g}" if aa else "OFF"])
-    return _simple_table(["Inventory","Bid δ","Ask δ"],rows)
+    return _simple_table(["Inventory", "Bid distance [pips]", "Ask distance [pips]"], rows)
 
 
 DEFAULT = default_config()
@@ -689,7 +740,7 @@ DEFAULT = default_config()
 sidebar = html.Aside([
     html.Div([
         html.Div("T2", className="brand-mark"),
-        html.Div([html.Strong("Trinity 2.0"), html.Span("C++ Howard / Python / Dash")], className="brand-copy"),
+        html.Div([html.Strong("FX Ladder Pricer")], className="brand-copy"),
     ], className="brand"),
     panel("Global", [
         html.Div([
@@ -699,61 +750,50 @@ sidebar = html.Aside([
     ], True),
     panel("Spot & risk", [
         html.Div([
-            number_input("EURSEK spot", "spot", DEFAULT["spot"], 0.1),
-            number_input("Spread [pips]", "spread", DEFAULT["spreadPips"], 1.0),
-            number_input("Drift / min", "drift", DEFAULT["spotDrift"], 0.0001),
-            number_input("Vol [pips / √min]", "sigma", DEFAULT["sigmaPips"], 1.0),
-            number_input("Gamma / φ", "gamma", DEFAULT["gamma"], 0.01),
+            number_input("EURSEK spot", "spot", DEFAULT["spot"], "any"),
+            number_input("Spread [pips]", "spread", DEFAULT["spreadPips"], "any"),
+            number_input("Drift / min", "drift", DEFAULT["spotDrift"], "any"),
+            number_input("Vol [pips / √min]", "sigma", DEFAULT["sigmaPips"], "any"),
+            number_input("Gamma / φ", "gamma", DEFAULT["gamma"], "any"),
         ], className="grid-2"),
     ], True),
     panel("Internalization time", [
         html.Div([
-            number_input("Tau 0 [min]", "tau0", DEFAULT["internalization"]["tau0"], 0.1),
-            number_input("Tau 1", "tau1", DEFAULT["internalization"]["tau1"], 0.01),
-            number_input("Tau 2", "tau2", DEFAULT["internalization"]["tau2"], 0.0005),
+            number_input("Tau 0 [min]", "tau0", DEFAULT["internalization"]["tau0"], "any"),
+            number_input("Tau 1", "tau1", DEFAULT["internalization"]["tau1"], "any"),
+            number_input("Tau 2", "tau2", DEFAULT["internalization"]["tau2"], "any"),
         ], className="grid-2"),
     ]),
     html.Div("Pricing tiers", className="section-title"),
     *[tier_panel(i, t, open_=(i == 0)) for i, t in enumerate(DEFAULT["tiers"])],
     panel("Dark pool", [
         checkbox("Enabled", "dp-enabled", DEFAULT["darkPool"]["enabled"]),
-        select("Distribution", "dp-dist", [
-            {"label": "Geometric", "value": "geometric"},
-            {"label": "Zero-inflated Poisson", "value": "zip"},
-        ], DEFAULT["darkPool"]["distribution"]),
+        html.Div("Zero-inflated Poisson fill-size model", className="muted-note"),
         html.Div([
-            number_input("Bid λ / min", "dp-lb", DEFAULT["darkPool"]["lambdaBid"], 0.1),
-            number_input("Ask λ / min", "dp-la", DEFAULT["darkPool"]["lambdaAsk"], 0.1),
-            number_input("Bid p", "dp-pb", DEFAULT["darkPool"]["pBid"], 0.05),
-            number_input("Ask p", "dp-pa", DEFAULT["darkPool"]["pAsk"], 0.05),
-            number_input("Bid μ", "dp-mub", DEFAULT["darkPool"]["muBid"], 0.1),
-            number_input("Ask μ", "dp-mua", DEFAULT["darkPool"]["muAsk"], 0.1),
-            number_input("Bid p0", "dp-p0b", DEFAULT["darkPool"]["p0Bid"], 0.05),
-            number_input("Ask p0", "dp-p0a", DEFAULT["darkPool"]["p0Ask"], 0.05),
-            number_input("Bid fee", "dp-fb", DEFAULT["darkPool"]["feeBid"], 0.1),
-            number_input("Ask fee", "dp-fa", DEFAULT["darkPool"]["feeAsk"], 0.1),
+            number_input("λ / side / min", "dp-lambda", DEFAULT["darkPool"]["lambda"], "any"),
+            number_input("μ", "dp-mu", DEFAULT["darkPool"]["mu"], "any"),
+            number_input("p0", "dp-p0", DEFAULT["darkPool"]["p0"], "any"),
+            number_input("Broker fee [pips]", "dp-fee", DEFAULT["darkPool"]["feePips"], "any"),
         ], className="grid-2"),
+        html.Div("Hedge-only: only the inventory-reducing side is posted and fills may not cross through flat.", className="muted-note"),
         text_input("Posted sizes", "dp-sizes", ", ".join(str(x) for x in DEFAULT["darkPool"]["postedSizes"])),
-        checkbox("Both sides simultaneously", "dp-both", DEFAULT["darkPool"]["allowBothSides"]),
     ]),
-    panel("Passive ECN hedge (Crisafi)", [
+    panel("ECN", [
         checkbox("Enabled", "ecn-enabled", DEFAULT["passiveEcn"]["enabled"]),
-        html.Div("Discrete δ grid: −0.50 to +0.50 in 0.005 increments (201 quote actions) + NONE", className="muted-note"),
         html.Div([
-            number_input("A0", "ecn-A0", DEFAULT["passiveEcn"]["flow"]["A0"], 0.001),
-            number_input("θ", "ecn-theta", DEFAULT["passiveEcn"]["flow"]["theta"], 0.01),
-            number_input("β", "ecn-beta", DEFAULT["passiveEcn"]["flow"]["beta"], 0.01),
-            number_input("Steepness", "ecn-steep", DEFAULT["passiveEcn"]["flow"]["steepness"], 0.1),
-            number_input("Shift", "ecn-shift", DEFAULT["passiveEcn"]["flow"]["shift"], 0.01),
-            number_input("Volume shift", "ecn-vshift", DEFAULT["passiveEcn"]["flow"]["volumeShift"], 0.001),
+            number_input("A arrivals / side [trades/min]", "ecn-A", DEFAULT["passiveEcn"]["flow"]["A"], "any"),
+            number_input("k [1/pip]", "ecn-k", DEFAULT["passiveEcn"]["flow"]["k"], "any"),
         ], className="grid-2"),
         html.Div([
-            number_input("Quote size [M]", "ecn-size", DEFAULT["passiveEcn"]["quoteSize"], 0.25),
-            number_input("Maker fee [pips]", "ecn-fee", DEFAULT["passiveEcn"]["makerFeePips"], 0.1),
+            number_input("Min distance from mid [pips]", "ecn-dmin", DEFAULT["passiveEcn"]["minDistancePips"], 0.5),
+            number_input("Max distance from mid [pips]", "ecn-dmax", DEFAULT["passiveEcn"]["maxDistancePips"], 0.5),
         ], className="grid-2"),
-        html.Div("ECN uses the exact same LogisticFlow and δ convention as a tier: δ=0 is touch, positive δ is tighter/price-improving, negative δ is wider. The optimizer chooses NONE or one discrete δ, and ECN fills may only reduce |inventory|.", className="muted-note"),
+        html.Div([
+            number_input("Quote size [M]", "ecn-size", DEFAULT["passiveEcn"]["quoteSize"], "any"),
+            number_input("Maker fee [pips]", "ecn-fee", DEFAULT["passiveEcn"]["makerFeePips"], "any"),
+        ], className="grid-2"),
     ]),
-    html.Button("Solve Howard", id="solve", className="primary-button"),
+    html.Button("Calibrate", id="solve", className="primary-button"),
 ], className="sidebar")
 
 policy_tab = html.Div([
@@ -777,8 +817,9 @@ policy_tab = html.Div([
             diagnostic_expander("Tier parameters", [
                 html.Div(id="flow-parameter-table", className="table-wrap"),
             ]),
-            diagnostic_expander("Flow curves", graph("flow-chart")),
-            diagnostic_expander("Hit ratios", graph("hit-ratio-chart")),
+            diagnostic_expander("Exogenous RFQ arrival intensity", graph("rfq-arrival-chart")),
+            diagnostic_expander("Won-trade intensity", graph("flow-chart")),
+            diagnostic_expander("Win probabilities", graph("hit-ratio-chart")),
             diagnostic_expander("Implied hit ratios vs inventory", graph("implied-hit-chart")),
             diagnostic_expander("Markouts", graph("markout-chart")),
             diagnostic_expander("Quotes vs inventory", graph("quote-inventory-chart")),
@@ -805,8 +846,8 @@ policy_tab = html.Div([
                 html.Div(id="ecn-parameter-table", className="table-wrap"),
             ]),
             diagnostic_expander("Flow curves", graph("ecn-fill-chart")),
-            diagnostic_expander("Hit ratios", graph("ecn-hit-ratio-chart")),
-            diagnostic_expander("Implied hit ratios vs inventory", graph("ecn-implied-hit-chart")),
+            diagnostic_expander("Relative intensity", graph("ecn-hit-ratio-chart")),
+            diagnostic_expander("Fill intensity vs inventory", graph("ecn-implied-hit-chart")),
             diagnostic_expander("Quotes vs inventory", graph("ecn-quote-inventory-chart")),
             diagnostic_expander("Optimal quote delta", [
                 graph("ecn-policy-chart"),
@@ -819,8 +860,8 @@ policy_tab = html.Div([
 
 mc_tab = html.Div([
     html.Div([
-        number_input("Paths", "mc-paths", 1000, 500),
-        number_input("Initial inventory [M]", "mc-q0", 0.0, 0.25),
+        number_input("Paths", "mc-paths", 1000, 1),
+        number_input("Initial inventory [M]", "mc-q0", 0.0, "any"),
         number_input("Random seed", "mc-seed", 12345, 1),
         html.Button("Run Monte Carlo", id="run-mc", className="secondary-button"),
     ], className="toolbar toolbar-wide"),
@@ -836,14 +877,27 @@ mc_tab = html.Div([
     html.Div([
         diagnostic_expander("Trading-session PnL distribution", graph("pnl-chart", 500), open_=True),
         diagnostic_expander("Inventory paths · median and 95% interval", graph("inventory-chart", 440)),
+        diagnostic_expander("Internalization time to zero", graph("mc-internalization-time-chart", 440)),
 
         html.Div([
             select("Retained path", "path-select", [], None),
             select("Quote size", "path-size-select", [], None),
         ], className="toolbar toolbar-wide mc-path-toolbar"),
 
+        diagnostic_expander("Mark-to-market PnL", graph("path-pnl-chart", 400)),
         diagnostic_expander("Inventory path · exact fill times", graph("path-chart", 400)),
-        diagnostic_expander("Spot, quotes and fills", graph("spot-path-chart", 520)),
+        diagnostic_expander(
+            "Spot, quotes and fills",
+            graph(
+                "spot-path-chart",
+                520,
+                config={
+                    "scrollZoom": True,
+                    "displayModeBar": True,
+                    "doubleClick": "reset+autosize",
+                },
+            ),
+        ),
         diagnostic_expander("Fills by tier and side", [
             graph("fill-counts-chart", 360),
             html.Div("Fill tape", className="card-title table-section-title"),
@@ -854,8 +908,8 @@ mc_tab = html.Div([
 
 frontier_tab = html.Div([
     html.Div([
-        number_input("φ min", "frontier-min", 0.01, 0.01),
-        number_input("φ max", "frontier-max", 0.5, 0.05),
+        number_input("φ min", "frontier-min", 0.01, "any"),
+        number_input("φ max", "frontier-max", 0.5, "any"),
         number_input("Points", "frontier-points", 9, 1),
         checkbox("Log-spaced φ", "frontier-log", True),
         html.Button("Compute frontier", id="run-frontier", className="secondary-button"),
@@ -877,8 +931,7 @@ app.layout = html.Div([
     html.Main([
         html.Header([
             html.Div([
-                html.H1("Trinity 2.0"),
-                html.P("Inventory-aware FX ladder pricing · native C++ Howard engine"),
+                html.H1("FX Ladder Pricer"),
             ]),
             html.Div("Ready", id="status", className="status ready"),
         ], className="topbar"),
@@ -901,17 +954,15 @@ for i in range(3):
     p = f"t{i}"
     for suffix in (
         "enabled", "name", "sizes", "A0", "theta", "beta", "steep", "shift", "vshift",
-        "markout-enabled", "impact", "impact-beta", "impact-tau", "dmin", "dmax",
+        "fee", "markout-enabled", "impact", "impact-beta", "impact-tau", "dmin", "dmax",
     ):
         CONFIG_FIELDS.append((f"{p}-{suffix}", State(f"{p}-{suffix}", "value")))
 for component_id in (
-    "dp-enabled", "dp-dist", "dp-lb", "dp-la", "dp-pb", "dp-pa", "dp-mub", "dp-mua",
-    "dp-p0b", "dp-p0a", "dp-fb", "dp-fa", "dp-sizes", "dp-both",
+    "dp-enabled", "dp-lambda", "dp-mu", "dp-p0", "dp-fee", "dp-sizes",
 ):
     CONFIG_FIELDS.append((component_id, State(component_id, "value")))
 for component_id in (
-    "ecn-enabled", "ecn-A0", "ecn-theta", "ecn-beta", "ecn-steep",
-    "ecn-shift", "ecn-vshift", "ecn-size", "ecn-fee",
+    "ecn-enabled", "ecn-A", "ecn-k", "ecn-dmin", "ecn-dmax", "ecn-size", "ecn-fee",
 ):
     CONFIG_FIELDS.append((component_id, State(component_id, "value")))
 
@@ -957,14 +1008,14 @@ def render_solution(solution, cfg):
 
 
 @app.callback(
-    Output("flow-chart", "figure"), Output("hit-ratio-chart", "figure"), Output("implied-hit-chart", "figure"),
+    Output("rfq-arrival-chart", "figure"), Output("flow-chart", "figure"), Output("hit-ratio-chart", "figure"), Output("implied-hit-chart", "figure"),
     Output("markout-chart", "figure"), Output("quote-inventory-chart", "figure"),
     Output("bid-surface-chart", "figure"), Output("ask-surface-chart", "figure"), Output("ladder-chart", "figure"),
     Output("flow-parameter-table", "children"), Output("ladder-table", "children"),
     Input("solution-store", "data"), Input("config-store", "data"), Input("tier-select", "value"), Input("ladder-q", "value"),
 )
 def render_tier_diagnostics(solution, cfg, tier_index, q_value):
-    empty = (go.Figure(),) * 8 + (html.Div("Solve the model first"), html.Div("Solve the model first"))
+    empty = (go.Figure(),) * 9 + (html.Div("Solve the model first"), html.Div("Solve the model first"))
     if not solution or not cfg or tier_index is None:
         return empty
     try:
@@ -972,6 +1023,7 @@ def render_tier_diagnostics(solution, cfg, tier_index, q_value):
         tier = _tier_cfg(cfg, ti)
         qv = float(q_value if q_value is not None else 0.0)
         return (
+            exogenous_arrival_figure(tier),
             flow_curve_figure(tier),
             hit_ratio_figure(tier),
             implied_hit_ratio_figure(solution, cfg, ti),
@@ -985,7 +1037,7 @@ def render_tier_diagnostics(solution, cfg, tier_index, q_value):
         )
     except Exception as exc:
         err = html.Div(f"Tier diagnostic failed: {exc}", className="error-note")
-        return (go.Figure(),) * 8 + (err, err)
+        return (go.Figure(),) * 9 + (err, err)
 
 
 @app.callback(
@@ -1005,6 +1057,142 @@ def render_dark_pool_diagnostics(solution, cfg):
         dark_pool_arrival_figure(cfg), dark_pool_full_fill_figure(cfg),
         dark_pool_policy_figure(solution), dark_pool_table(solution),
     )
+
+
+def expected_internalization_times(solution: dict[str, Any] | None, cfg: dict[str, Any] | None) -> dict[str, list[float]]:
+    """Expected first-passage time to q=0 under the solved fixed policy.
+
+    This builds the inventory CTMC from exactly the same policy-dependent event
+    intensities used by the Monte Carlo engine, then solves -Q_T tau = 1 with
+    q=0 absorbing.  The production UI uses a uniform 1M inventory grid, so the
+    configured trade sizes must land back on that grid for this exact curve.
+    """
+    if not solution or not cfg:
+        return {"qGrid": [], "minutes": []}
+    q_grid = np.asarray(solution.get("qGrid", []), dtype=float)
+    if q_grid.size == 0:
+        return {"qGrid": [], "minutes": []}
+
+    def state_index(x: float) -> int:
+        j = int(np.argmin(np.abs(q_grid - x)))
+        if abs(float(q_grid[j]) - float(x)) > 1e-8:
+            raise ValueError(
+                "Internalization-time curve requires fill sizes aligned with the 1M inventory grid"
+            )
+        return j
+
+    zero = state_index(0.0)
+    n = len(q_grid)
+    Q = np.zeros((n, n), dtype=float)
+
+    enabled_tiers = {t["name"]: t for t in cfg.get("tiers", []) if t.get("enabled", False)}
+
+    def logistic_rate(flow: dict[str, Any], delta: float, size: float) -> float:
+        scale = float(flow["A0"]) * size ** (-float(flow["theta"]) - float(flow["beta"]) * size)
+        center = float(flow["shift"]) - float(flow["volumeShift"]) * (size - 1.0)
+        y = float(flow["steepness"]) * (delta - center)
+        if y >= 0.0:
+            e = math.exp(-y) if y < 745.0 else 0.0
+            hit = 1.0 / (1.0 + e)
+        else:
+            e = math.exp(y) if y > -745.0 else 0.0
+            hit = e / (1.0 + e)
+        return scale * hit
+
+    def add_transition(i: int, q2: float, rate: float) -> None:
+        if rate <= 0.0:
+            return
+        j = state_index(q2)
+        if j == i:
+            return
+        Q[i, j] += rate
+        Q[i, i] -= rate
+
+    # Customer tiers.
+    for tier_policy in solution.get("tiers", []):
+        tier_cfg = enabled_tiers.get(tier_policy.get("name"))
+        if not tier_cfg:
+            continue
+        sizes = [float(z) for z in tier_policy.get("sizes", [])]
+        flow = tier_cfg["flow"]
+        for i, q in enumerate(q_grid):
+            for side, direction in (("bid", 1.0), ("ask", -1.0)):
+                row = tier_policy[side][i]
+                for j, z in enumerate(sizes):
+                    q2 = float(q) + direction * z
+                    if q2 < q_grid[0] - 1e-8 or q2 > q_grid[-1] + 1e-8:
+                        continue
+                    delta = float(row[j])
+                    add_transition(i, q2, logistic_rate(flow, delta, z))
+
+    # Dark-pool fills.
+    dark_policy = solution.get("darkPool")
+    dark_cfg = cfg.get("darkPool", {})
+    if dark_policy and dark_cfg.get("enabled", False):
+
+        def dark_fill_rates(side: str, posted: int) -> list[tuple[int, float]]:
+            intensity = float(dark_cfg["lambda"])
+            mu = float(dark_cfg["mu"])
+            p0 = float(dark_cfg["p0"])
+            positive_norm = 1.0 - math.exp(-mu)
+            if posted <= 0 or intensity <= 0.0 or positive_norm <= 1e-15:
+                return []
+            positive_mass = 1.0 - p0
+            out=[]
+            cumulative=0.0
+            for k in range(1, posted):
+                pk=math.exp(-mu+k*math.log(mu)-math.lgamma(k+1))/positive_norm
+                cumulative += pk
+                out.append((k, intensity*positive_mass*pk))
+            out.append((posted, intensity*positive_mass*max(0.0,1.0-cumulative)))
+            return out
+
+        for i, q in enumerate(q_grid):
+            for side, direction in (("bid", 1.0), ("ask", -1.0)):
+                active = bool(dark_policy[f"{side}Active"][i])
+                if not active:
+                    continue
+                posted = int(round(float(dark_policy[f"{side}Size"][i])))
+                if posted <= 0:
+                    continue
+                for fill, rate in dark_fill_rates(side, posted):
+                    q2 = float(q) + direction * float(fill)
+                    if q_grid[0] - 1e-8 <= q2 <= q_grid[-1] + 1e-8:
+                        add_transition(i, q2, rate)
+
+    # Passive ECN hedge.
+    ecn_policy = solution.get("passiveEcn")
+    ecn_cfg = cfg.get("passiveEcn", {})
+    if ecn_policy and ecn_cfg.get("enabled", False):
+        A = float(ecn_cfg["flow"]["A"])
+        k = float(ecn_cfg["flow"]["k"])
+        z = float(ecn_cfg["quoteSize"])
+        for i, q in enumerate(q_grid):
+            for side, direction in (("bid", 1.0), ("ask", -1.0)):
+                if not bool(ecn_policy[f"{side}Active"][i]):
+                    continue
+                delta = float(ecn_policy[f"{side}Delta"][i])
+                rate = A * math.exp(-k * delta)
+                q2 = float(q) + direction * z
+                if q_grid[0] - 1e-8 <= q2 <= q_grid[-1] + 1e-8:
+                    add_transition(i, q2, rate)
+
+    transient = [i for i in range(n) if i != zero]
+    minus_q = -Q[np.ix_(transient, transient)]
+    rhs = np.ones(len(transient), dtype=float)
+    try:
+        tau_transient = np.linalg.solve(minus_q, rhs)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("Internalization time is not finite for the current policy") from exc
+
+    tau = np.zeros(n, dtype=float)
+    tau[transient] = np.maximum(0.0, tau_transient)
+    qmax = float(cfg.get("grid", {}).get("maxAbs", np.max(np.abs(q_grid))))
+    operational = np.abs(q_grid) <= qmax + 1e-8
+    return {
+        "qGrid": q_grid[operational].tolist(),
+        "minutes": tau[operational].tolist(),
+    }
 
 
 @app.callback(
@@ -1048,15 +1236,17 @@ def update_path_quote_sizes(solution):
 
 @app.callback(
     Output("mc-store", "data"), Output("stats-store", "data"), Output("status", "children", allow_duplicate=True), Output("status", "className", allow_duplicate=True),
-    Input("run-mc", "n_clicks"), State("config-store", "data"), State("mc-paths", "value"), State("mc-q0", "value"), State("mc-seed", "value"), prevent_initial_call=True,
+    Input("run-mc", "n_clicks"), State("config-store", "data"), State("solution-store", "data"), State("mc-paths", "value"), State("mc-q0", "value"), State("mc-seed", "value"), prevent_initial_call=True,
 )
-def run_mc(_clicks, cfg, paths, q0, seed):
+def run_mc(_clicks, cfg, solution, paths, q0, seed):
     if not cfg:
         return no_update, no_update, "Solve the model first", "status error"
     try:
         engine = ENGINES.get(cfg)
         mc = engine.simulate(SESSION_HORIZON, int(paths), float(q0), int(seed), retained_paths=8, sample_points=381)
         stats = engine.statistics(SESSION_HORIZON, float(q0))
+        if solution:
+            stats["internalizationTimes"] = expected_internalization_times(solution, cfg)
         return mc, stats, "Monte Carlo complete", "status ready"
     except Exception as exc:
         return no_update, no_update, f"Monte Carlo failed · {exc}", "status error"
@@ -1065,12 +1255,12 @@ def run_mc(_clicks, cfg, paths, q0, seed):
 @app.callback(
     Output("mc-mean", "children"), Output("cf-mean", "children"), Output("mc-std", "children"), Output("cf-std", "children"),
     Output("mc-p5", "children"), Output("mc-loss", "children"), Output("pnl-chart", "figure"), Output("inventory-chart", "figure"),
-    Output("path-select", "options"), Output("path-select", "value"),
+    Output("mc-internalization-time-chart", "figure"), Output("path-select", "options"), Output("path-select", "value"),
     Input("mc-store", "data"), Input("stats-store", "data"),
 )
 def render_mc(mc, stats):
     if not mc or not stats:
-        return "—", "—", "—", "—", "—", "—", go.Figure(), go.Figure(), [], None
+        return "—", "—", "—", "—", "—", "—", go.Figure(), go.Figure(), go.Figure(), [], None
     pnl = np.asarray(mc["pnlBase"], dtype=float)
     mc_mean = float(np.mean(pnl)); mc_std = float(np.std(pnl, ddof=1)) if len(pnl) > 1 else 0.0
     p5 = float(np.percentile(pnl, 5)); loss = 100.0 * float(np.mean(pnl < 0.0))
@@ -1088,20 +1278,71 @@ def render_mc(mc, stats):
     inv.add_hline(y=0, line_dash="dot")
     inv.update_layout(title="Inventory paths · median and 95% interval", yaxis_title="Inventory [EUR M]", template="trinity_dark")
     apply_session_clock_axis(inv)
+    internal = go.Figure()
+    internal_data = stats.get("internalizationTimes") or {}
+    q_grid = np.asarray(internal_data.get("qGrid", []), dtype=float)
+    tau = np.asarray(internal_data.get("minutes", []), dtype=float)
+    if len(q_grid) == len(tau) and len(q_grid):
+        positive = q_grid >= -1e-12
+        negative = q_grid <= 1e-12
+        # Plot inventory *size* on the horizontal axis.  Long and short sides are
+        # separate traces so any asymmetry in the optimized policy remains visible.
+        internal.add_trace(go.Scatter(
+            x=q_grid[positive], y=tau[positive], mode="lines+markers",
+            name="Long inventory", hovertemplate="Inventory %{x:.0f}M<br>Time to zero %{y:.2f} min<extra></extra>"
+        ))
+        internal.add_trace(go.Scatter(
+            x=np.abs(q_grid[negative][::-1]), y=tau[negative][::-1], mode="lines+markers",
+            name="Short inventory", hovertemplate="Inventory %{x:.0f}M<br>Time to zero %{y:.2f} min<extra></extra>"
+        ))
+    internal.update_layout(
+        title="Expected internalization time to zero",
+        xaxis_title="Inventory size [EUR M]",
+        yaxis_title="Expected time to zero [min]",
+        template="trinity_dark",
+        hovermode="x unified",
+    )
+    internal.update_xaxes(rangemode="tozero")
+    internal.update_yaxes(rangemode="tozero")
+
     options = [{"label": f"Path {i + 1}", "value": i} for i in range(len(mc.get("samplePaths", [])))]
-    return format_ccy(mc_mean), format_ccy(stats["meanBase"]), format_ccy(mc_std), format_ccy(stats["stdBase"]), format_ccy(p5), f"{loss:.1f}%", hist, inv, options, (0 if options else None)
+    return format_ccy(mc_mean), format_ccy(stats["meanBase"]), format_ccy(mc_std), format_ccy(stats["stdBase"]), format_ccy(p5), f"{loss:.1f}%", hist, inv, internal, options, (0 if options else None)
 
 
 @app.callback(
-    Output("path-chart", "figure"), Output("spot-path-chart", "figure"),
+    Output("path-pnl-chart", "figure"), Output("path-chart", "figure"), Output("spot-path-chart", "figure"),
     Output("fill-counts-chart", "figure"), Output("fill-tape", "children"),
     Input("mc-store", "data"), Input("path-select", "value"), Input("path-size-select", "value"),
     Input("solution-store", "data"), Input("config-store", "data"),
 )
 def render_path(mc, path_index, quote_size, solution, cfg):
     if not mc or path_index is None or not mc.get("samplePaths"):
-        return go.Figure(), go.Figure(), go.Figure(), "No retained path"
+        return go.Figure(), go.Figure(), go.Figure(), go.Figure(), "No retained path"
     path = mc["samplePaths"][int(path_index)]
+
+    # Exact retained-path mark-to-market PnL. Cash is stored by the native
+    # simulator at the same timestamps as spot/inventory, so all execution
+    # prices and venue/tier fees are included without reconstruction.
+    pnl_fig = go.Figure()
+    cashes = np.asarray(path.get("cashes", []), dtype=float)
+    spots_path = np.asarray(path.get("spots", []), dtype=float)
+    inventories_path = np.asarray(path.get("inventories", []), dtype=float)
+    times_path = np.asarray(path.get("times", []), dtype=float)
+    if len(cashes) == len(spots_path) == len(inventories_path) == len(times_path) and len(cashes) > 0:
+        q0_pnl = float(inventories_path[0])
+        s0_pnl = float(spots_path[0])
+        pnl_quote = (cashes + inventories_path * spots_path - q0_pnl * s0_pnl) * 1_000_000.0
+        pnl_base = np.divide(pnl_quote, spots_path, out=np.full_like(pnl_quote, np.nan), where=np.abs(spots_path) > 1e-15)
+        pnl_fig.add_trace(go.Scatter(
+            x=session_timestamps(times_path.tolist()), y=pnl_base, mode="lines",
+            name="MtM PnL", line=dict(width=2.5), line_shape="hv",
+            hovertemplate="%{x|%H:%M:%S}<br>MtM PnL=%{y:,.0f} EUR<extra></extra>",
+        ))
+        pnl_fig.add_hline(y=0, line_dash="dot")
+    else:
+        pnl_fig.add_annotation(text="Rebuild the native extension to record path cash/PnL", showarrow=False)
+    pnl_fig.update_layout(title="Mark-to-market PnL", yaxis_title="PnL [EUR]", template="trinity_dark")
+    apply_session_clock_axis(pnl_fig)
 
     # Exact event-time inventory path reconstructed from the fill tape.
     q0 = float(path["inventories"][0]) if path.get("inventories") else 0.0
@@ -1140,8 +1381,105 @@ def render_path(mc, path_index, quote_size, solution, cfg):
             spot_fig.add_trace(go.Scatter(x=path_clock, y=bid_px, mode="lines", name=f"{tier['name']} bid {float(quote_size):g}M", opacity=.72, line=dict(color=BID_COLOR), line_shape="hv"))
             spot_fig.add_trace(go.Scatter(x=path_clock, y=ask_px, mode="lines", line=dict(color=ASK_COLOR, dash="dash"), line_shape="hv", name=f"{tier['name']} ask {float(quote_size):g}M", opacity=.72))
 
+        # Passive ECN is a separate optimized venue, so it is not present in
+        # solution["tiers"]. Reconstruct the ECN quote state explicitly using
+        # the same left-bracket inventory lookup as the C++ Monte Carlo engine.
+        ecn = solution.get("passiveEcn")
+        if ecn:
+            ecn_q = np.asarray(ecn["qGrid"], dtype=float)
+            bid_delta_grid = np.asarray(ecn["bidDelta"], dtype=float)
+            ask_delta_grid = np.asarray(ecn["askDelta"], dtype=float)
+            bid_active_grid = np.asarray(ecn["bidActive"], dtype=bool)
+            ask_active_grid = np.asarray(ecn["askActive"], dtype=bool)
+
+            def ecn_state_indices(q_values):
+                idx = np.searchsorted(ecn_q, q_values, side="left")
+                idx = np.clip(idx, 0, len(ecn_q) - 1)
+                exact = np.isclose(ecn_q[idx], q_values, rtol=0.0, atol=1e-10)
+                idx = np.where((idx > 0) & ~exact, idx - 1, idx)
+                return idx.astype(int)
+
+            ecn_idx = ecn_state_indices(inventories)
+            ecn_bid_delta = bid_delta_grid[ecn_idx]
+            ecn_ask_delta = ask_delta_grid[ecn_idx]
+            ecn_bid_active = bid_active_grid[ecn_idx]
+            ecn_ask_active = ask_active_grid[ecn_idx]
+            ecn_bid_px = np.where(ecn_bid_active, spots - ecn_bid_delta / 10_000.0, np.nan)
+            ecn_ask_px = np.where(ecn_ask_active, spots + ecn_ask_delta / 10_000.0, np.nan)
+            ecn_size = float(ecn["quoteSize"])
+
+            spot_fig.add_trace(go.Scatter(
+                x=path_clock, y=ecn_bid_px, mode="lines",
+                name=f"Passive ECN bid {ecn_size:g}M",
+                opacity=.95, line=dict(color=BID_COLOR, width=3, dash="dot"),
+                line_shape="hv", connectgaps=False,
+            ))
+            spot_fig.add_trace(go.Scatter(
+                x=path_clock, y=ecn_ask_px, mode="lines",
+                name=f"Passive ECN ask {ecn_size:g}M",
+                opacity=.95, line=dict(color=ASK_COLOR, width=3, dash="dot"),
+                line_shape="hv", connectgaps=False,
+            ))
+
+    ecn_arrivals = list(path.get("ecnArrivals", []))
+    if ecn_arrivals:
+        def _ecn_plot_price(event):
+            side = str(event.get("side", "")).lower()
+            ref = float(event.get("referencePrice", np.nan))
+            quote_depth = float(event.get("quoteDepthPips", event.get("depthPips", np.nan)))
+            trade_px = float(event.get("tradePrice", ref))
+            if bool(event.get("won", False)) and np.isfinite(ref) and np.isfinite(quote_depth):
+                signed = quote_depth / 10_000.0
+                return ref - signed if side == "bid" else ref + signed
+            return trade_px
+
+        def _ecn_trace(events, side, won, name, color, fill_status):
+            chosen = [e for e in events if str(e.get("side", "")).lower() == side and bool(e.get("won", False)) == won]
+            if not chosen:
+                return None
+            return go.Scatter(
+                x=[session_timestamp(e["time"]) for e in chosen],
+                y=[_ecn_plot_price(e) for e in chosen],
+                mode="markers",
+                name=name,
+                marker=dict(
+                    symbol="circle",
+                    size=8,
+                    color=color if won else "rgba(0,0,0,0)",
+                    line=dict(color=color, width=2),
+                ),
+                customdata=[[
+                    side.capitalize(),
+                    fill_status,
+                    float(e.get("tradeDistancePips", np.nan)),
+                    float(e.get("quoteDepthPips", e.get("depthPips", np.nan))),
+                    float(e.get("tradePrice", np.nan)),
+                    bool(e.get("quoteActive", False)),
+                ] for e in chosen],
+                hovertemplate=(
+                    "%{x|%H:%M:%S}<br>ECN %{customdata[0]} trade · %{customdata[1]}"
+                    "<br>plot px=%{y:.6f}<br>trade px=%{customdata[4]:.6f}"
+                    "<br>trade distance=%{customdata[2]:.2f} pips"
+                    "<br>quote depth=%{customdata[3]:.2f} pips"
+                    "<br>quote active=%{customdata[5]}<extra></extra>"
+                ),
+            )
+
+        for args in (
+            ("ask", True,  "ECN ask fills",     ASK_COLOR, "filled"),
+            ("ask", False, "ECN ask not filled", ASK_COLOR, "not filled"),
+            ("bid", True,  "ECN bid fills",     BID_COLOR, "filled"),
+            ("bid", False, "ECN bid not filled", BID_COLOR, "not filled"),
+        ):
+            trace = _ecn_trace(ecn_arrivals, *args)
+            if trace is not None:
+                spot_fig.add_trace(trace)
+
     for side, symbol in (("bid", "triangle-up"), ("ask", "triangle-down")):
-        fills_side = [f for f in path["fills"] if str(f["side"]).lower() == side]
+        fills_side = [
+            f for f in path["fills"]
+            if str(f["side"]).lower() == side and str(f.get("tier", "")) != "Passive ECN"
+        ]
         if fills_side:
             spot_fig.add_trace(go.Scatter(
                 x=[session_timestamp(f["time"]) for f in fills_side], y=[f["price"] for f in fills_side], mode="markers",
@@ -1150,7 +1488,13 @@ def render_path(mc, path_index, quote_size, solution, cfg):
                 hovertemplate="%{x|%H:%M:%S}<br>px=%{y:.6f}<br>%{customdata[0]} · %{customdata[1]}M<extra></extra>",
             ))
     title_size = "" if quote_size is None else f" · {float(quote_size):g}M quotes"
-    spot_fig.update_layout(title=f"Spot, quotes and fills{title_size}", yaxis_title="EURSEK", template="trinity_dark")
+    spot_fig.update_layout(
+        title=f"Spot, quotes and fills{title_size}",
+        yaxis_title="EURSEK",
+        template="trinity_dark",
+        dragmode="pan",
+        uirevision="simulation-spot-quotes-fills",
+    )
     apply_session_clock_axis(spot_fig)
 
     counts: dict[tuple[str,str], int] = {}
@@ -1172,7 +1516,7 @@ def render_path(mc, path_index, quote_size, solution, cfg):
             html.Td(f"{f['price']:.6f}"), html.Td(f"{f['inventoryBefore']:.2f}"), html.Td(f"{f['inventoryAfter']:.2f}"),
         ]))
     table = html.Table([header, html.Tbody(rows or [html.Tr(html.Td("No fills", colSpan=7))])], className="data-table")
-    return fig, spot_fig, fill_counts, table
+    return pnl_fig, fig, spot_fig, fill_counts, table
 
 
 @app.callback(
