@@ -7,6 +7,15 @@ from typing import Any, Iterable
 from . import _native
 
 
+_EXPECTED_ECN_PARAMETERIZATION_VERSION = 3
+if getattr(_native, "ECN_PARAMETERIZATION_VERSION", None) != _EXPECTED_ECN_PARAMETERIZATION_VERSION:
+    raise RuntimeError(
+        "The compiled trinity._native extension is stale. Rebuild it with "
+        "`python3 setup.py build_ext --inplace` (or reinstall with `pip install -e .`) "
+        "before running the dashboard."
+    )
+
+
 class Engine:
     """Small Python façade around the C++ pricing engine.
 

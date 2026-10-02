@@ -1,3 +1,4 @@
+import pytest
 from trinity.defaults import default_config
 from trinity.ui_config import build_config, checked
 
@@ -33,7 +34,7 @@ def ui_values_from_default():
     values.update({
         "ecn-enabled": ["on"] if ecn["enabled"] else [],
         "ecn-A": ecn["flow"]["A"], "ecn-k": ecn["flow"]["k"],
-        "ecn-dmin": ecn["minDistancePips"], "ecn-dmax": ecn["maxDistancePips"],
+        "ecn-dmin": ecn["minDelta"], "ecn-dmax": ecn["maxDelta"],
         "ecn-size": ecn["quoteSize"], "ecn-fee": ecn["makerFeePips"],
     })
     return values
@@ -60,24 +61,38 @@ def test_checked_dash_checklist_values():
     assert checked(None) is False
 
 
-def test_passive_ecn_uses_tenth_pip_distance_grid():
+def test_passive_ecn_uses_one_percent_delta_grid():
     cfg = build_config(ui_values_from_default())
     ecn = cfg["passiveEcn"]
     deltas = ecn["deltas"]
-    assert ecn["minDistancePips"] == 0.0
-    assert ecn["maxDistancePips"] == 20.0
-    assert len(deltas) == 201
+    assert ecn["minDelta"] == 0.0
+    assert ecn["maxDelta"] == 0.5
+    assert len(deltas) == 51
     assert deltas[0] == 0.0
-    assert deltas[-1] == 20.0
-    assert all(abs((b - a) - 0.1) < 1e-12 for a, b in zip(deltas, deltas[1:]))
+    assert deltas[-1] == 0.5
+    assert all(abs((b - a) - 0.01) < 1e-12 for a, b in zip(deltas, deltas[1:]))
 
 
-def test_passive_ecn_distance_bounds_drive_grid():
+def test_passive_ecn_delta_bounds_drive_grid():
     values = ui_values_from_default()
-    values["ecn-dmin"] = 2.0
-    values["ecn-dmax"] = 5.0
+    values["ecn-dmin"] = 0.20
+    values["ecn-dmax"] = 0.35
     cfg = build_config(values)
-    assert cfg["passiveEcn"]["deltas"] == [round(2.0 + 0.1 * i, 10) for i in range(31)]
+    assert cfg["passiveEcn"]["deltas"] == [round(0.20 + 0.01 * i, 10) for i in range(16)]
+
+
+def test_passive_ecn_cannot_cross_through_mid():
+    values = ui_values_from_default()
+    values["ecn-dmax"] = 0.51
+    with pytest.raises(ValueError, match="<= 0.5"):
+        build_config(values)
+
+
+def test_passive_ecn_bounds_must_align_to_one_percent_grid():
+    values = ui_values_from_default()
+    values["ecn-dmin"] = 0.005
+    with pytest.raises(ValueError, match="0.01 grid"):
+        build_config(values)
 
 
 def test_inventory_grid_is_fixed_uniform_one_million():
@@ -108,8 +123,8 @@ def test_continuous_dash_number_inputs_do_not_impose_step_grid():
     app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
     allowed_discrete = (
         'number_input("Max |q| [M]",',
-        'number_input("Min distance from mid [pips]",',
-        'number_input("Max distance from mid [pips]",',
+        'number_input("Min delta",',
+        'number_input("Max delta",',
         'number_input("Paths",',
         'number_input("Random seed",',
         'number_input("Points",',
@@ -186,3 +201,33 @@ def test_dark_pool_is_zero_inflated_poisson_only():
     assert '"dp-dist"' not in app_source
     assert '"dp-pb"' not in app_source
     assert '"dp-pa"' not in app_source
+
+
+def test_default_fx_mid_supports_direct_and_inverse_pairs():
+    from trinity.defaults import DEFAULT_FX_MIDS, default_fx_mid
+
+    assert default_fx_mid("EURUSD") == DEFAULT_FX_MIDS["EURUSD"]
+    assert default_fx_mid("USDEUR") == pytest.approx(1.0 / DEFAULT_FX_MIDS["EURUSD"])
+    assert default_fx_mid(None) is None
+    assert default_fx_mid("BAD") is None
+
+
+def test_flow_source_dynamic_buttons_ignore_mount_events():
+    """Dynamic Dash controls mount with n_clicks=0; those are not user actions."""
+    from pathlib import Path
+
+    app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
+    assert 'if not _remove:\n            return (no_update,) * 20' in app_source
+    assert 'if not _add:\n            return (no_update,) * 20' in app_source
+    assert 'if not triggered_value:\n            return no_update' in app_source
+
+
+def test_ecn_flow_source_ui_is_wired_for_crossed_sources():
+    from pathlib import Path
+
+    app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
+    assert 'id="open-ecn-flow-sources"' in app_source
+    assert 'id="ecn-extra-flow-sources-store"' in app_source
+    assert 'ecn["flowSources"] = [direct] + deepcopy(ecn_extras)' in app_source
+    assert 'if not _remove:\n            return (no_update,) * 4' in app_source
+    assert 'if not _add:\n            return (no_update,) * 4' in app_source

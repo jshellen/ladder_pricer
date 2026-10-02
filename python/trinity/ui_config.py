@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from .defaults import default_config, ecn_distance_grid
+from .defaults import default_config, ecn_delta_grid
 
 
 def checked(value: Any) -> bool:
@@ -88,13 +88,13 @@ def build_config(values: Mapping[str, Any]) -> dict[str, Any]:
         "postedSizes": parse_numbers(values.get("dp-sizes", "")),
     }
     ecn_default = cfg["passiveEcn"]
-    min_distance = _number(values, "ecn-dmin") if values.get("ecn-dmin") is not None else ecn_default["minDistancePips"]
-    max_distance = _number(values, "ecn-dmax") if values.get("ecn-dmax") is not None else ecn_default["maxDistancePips"]
+    min_delta = _number(values, "ecn-dmin") if values.get("ecn-dmin") is not None else ecn_default["minDelta"]
+    max_delta = _number(values, "ecn-dmax") if values.get("ecn-dmax") is not None else ecn_default["maxDelta"]
     cfg["passiveEcn"] = {
         "enabled": checked(values.get("ecn-enabled")),
-        "minDistancePips": min_distance,
-        "maxDistancePips": max_distance,
-        "deltas": ecn_distance_grid(min_distance, max_distance),
+        "minDelta": min_delta,
+        "maxDelta": max_delta,
+        "deltas": ecn_delta_grid(min_delta, max_delta),
         "flow": {
             "A": _number(values, "ecn-A") if values.get("ecn-A") is not None else ecn_default["flow"]["A"],
             "k": _number(values, "ecn-k") if values.get("ecn-k") is not None else ecn_default["flow"]["k"],

@@ -1,0 +1,20 @@
+/* Dash 4 flow-source dropdown selected-value colour override. */
+.flow-source-modal .field-dropdown,
+.flow-source-modal .field-dropdown .dash-dropdown-wrapper,
+.flow-source-modal .field-dropdown .dash-dropdown-wrapper button,
+.flow-source-modal .field-dropdown button[aria-haspopup],
+.flow-source-modal .field-dropdown [role="combobox"] {
+  --Dash-Text-Primary: #111821;
+  --Dash-Text-Secondary: #334155;
+  color: #111821 !important;
+  -webkit-text-fill-color: #111821 !important;
+  opacity: 1 !important;
+}
+
+.flow-source-modal .field-dropdown .dash-dropdown-wrapper button *,
+.flow-source-modal .field-dropdown button[aria-haspopup] *,
+.flow-source-modal .field-dropdown [role="combobox"] * {
+  color: #111821 !important;
+  -webkit-text-fill-color: #111821 !important;
+  opacity: 1 !important;
+}

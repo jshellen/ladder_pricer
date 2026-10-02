@@ -8,9 +8,9 @@ from typing import Any
 import numpy as np
 import plotly.graph_objects as go
 import plotly.io as pio
-from dash import Dash, Input, Output, State, dcc, html, no_update
+from dash import ALL, Dash, Input, Output, State, ctx, dcc, html, no_update
 
-from trinity.defaults import default_config
+from trinity.defaults import default_config, default_fx_mid
 from trinity.service import ENGINES
 from trinity.ui_config import build_config, checked, parse_numbers
 
@@ -18,6 +18,46 @@ APP_TITLE = "FX Ladder Pricer"
 SESSION_HORIZON = 570.0
 BASE_CCY = "EUR"
 QUOTE_CCY = "SEK"
+
+FX_PAIRS = [
+    "EURSEK", "USDSEK", "GBPSEK", "NOKSEK", "DKKSEK",
+    "EURNOK", "USDNOK", "GBPNOK", "SEKNOK", "DKKNOK",
+    "EURDKK", "USDDKK", "GBPDKK", "SEKDKK", "NOKDKK",
+    "EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "USDCAD", "USDCHF", "USDJPY",
+    "EURGBP", "EURCHF", "EURJPY", "GBPCHF", "GBPJPY", "AUDJPY", "NZDJPY",
+]
+FX_PAIR_OPTIONS = [{"label": pair, "value": pair} for pair in FX_PAIRS]
+
+def _pair_legs(pair: str | None) -> tuple[str, str] | None:
+    pair = str(pair or "").upper().strip()
+    if len(pair) != 6 or not pair.isalpha():
+        return None
+    return pair[:3], pair[3:]
+
+def _source_pair_options(target_pair: str | None) -> list[dict[str, str]]:
+    legs = _pair_legs(target_pair)
+    if not legs:
+        return FX_PAIR_OPTIONS
+    _, quote = legs
+    pairs = [pair for pair in FX_PAIRS if _pair_legs(pair) and _pair_legs(pair)[1] == quote and pair != target_pair]
+    return [{"label": pair, "value": pair} for pair in pairs]
+
+def _derive_cross_pair(target_pair: str | None, source_pair: str | None) -> str | None:
+    target = _pair_legs(target_pair)
+    source = _pair_legs(source_pair)
+    if not target or not source or target[1] != source[1] or target[0] == source[0]:
+        return None
+    # The backend expects X = target-base/source-base so that
+    # source_price = target_price / X. Keep this orientation even when the
+    # market convention normally quotes the inverse cross.
+    return target[0] + source[0]
+
+def _cross_pair_options(target_pair: str | None, source_pair: str | None) -> list[dict[str, str]]:
+    derived = _derive_cross_pair(target_pair, source_pair)
+    pairs = list(FX_PAIRS)
+    if derived and derived not in pairs:
+        pairs.insert(0, derived)
+    return [{"label": pair, "value": pair} for pair in pairs]
 
 SESSION_CLOCK_ORIGIN = datetime(2000, 1, 1, 7, 45)
 SESSION_TIME_TICK_MINUTES = [0.0, 120.0, 240.0, 360.0, 480.0, SESSION_HORIZON]
@@ -185,13 +225,200 @@ def diagnostic_expander(title: str, children, open_: bool = False):
     )
 
 
+
+def _default_cross_flow_source(index: int = 0, target_pair: str | None = None) -> dict[str, Any]:
+    return {
+        "name": "Select FX pair",
+        "pair": None,
+        "crossPair": None,
+        "mapping": {"type": "crossed", "crossMid": None, "sourceSpreadPips": 20.0},
+        "flow": {"A0": 0.01, "theta": 0.144, "beta": 0.0857, "steepness": 8.42, "shift": 0.52, "volumeShift": 0.026},
+    }
+
+
+def _direct_flow_source(flow: dict[str, Any], target_pair: str) -> dict[str, Any]:
+    return {
+        "name": str(target_pair),
+        "pair": str(target_pair),
+        "mapping": {"type": "identity"},
+        "flow": deepcopy(flow),
+    }
+
+
+def _default_cross_ecn_flow_source(index: int = 0, target_pair: str | None = None) -> dict[str, Any]:
+    return {
+        "name": "Select FX pair",
+        "pair": None,
+        "crossPair": None,
+        "mapping": {"type": "crossed", "crossMid": None, "sourceSpreadPips": 20.0},
+        "flow": {"A": 0.10, "k": 8.4},
+    }
+
+
+def _direct_ecn_flow_source(flow: dict[str, Any], target_pair: str) -> dict[str, Any]:
+    return {
+        "name": str(target_pair),
+        "pair": str(target_pair),
+        "mapping": {"type": "identity"},
+        "flow": deepcopy(flow),
+    }
+
+
+def flow_pair_card(key: str, label: str, selected: bool, removable: bool = False):
+    classes = "flow-pair-card" + (" selected" if selected else "")
+    children = [
+        html.Button(
+            label,
+            id={"type": "flow-pair-select", "key": key},
+            className=classes,
+            n_clicks=0,
+        )
+    ]
+    children.append(html.Span("crossed" if removable else "direct", className="flow-pair-badge"))
+    return html.Div(children, className="flow-pair-card-wrap")
+
+
+def _dropdown_field(label: str, component_id: str, value: str | None, options: list[dict[str, str]], placeholder: str = "Select FX pair"):
+    return html.Label([
+        html.Span(label),
+        dcc.Dropdown(id=component_id, value=value, options=options, placeholder=placeholder, clearable=False, className="field-dropdown", persistence=True, persistence_type="memory"),
+    ], className="field")
+
+
+def flow_source_settings_editor(source_key: str, source: dict[str, Any], target_pair: str):
+    flow = source.get("flow", {})
+    mapping = source.get("mapping", {})
+    direct = source_key == "direct"
+
+    header = html.Div([
+        html.Div([
+            html.Div(str(source.get("pair") or target_pair), className="flow-source-title"),
+            html.Div("Direct target-pair flow" if direct else "Crossed source", className="muted-note source-kind-note"),
+        ]),
+        None if direct else html.Button(
+            "Remove FX pair",
+            id="flow-source-remove-selected",
+            className="ghost-button danger-ghost-button",
+            n_clicks=0,
+        ),
+    ], className="flow-source-row-head")
+
+    if direct:
+        source_fields = [html.Div([
+            dcc.Dropdown(id="flow-edit-pair", value=target_pair, options=FX_PAIR_OPTIONS),
+            dcc.Dropdown(id="flow-edit-cross-pair", value=None, options=FX_PAIR_OPTIONS),
+            dcc.Input(id="flow-edit-cross-mid", type="number", value=1.0),
+            dcc.Input(id="flow-edit-spread", type="number", value=1.0),
+            html.Button("Remove FX pair", id="flow-source-remove-selected", n_clicks=0),
+        ], style={"display": "none"})]
+    else:
+        pair = source.get("pair")
+        cross_pair = source.get("crossPair") or _derive_cross_pair(target_pair, pair)
+        configured_mid = mapping.get("crossMid")
+        cross_mid = configured_mid if configured_mid is not None else default_fx_mid(cross_pair)
+        source_fields = [
+            html.Div([
+                _dropdown_field("Source pair", "flow-edit-pair", pair, _source_pair_options(target_pair)),
+                _dropdown_field("Cross / hedge pair", "flow-edit-cross-pair", cross_pair, _cross_pair_options(target_pair, pair), "Select hedge pair"),
+                number_input("Cross mid", "flow-edit-cross-mid", cross_mid, "any"),
+                number_input("Source spread [pips]", "flow-edit-spread", float(mapping.get("sourceSpreadPips", 20.0)), "any"),
+            ], className="grid-2"),
+            html.Div("Flow calibration", className="subhead"),
+        ]
+
+    return html.Div([
+        header,
+        *source_fields,
+        html.Div([
+            number_input("A0 / min", "flow-edit-A0", float(flow.get("A0", 0.01)), "any"),
+            number_input("Theta", "flow-edit-theta", float(flow.get("theta", 0.144)), "any"),
+            number_input("Beta", "flow-edit-beta", float(flow.get("beta", 0.0857)), "any"),
+            number_input("Steepness", "flow-edit-steep", float(flow.get("steepness", 8.42)), "any"),
+            number_input("Shift", "flow-edit-shift", float(flow.get("shift", 0.52)), "any"),
+            number_input("Volume shift", "flow-edit-vshift", float(flow.get("volumeShift", 0.026)), "any"),
+        ], className="grid-2 flow-calibration-grid"),
+    ], className="flow-source-settings")
+
+def ecn_flow_pair_card(key: str, label: str, selected: bool, removable: bool = False):
+    classes = "flow-pair-card" + (" selected" if selected else "")
+    return html.Div([
+        html.Button(
+            label,
+            id={"type": "ecn-flow-pair-select", "key": key},
+            className=classes,
+            n_clicks=0,
+        ),
+        html.Span("crossed" if removable else "direct", className="flow-pair-badge"),
+    ], className="flow-pair-card-wrap")
+
+
+def _ecn_dropdown_field(label: str, component_id: str, value: str | None, options: list[dict[str, str]], placeholder: str = "Select FX pair"):
+    return html.Label([
+        html.Span(label),
+        dcc.Dropdown(id=component_id, value=value, options=options, placeholder=placeholder, clearable=False, className="field-dropdown", persistence=True, persistence_type="memory"),
+    ], className="field")
+
+
+def ecn_flow_source_settings_editor(source_key: str, source: dict[str, Any], target_pair: str):
+    flow = source.get("flow", {})
+    mapping = source.get("mapping", {})
+    direct = source_key == "direct"
+
+    header = html.Div([
+        html.Div([
+            html.Div(str(source.get("pair") or target_pair), className="flow-source-title"),
+            html.Div("Direct target-pair ECN flow" if direct else "Crossed ECN source", className="muted-note source-kind-note"),
+        ]),
+        None if direct else html.Button(
+            "Remove FX pair", id="ecn-flow-source-remove-selected",
+            className="ghost-button danger-ghost-button", n_clicks=0,
+        ),
+    ], className="flow-source-row-head")
+
+    if direct:
+        source_fields = [html.Div([
+            dcc.Dropdown(id="ecn-flow-edit-pair", value=target_pair, options=FX_PAIR_OPTIONS),
+            dcc.Dropdown(id="ecn-flow-edit-cross-pair", value=None, options=FX_PAIR_OPTIONS),
+            dcc.Input(id="ecn-flow-edit-cross-mid", type="number", value=1.0),
+            dcc.Input(id="ecn-flow-edit-spread", type="number", value=1.0),
+            html.Button("Remove FX pair", id="ecn-flow-source-remove-selected", n_clicks=0),
+        ], style={"display": "none"})]
+    else:
+        pair = source.get("pair")
+        cross_pair = source.get("crossPair") or _derive_cross_pair(target_pair, pair)
+        configured_mid = mapping.get("crossMid")
+        cross_mid = configured_mid if configured_mid is not None else default_fx_mid(cross_pair)
+        source_fields = [
+            html.Div([
+                _ecn_dropdown_field("Source pair", "ecn-flow-edit-pair", pair, _source_pair_options(target_pair)),
+                _ecn_dropdown_field("Cross / hedge pair", "ecn-flow-edit-cross-pair", cross_pair, _cross_pair_options(target_pair, pair), "Select hedge pair"),
+                number_input("Cross mid", "ecn-flow-edit-cross-mid", cross_mid, "any"),
+                number_input("Source spread [pips]", "ecn-flow-edit-spread", float(mapping.get("sourceSpreadPips", 20.0)), "any"),
+            ], className="grid-2"),
+            html.Div("ECN flow calibration", className="subhead"),
+        ]
+
+    return html.Div([
+        header,
+        *source_fields,
+        html.Div([
+            number_input("A at mid / side [trades/min]", "ecn-flow-edit-A", float(flow.get("A", 0.10)), "any"),
+            number_input("k", "ecn-flow-edit-k", float(flow.get("k", 8.4)), "any"),
+        ], className="grid-2 flow-calibration-grid"),
+    ], className="flow-source-settings")
+
+
 def tier_panel(index: int, tier: dict[str, Any], open_: bool = False):
     p = f"t{index}"
     return panel(tier["name"], [
         checkbox("Enabled", f"{p}-enabled", tier["enabled"]),
         text_input("Name", f"{p}-name", tier["name"]),
         text_input("Sizes [EUR M]", f"{p}-sizes", ", ".join(str(x) for x in tier["sizes"])),
-        html.Div("Flow", className="subhead"),
+        html.Div([
+            html.Button("Configure flow sources", id={"type": "open-flow-sources", "tier": index}, className="secondary-button compact-button", n_clicks=0),
+        ], className="flow-source-config-line"),
+        # Keep the original direct-flow inputs mounted for backward-compatible config
+        # construction.  Their values are synchronized from the modal editor.
         html.Div([
             number_input("A0 / min", f"{p}-A0", tier["flow"]["A0"], "any"),
             number_input("Theta", f"{p}-theta", tier["flow"]["theta"], "any"),
@@ -199,7 +426,7 @@ def tier_panel(index: int, tier: dict[str, Any], open_: bool = False):
             number_input("Steepness", f"{p}-steep", tier["flow"]["steepness"], "any"),
             number_input("Shift", f"{p}-shift", tier["flow"]["shift"], "any"),
             number_input("Volume shift", f"{p}-vshift", tier["flow"]["volumeShift"], "any"),
-        ], className="grid-2"),
+        ], style={"display": "none"}),
         html.Div("Trading economics", className="subhead"),
         html.Div([
             number_input("Fee [pips]", f"{p}-fee", tier.get("feePips", 0.0), "any"),
@@ -549,11 +776,59 @@ def dark_pool_table(solution: dict[str, Any]) -> html.Table | html.Div:
     return _simple_table(["Inventory","Bid posted size","Ask posted size"],rows)
 
 
-def _ecn_arrival_rate(cfg: dict[str, Any], delta_pips):
-    flow = cfg.get("passiveEcn", {}).get("flow", {})
-    A = float(flow.get("A", 0.0))
-    k = float(flow.get("k", 1.0))
-    return A * np.exp(np.clip(-k * np.asarray(delta_pips, dtype=float), -745.0, 709.0))
+def _ecn_flow_sources(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    e = cfg.get("passiveEcn", {})
+    configured = e.get("flowSources")
+    if not configured:
+        configured = [{
+            "name": str(cfg.get("targetPair", "direct")),
+            "flow": e.get("flow", {}),
+            "mapping": {"type": "identity"},
+        }]
+
+    target_spread = float(cfg.get("spreadPips", 0.0))
+    out = []
+    for raw in configured:
+        flow = raw.get("flow", {})
+        mapping = raw.get("mapping", {}) or {}
+        mapping_type = str(mapping.get("type", "identity"))
+        alpha = 1.0
+        size_scale = 1.0
+        if mapping_type == "crossed":
+            cross_mid = float(mapping.get("crossMid", 0.0))
+            source_spread = float(mapping.get("sourceSpreadPips", 0.0))
+            if cross_mid <= 0.0 or source_spread <= 0.0:
+                raise ValueError("Crossed ECN flow source requires positive cross mid and source spread")
+            alpha = target_spread / (cross_mid * source_spread)
+            size_scale = cross_mid
+        elif mapping_type == "affine":
+            alpha = float(mapping.get("deltaScale", 1.0))
+            size_scale = float(mapping.get("sourceSizePerTarget", 1.0))
+        elif mapping_type != "identity":
+            raise ValueError(f"Unsupported ECN flow-source mapping {mapping_type}")
+        out.append({
+            "name": str(raw.get("name") or raw.get("pair") or "source"),
+            "A": float(flow.get("A", 0.0)),
+            "k": float(flow.get("k", 1.0)),
+            "alpha": alpha,
+            "sourceSizePerTarget": size_scale,
+            "mapping": mapping,
+        })
+    return out
+
+
+def _ecn_source_arrival_rate(source: dict[str, Any], delta):
+    d = np.asarray(delta, dtype=float)
+    exponent = -float(source["k"]) * float(source["alpha"]) * (0.5 - d)
+    return float(source["A"]) * np.exp(np.clip(exponent, -745.0, 709.0))
+
+
+def _ecn_arrival_rate(cfg: dict[str, Any], delta):
+    d = np.asarray(delta, dtype=float)
+    total = np.zeros_like(d, dtype=float)
+    for source in _ecn_flow_sources(cfg):
+        total = total + _ecn_source_arrival_rate(source, d)
+    return float(total) if total.ndim == 0 else total
 
 
 def _ecn_step_line(q: np.ndarray, values: np.ndarray, active: np.ndarray, side: str) -> tuple[list[float | None], list[float | None], np.ndarray, np.ndarray]:
@@ -614,58 +889,90 @@ def _add_ecn_inventory_trace(fig: go.Figure, q: np.ndarray, values: np.ndarray, 
 
 def passive_ecn_parameter_table(cfg: dict[str, Any]) -> html.Table:
     e = cfg.get("passiveEcn", {})
-    flow = e.get("flow", {})
     z = float(e.get("quoteSize", 1.0))
-    rows = [[
-        f"{z:g}",
-        f"{float(flow.get('A', 0.0)):.6g}",
-        f"{float(flow.get('k', 0.0)):.4g}",
-        f"{float(e.get('makerFeePips', 0.0)):.4f}",
-        f"{float(e.get('minDistancePips', 0.0)):g}",
-        f"{float(e.get('maxDistancePips', 0.0)):g}",
-        "0.5",
-    ]]
+    fee = float(e.get("makerFeePips", 0.0))
+    rows = []
+    for source in _ecn_flow_sources(cfg):
+        mapping = source.get("mapping", {})
+        mapping_type = str(mapping.get("type", "identity"))
+        if mapping_type == "crossed":
+            mapping_text = (
+                f"α={float(source['alpha']):.4g}; "
+                f"cross={float(mapping.get('crossMid', 0.0)):.6g}; "
+                f"spread={float(mapping.get('sourceSpreadPips', 0.0)):.4g}p"
+            )
+        else:
+            mapping_text = "direct"
+        rows.append([
+            str(source["name"]),
+            f"{float(source['A']):.6g}",
+            f"{float(source['k']):.4g}",
+            mapping_text,
+            f"{float(source['sourceSizePerTarget']):.6g}",
+            f"{z:g}",
+            f"{fee:.4f}",
+        ])
     return _simple_table(
-        ["Quote size [M]", "A = ECN arrivals/side [trades/min]", "k [1/pip]", "Maker fee [pips]",
-         "Min distance [pips]", "Max distance [pips]", "Grid step [pips]"],
+        ["ECN source", "A = mid intensity/side", "k", "Mapping",
+         "Source size / target size", "Target-equivalent quote [M]", "Maker fee [pips]"],
         rows,
     )
 
 
 def passive_ecn_fill_figure(cfg: dict[str, Any]) -> go.Figure:
     e = cfg.get("passiveEcn", {})
-    z = float(e.get("quoteSize", 1.0))
-    lo = float(e.get("minDistancePips", 0.0))
-    hi = float(e.get("maxDistancePips", 20.0))
+    lo = float(e.get("minDelta", 0.0))
+    hi = float(e.get("maxDelta", 0.5))
     grid = np.linspace(lo, hi, 240)
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=grid, y=_ecn_arrival_rate(cfg, grid), mode="lines", name=f"{z:g}M ECN"))
+    sources = _ecn_flow_sources(cfg)
+    for source in sources:
+        fig.add_trace(go.Scatter(
+            x=grid, y=_ecn_source_arrival_rate(source, grid), mode="lines",
+            name=str(source["name"]), opacity=.72,
+        ))
+    if len(sources) > 1:
+        fig.add_trace(go.Scatter(
+            x=grid, y=_ecn_arrival_rate(cfg, grid), mode="lines",
+            name="Total ECN", line=dict(width=4),
+        ))
     deltas = np.asarray(e.get("deltas", []), dtype=float)
     if deltas.size:
-        fig.add_trace(go.Scatter(x=deltas, y=_ecn_arrival_rate(cfg, deltas), mode="markers", name="0.5-pip grid"))
-    fig.update_layout(title="Implied ECN fill intensity λ_fill(δ)=A exp(−kδ)",
-                      xaxis_title="Quote distance from mid δ [pips]", yaxis_title="Fill intensity [trades/min]",
-                      template="trinity_dark")
+        fig.add_trace(go.Scatter(
+            x=deltas, y=_ecn_arrival_rate(cfg, deltas), mode="markers",
+            name="Total · 1%-point grid", marker=dict(size=5),
+        ))
+    fig.update_layout(
+        title="ECN fill intensity · source curves mapped from master target-pair delta",
+        xaxis_title="Master price-improvement delta d (0 = touch, 0.5 = mid)",
+        yaxis_title="Fill intensity [trades/min]", template="trinity_dark",
+    )
     fig.update_xaxes(range=[lo, hi])
     return fig
 
 
 def passive_ecn_hit_ratio_figure(cfg: dict[str, Any]) -> go.Figure:
     e = cfg.get("passiveEcn", {})
-    flow = e.get("flow", {})
-    k = float(flow.get("k", 1.0))
-    z = float(e.get("quoteSize", 1.0))
-    lo = float(e.get("minDistancePips", 0.0))
-    hi = float(e.get("maxDistancePips", 20.0))
+    lo = float(e.get("minDelta", 0.0))
+    hi = float(e.get("maxDelta", 0.5))
     grid = np.linspace(lo, hi, 240)
-    relative = np.exp(np.clip(-k * grid, -745.0, 709.0))
+    sources = _ecn_flow_sources(cfg)
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=grid, y=relative, mode="lines", name=f"{z:g}M ECN"))
-    deltas = np.asarray(e.get("deltas", []), dtype=float)
-    if deltas.size:
-        fig.add_trace(go.Scatter(x=deltas, y=np.exp(np.clip(-k * deltas, -745.0, 709.0)), mode="markers", name="0.5-pip grid"))
-    fig.update_layout(title="ECN reach probability P(D ≥ δ)=exp(−kδ)", xaxis_title="Quote distance from mid δ [pips]",
-                      yaxis_title="Reach probability", template="trinity_dark")
+    for source in sources:
+        A = float(source["A"])
+        relative = _ecn_source_arrival_rate(source, grid) / A if A > 0.0 else np.zeros_like(grid)
+        fig.add_trace(go.Scatter(x=grid, y=relative, mode="lines", name=str(source["name"])))
+    total_mid = sum(float(s["A"]) for s in sources)
+    if len(sources) > 1 and total_mid > 0.0:
+        fig.add_trace(go.Scatter(
+            x=grid, y=_ecn_arrival_rate(cfg, grid) / total_mid, mode="lines",
+            name="Total / total mid intensity", line=dict(width=4),
+        ))
+    fig.update_layout(
+        title="ECN relative intensity by flow source",
+        xaxis_title="Master price-improvement delta d (0 = touch, 0.5 = mid)",
+        yaxis_title="Intensity relative to source mid", template="trinity_dark",
+    )
     fig.update_xaxes(range=[lo, hi])
     return fig
 
@@ -700,8 +1007,9 @@ def passive_ecn_quote_inventory_figure(solution: dict[str, Any], cfg: dict[str, 
         ask_delta = np.asarray(e["askDelta"], dtype=float)
         bid_active = np.asarray(e["bidActive"], dtype=bool)
         ask_active = np.asarray(e["askActive"], dtype=bool)
-        bid_px = np.where(bid_active, -bid_delta, np.nan)
-        ask_px = np.where(ask_active, ask_delta, np.nan)
+        spread_pips = float(cfg.get("spreadPips", 0.0))
+        bid_px = np.where(bid_active, -spread_pips * (0.5 - bid_delta), np.nan)
+        ask_px = np.where(ask_active, spread_pips * (0.5 - ask_delta), np.nan)
         _add_ecn_inventory_trace(fig, q, bid_px, bid_active, "Bid hedge", BID_COLOR, "bid")
         _add_ecn_inventory_trace(fig, q, ask_px, ask_active, "Ask hedge", ASK_COLOR, "ask")
         fig.add_hline(y=0, line_dash="dot")
@@ -722,7 +1030,7 @@ def passive_ecn_policy_figure(solution: dict[str, Any]) -> go.Figure:
         ask_active = np.asarray(e["askActive"], dtype=bool)
         _add_ecn_inventory_trace(fig, q, bid, bid_active, "Bid hedge", BID_COLOR, "bid")
         _add_ecn_inventory_trace(fig, q, ask, ask_active, "Ask hedge", ASK_COLOR, "ask")
-    fig.update_layout(title="Optimal passive ECN distance vs inventory",xaxis_title="Inventory q [EUR M]",yaxis_title="Distance from mid [pips]",template="trinity_dark")
+    fig.update_layout(title="Optimal passive ECN delta vs inventory",xaxis_title="Inventory q [EUR M]",yaxis_title="Price-improvement delta d",template="trinity_dark")
     return fig
 
 def passive_ecn_table(solution: dict[str, Any]) -> html.Table | html.Div:
@@ -732,7 +1040,7 @@ def passive_ecn_table(solution: dict[str, Any]) -> html.Table | html.Div:
     rows=[]
     for q,bd,ba,ad,aa in zip(e["qGrid"],e["bidDelta"],e["bidActive"],e["askDelta"],e["askActive"]):
         rows.append([f"{q:g}", f"{bd:g}" if ba else "OFF", f"{ad:g}" if aa else "OFF"])
-    return _simple_table(["Inventory", "Bid distance [pips]", "Ask distance [pips]"], rows)
+    return _simple_table(["Inventory", "Bid delta", "Ask delta"], rows)
 
 
 DEFAULT = default_config()
@@ -746,7 +1054,6 @@ sidebar = html.Aside([
         html.Div([
             number_input("Max |q| [M]", "qmax", DEFAULT["grid"]["maxAbs"], 1.0),
         ], className="grid-2"),
-        html.Div("Inventory grid is fixed to uniform 1M spacing.", className="muted-note"),
     ], True),
     panel("Spot & risk", [
         html.Div([
@@ -781,12 +1088,17 @@ sidebar = html.Aside([
     panel("ECN", [
         checkbox("Enabled", "ecn-enabled", DEFAULT["passiveEcn"]["enabled"]),
         html.Div([
-            number_input("A arrivals / side [trades/min]", "ecn-A", DEFAULT["passiveEcn"]["flow"]["A"], "any"),
-            number_input("k [1/pip]", "ecn-k", DEFAULT["passiveEcn"]["flow"]["k"], "any"),
-        ], className="grid-2"),
+            html.Button("Configure flow sources", id="open-ecn-flow-sources", className="secondary-button compact-button", n_clicks=0),
+        ], className="flow-source-config-line"),
+        # Direct ECN A/k remain mounted for backward-compatible config building.
+        # The modal editor synchronizes these values for the target-pair source.
         html.Div([
-            number_input("Min distance from mid [pips]", "ecn-dmin", DEFAULT["passiveEcn"]["minDistancePips"], 0.5),
-            number_input("Max distance from mid [pips]", "ecn-dmax", DEFAULT["passiveEcn"]["maxDistancePips"], 0.5),
+            number_input("A at mid / side [trades/min]", "ecn-A", DEFAULT["passiveEcn"]["flow"]["A"], "any"),
+            number_input("k", "ecn-k", DEFAULT["passiveEcn"]["flow"]["k"], "any"),
+        ], style={"display": "none"}),
+        html.Div([
+            number_input("Min delta", "ecn-dmin", DEFAULT["passiveEcn"]["minDelta"], 0.01),
+            number_input("Max delta", "ecn-dmax", DEFAULT["passiveEcn"]["maxDelta"], 0.01),
         ], className="grid-2"),
         html.Div([
             number_input("Quote size [M]", "ecn-size", DEFAULT["passiveEcn"]["quoteSize"], "any"),
@@ -927,6 +1239,65 @@ app.layout = html.Div([
     dcc.Store(id="mc-store"),
     dcc.Store(id="stats-store"),
     dcc.Store(id="frontier-store"),
+    dcc.Store(id="extra-flow-sources-store", data={"0": [], "1": [], "2": []}),
+    dcc.Store(id="flow-source-tier-store", data=None),
+    dcc.Store(id="flow-source-selected-store", data="direct"),
+    dcc.Store(id="flow-source-modal-open-store", data=False),
+    dcc.Store(id="ecn-extra-flow-sources-store", data=[]),
+    dcc.Store(id="ecn-flow-source-selected-store", data="direct"),
+    dcc.Store(id="ecn-flow-source-modal-open-store", data=False),
+    html.Div([
+        html.Div([
+            html.Div([
+                html.Div([
+                    html.H2("Configure flow sources", className="modal-title"),
+                    html.Div("Choose the target FX pair, then add the FX pairs whose customer flow should be mapped into that target risk.", className="muted-note modal-note"),
+                ]),
+                html.Button("×", id="flow-source-close", className="modal-close", n_clicks=0),
+            ], className="modal-head"),
+            html.Div(id="flow-source-tier-label", className="flow-source-target-label"),
+            html.Div([
+                html.Label([
+                    html.Span("Target / priced FX pair"),
+                    dcc.Dropdown(id="flow-target-pair", options=FX_PAIR_OPTIONS, value=DEFAULT.get("targetPair", "EURSEK"), placeholder="Select target FX pair", clearable=False, className="field-dropdown", persistence=True, persistence_type="memory"),
+                ], className="field"),
+            ], className="flow-target-picker"),
+            html.Div([
+                html.Div(id="flow-source-cards", className="flow-pair-cards"),
+                html.Div(id="flow-source-settings"),
+            ], id="flow-source-editor", className="flow-source-editor"),
+            html.Div([
+                html.Button("+ Add FX pair", id="flow-source-add", className="secondary-button", n_clicks=0),
+                html.Div([
+                    html.Button("Close", id="flow-source-cancel", className="ghost-button", n_clicks=0),
+                    html.Button("Apply", id="flow-source-apply", className="primary-button", n_clicks=0),
+                ], className="modal-actions-right"),
+            ], className="modal-actions"),
+        ], className="flow-source-modal-card"),
+    ], id="flow-source-modal", className="flow-source-modal", style={"display": "none"}),
+    html.Div([
+        html.Div([
+            html.Div([
+                html.Div([
+                    html.H2("Configure ECN flow sources", className="modal-title"),
+                    html.Div("The ECN optimizer chooses one master delta on the target pair. Crossed ECN pairs inherit that quote through the same FX transformation used by Tier flow sources, while keeping their own A and k curves.", className="muted-note modal-note"),
+                ]),
+                html.Button("×", id="ecn-flow-source-close", className="modal-close", n_clicks=0),
+            ], className="modal-head"),
+            html.Div(id="ecn-flow-source-target-label", className="flow-source-target-label"),
+            html.Div([
+                html.Div(id="ecn-flow-source-cards", className="flow-pair-cards"),
+                html.Div(id="ecn-flow-source-settings"),
+            ], className="flow-source-editor"),
+            html.Div([
+                html.Button("+ Add FX pair", id="ecn-flow-source-add", className="secondary-button", n_clicks=0),
+                html.Div([
+                    html.Button("Close", id="ecn-flow-source-cancel", className="ghost-button", n_clicks=0),
+                    html.Button("Apply", id="ecn-flow-source-apply", className="primary-button", n_clicks=0),
+                ], className="modal-actions-right"),
+            ], className="modal-actions"),
+        ], className="flow-source-modal-card"),
+    ], id="ecn-flow-source-modal", className="flow-source-modal", style={"display": "none"}),
     sidebar,
     html.Main([
         html.Header([
@@ -971,12 +1342,514 @@ CONFIG_STATES = [state for _, state in CONFIG_FIELDS]
 
 
 @app.callback(
+    Output("flow-source-add", "disabled"),
+    Input("flow-target-pair", "value"),
+)
+def disable_add_flow_source_without_target(target_pair):
+    return not bool(target_pair)
+
+
+@app.callback(
+    Output("flow-source-modal-open-store", "data"),
+    Output("flow-source-tier-store", "data"),
+    Input({"type": "open-flow-sources", "tier": ALL}, "n_clicks"),
+    Input("flow-source-close", "n_clicks"),
+    Input("flow-source-cancel", "n_clicks"),
+    Input("flow-source-apply", "n_clicks"),
+    State("flow-source-modal-open-store", "data"),
+    State("flow-source-tier-store", "data"),
+    prevent_initial_call=True,
+)
+def set_flow_source_modal_open(_open_clicks, _close, _cancel, _apply, is_open, selected_tier):
+    """Own modal visibility independently from editor state.
+
+    Source-pair edits rebuild the editor subtree; they must never participate in
+    opening or closing the modal.  Keeping visibility in a dedicated Store also
+    prevents a component remount from resetting the popup.
+    """
+    trigger = ctx.triggered_id
+    if isinstance(trigger, dict) and trigger.get("type") == "open-flow-sources":
+        return True, int(trigger["tier"])
+    if trigger in {"flow-source-close", "flow-source-cancel", "flow-source-apply"}:
+        return False, selected_tier
+    return bool(is_open), selected_tier
+
+
+@app.callback(
+    Output("flow-source-modal", "style"),
+    Input("flow-source-modal-open-store", "data"),
+)
+def render_flow_source_modal_visibility(is_open):
+    return {"display": "flex"} if is_open else {"display": "none"}
+
+
+@app.callback(
+    Output("flow-source-selected-store", "data"),
+    Input("flow-source-tier-store", "data"),
+    Input("flow-target-pair", "value"),
+    Input({"type": "flow-pair-select", "key": ALL}, "n_clicks"),
+    State("flow-source-selected-store", "data"),
+)
+def select_flow_source(_tier_index, _target_pair, _clicks, selected):
+    trigger = ctx.triggered_id
+    if trigger in ("flow-source-tier-store", "flow-target-pair"):
+        return "direct"
+    if isinstance(trigger, dict) and trigger.get("type") == "flow-pair-select":
+        # Pattern-matching Inputs are also triggered when a newly-rendered card
+        # enters the layout.  That is not a user click: its n_clicks value is 0.
+        # Ignoring those mount events prevents a card refresh from changing the
+        # active source while the editor is being created.
+        triggered_value = ctx.triggered[0].get("value") if ctx.triggered else None
+        if not triggered_value:
+            return no_update
+        return str(trigger.get("key", "direct"))
+    return selected or "direct"
+
+
+@app.callback(
+    Output("flow-source-cards", "children"),
+    Output("flow-source-tier-label", "children"),
+    Input("flow-source-tier-store", "data"),
+    Input("flow-target-pair", "value"),
+    Input("flow-source-selected-store", "data"),
+    Input("extra-flow-sources-store", "data"),
+)
+def render_flow_source_cards(tier_index, target_pair, selected, data):
+    """Render only the source selector cards.
+
+    The cards may react to edits in ``extra-flow-sources-store`` (for example
+    changing a card label from "Select FX pair" to "USDSEK").  The active
+    settings form is deliberately rendered by a separate callback so editing a
+    dropdown never destroys and remounts that dropdown mid-selection.
+    """
+    if tier_index is None:
+        return [], ""
+    ti = int(tier_index)
+    if not target_pair:
+        return [], f"Tier {ti + 1}"
+
+    extras = (data or {}).get(str(ti), [])
+    selected = selected or "direct"
+    cards = [flow_pair_card("direct", str(target_pair), selected == "direct")]
+    for i, source in enumerate(extras):
+        key = f"extra-{i}"
+        cards.append(flow_pair_card(key, str(source.get("pair") or "Select FX pair"), selected == key, removable=True))
+    return cards, f"Tier {ti + 1} · target risk {target_pair}"
+
+
+@app.callback(
+    Output("flow-source-settings", "children"),
+    Input("flow-source-tier-store", "data"),
+    Input("flow-target-pair", "value"),
+    Input("flow-source-selected-store", "data"),
+    State("extra-flow-sources-store", "data"),
+    *[State(f"t{i}-{suffix}", "value") for i in range(3) for suffix in ("A0", "theta", "beta", "steep", "shift", "vshift")],
+)
+def render_flow_source_settings(tier_index, target_pair, selected, data, *direct_values):
+    """Render the settings form only when its identity changes.
+
+    ``extra-flow-sources-store`` and the direct-flow inputs are *State*, not
+    Input.  Consequently ordinary edits persist into the stores without
+    remounting the form that the user is currently interacting with.
+    """
+    if tier_index is None:
+        return []
+    ti = int(tier_index)
+    if not target_pair:
+        return html.Div(
+            "Select the target / priced FX pair above to configure its direct flow and add crossed flow sources.",
+            className="muted-note flow-source-empty",
+        )
+
+    extras = (data or {}).get(str(ti), [])
+    selected = selected or "direct"
+    offset = ti * 6
+    vals = direct_values[offset:offset + 6]
+    direct_flow = {
+        "A0": vals[0], "theta": vals[1], "beta": vals[2],
+        "steepness": vals[3], "shift": vals[4], "volumeShift": vals[5],
+    }
+
+    if selected == "direct":
+        source = _direct_flow_source(direct_flow, str(target_pair))
+    else:
+        try:
+            idx = int(str(selected).split("-", 1)[1])
+            source = extras[idx]
+        except (ValueError, IndexError):
+            source = _direct_flow_source(direct_flow, str(target_pair))
+            selected = "direct"
+
+    return flow_source_settings_editor(selected, source, str(target_pair))
+
+
+@app.callback(
+    Output("flow-edit-cross-pair", "value"),
+    Input("flow-edit-pair", "value"),
+    State("flow-target-pair", "value"),
+    prevent_initial_call=True,
+)
+def derive_flow_source_cross_pair(source_pair, target_pair):
+    """Populate the economically implied hedge cross without rebuilding the form."""
+    if not source_pair or not target_pair:
+        return no_update
+    return _derive_cross_pair(target_pair, source_pair) or no_update
+
+
+@app.callback(
+    Output("flow-edit-cross-mid", "value"),
+    Input("flow-edit-cross-pair", "value"),
+    prevent_initial_call=True,
+)
+def populate_flow_source_cross_mid(cross_pair):
+    """Populate the temporary default reference mid in-place."""
+    mid = default_fx_mid(cross_pair)
+    return mid if mid is not None else no_update
+
+
+@app.callback(
+    Output("extra-flow-sources-store", "data"),
+    Output("flow-source-selected-store", "data", allow_duplicate=True),
+    Output("t0-A0", "value"), Output("t0-theta", "value"), Output("t0-beta", "value"), Output("t0-steep", "value"), Output("t0-shift", "value"), Output("t0-vshift", "value"),
+    Output("t1-A0", "value"), Output("t1-theta", "value"), Output("t1-beta", "value"), Output("t1-steep", "value"), Output("t1-shift", "value"), Output("t1-vshift", "value"),
+    Output("t2-A0", "value"), Output("t2-theta", "value"), Output("t2-beta", "value"), Output("t2-steep", "value"), Output("t2-shift", "value"), Output("t2-vshift", "value"),
+    Input("flow-source-add", "n_clicks"),
+    Input("flow-source-remove-selected", "n_clicks"),
+    Input("flow-edit-pair", "value"), Input("flow-edit-cross-pair", "value"),
+    Input("flow-edit-cross-mid", "value"), Input("flow-edit-spread", "value"),
+    Input("flow-edit-A0", "value"), Input("flow-edit-theta", "value"), Input("flow-edit-beta", "value"),
+    Input("flow-edit-steep", "value"), Input("flow-edit-shift", "value"), Input("flow-edit-vshift", "value"),
+    State("flow-source-tier-store", "data"), State("flow-target-pair", "value"), State("flow-source-selected-store", "data"), State("extra-flow-sources-store", "data"),
+    *[State(f"t{i}-{suffix}", "value") for i in range(3) for suffix in ("A0", "theta", "beta", "steep", "shift", "vshift")],
+    prevent_initial_call=True,
+)
+def update_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, spread, A0, theta, beta, steep, shift, vshift,
+                              tier_index, target_pair, selected, data, *direct_values):
+    if tier_index is None:
+        return (no_update,) * 20
+    ti = int(tier_index)
+    key = str(ti)
+    out = deepcopy(data or {"0": [], "1": [], "2": []})
+    direct = list(direct_values)
+    selected = selected or "direct"
+    trigger = ctx.triggered_id
+
+    if trigger == "flow-source-add":
+        # n_clicks=0 can be observed during component initialisation; only a
+        # positive click count represents an actual Add action.
+        if not _add:
+            return (no_update,) * 20
+        if not target_pair:
+            return out, selected, *direct
+        out.setdefault(key, []).append(_default_cross_flow_source(len(out.get(key, [])), target_pair))
+        new_selected = f"extra-{len(out[key]) - 1}"
+        return out, new_selected, *direct
+
+    if trigger == "flow-source-remove-selected":
+        # The Remove button is dynamically mounted when a crossed source is
+        # selected. Dash can fire the callback once on that mount with
+        # n_clicks=0. Treat only a positive click count as a removal.
+        if not _remove:
+            return (no_update,) * 20
+        if selected.startswith("extra-"):
+            idx = int(selected.split("-", 1)[1])
+            if 0 <= idx < len(out.get(key, [])):
+                out[key].pop(idx)
+        return out, "direct", *direct
+
+    if selected == "direct":
+        if all(x is not None for x in (A0, theta, beta, steep, shift, vshift)):
+            offset = ti * 6
+            direct[offset:offset + 6] = [float(A0), float(theta), float(beta), float(steep), float(shift), float(vshift)]
+        return out, no_update, *direct
+
+    if selected.startswith("extra-"):
+        idx = int(selected.split("-", 1)[1])
+        if 0 <= idx < len(out.get(key, [])) and all(x is not None for x in (spread, A0, theta, beta, steep, shift, vshift)):
+            src = out[key][idx]
+            chosen_pair = str(pair) if pair else None
+            derived_cross = _derive_cross_pair(target_pair, chosen_pair)
+            chosen_cross = derived_cross if trigger == "flow-edit-pair" and derived_cross else (str(cross_pair) if cross_pair else derived_cross)
+
+            # Pair selection is market-data driven: use the temporary default
+            # mid for the newly selected cross.  A manually edited Cross mid is
+            # preserved for all other triggers.
+            chosen_mid = None if cross_mid is None else float(cross_mid)
+            if trigger in ("flow-edit-pair", "flow-edit-cross-pair"):
+                looked_up_mid = default_fx_mid(chosen_cross)
+                if looked_up_mid is not None:
+                    chosen_mid = looked_up_mid
+            if chosen_pair and chosen_mid is None:
+                raise ValueError(f"No default mid available for cross {chosen_cross}")
+            if chosen_mid is not None and chosen_mid <= 0.0:
+                raise ValueError("Cross mid must be positive")
+            if float(spread) <= 0.0:
+                raise ValueError("Source spread must be positive")
+
+            src.update({"name": chosen_pair or "Select FX pair", "pair": chosen_pair, "crossPair": chosen_cross})
+            src["mapping"] = {"type": "crossed", "crossMid": chosen_mid, "sourceSpreadPips": float(spread)}
+            src["flow"] = {"A0": float(A0), "theta": float(theta), "beta": float(beta), "steepness": float(steep), "shift": float(shift), "volumeShift": float(vshift)}
+        return out, no_update, *direct
+
+    return out, no_update, *direct
+
+
+@app.callback(
+    Output("ecn-flow-source-modal-open-store", "data"),
+    Input("open-ecn-flow-sources", "n_clicks"),
+    Input("ecn-flow-source-close", "n_clicks"),
+    Input("ecn-flow-source-cancel", "n_clicks"),
+    Input("ecn-flow-source-apply", "n_clicks"),
+    State("ecn-flow-source-modal-open-store", "data"),
+    prevent_initial_call=True,
+)
+def set_ecn_flow_source_modal_open(_open, _close, _cancel, _apply, is_open):
+    trigger = ctx.triggered_id
+    if trigger == "open-ecn-flow-sources" and _open:
+        return True
+    if trigger in {"ecn-flow-source-close", "ecn-flow-source-cancel", "ecn-flow-source-apply"}:
+        return False
+    return bool(is_open)
+
+
+@app.callback(
+    Output("ecn-flow-source-modal", "style"),
+    Input("ecn-flow-source-modal-open-store", "data"),
+)
+def render_ecn_flow_source_modal_visibility(is_open):
+    return {"display": "flex"} if is_open else {"display": "none"}
+
+
+@app.callback(
+    Output("ecn-flow-source-add", "disabled"),
+    Input("flow-target-pair", "value"),
+)
+def disable_add_ecn_flow_source_without_target(target_pair):
+    return not bool(target_pair)
+
+
+@app.callback(
+    Output("ecn-flow-source-selected-store", "data"),
+    Input("flow-target-pair", "value"),
+    Input({"type": "ecn-flow-pair-select", "key": ALL}, "n_clicks"),
+    State("ecn-flow-source-selected-store", "data"),
+)
+def select_ecn_flow_source(_target_pair, _clicks, selected):
+    trigger = ctx.triggered_id
+    if trigger == "flow-target-pair":
+        return "direct"
+    if isinstance(trigger, dict) and trigger.get("type") == "ecn-flow-pair-select":
+        triggered_value = ctx.triggered[0].get("value") if ctx.triggered else None
+        if not triggered_value:
+            return no_update
+        return str(trigger.get("key", "direct"))
+    return selected or "direct"
+
+
+@app.callback(
+    Output("ecn-flow-source-cards", "children"),
+    Output("ecn-flow-source-target-label", "children"),
+    Input("flow-target-pair", "value"),
+    Input("ecn-flow-source-selected-store", "data"),
+    Input("ecn-extra-flow-sources-store", "data"),
+)
+def render_ecn_flow_source_cards(target_pair, selected, data):
+    if not target_pair:
+        return [], "Select the target / priced FX pair in a Tier flow-source dialog first"
+    extras = data or []
+    selected = selected or "direct"
+    cards = [ecn_flow_pair_card("direct", str(target_pair), selected == "direct")]
+    for i, source in enumerate(extras):
+        key = f"extra-{i}"
+        cards.append(ecn_flow_pair_card(key, str(source.get("pair") or "Select FX pair"), selected == key, removable=True))
+    return cards, f"ECN · target risk {target_pair}"
+
+
+@app.callback(
+    Output("ecn-flow-source-settings", "children"),
+    Input("flow-target-pair", "value"),
+    Input("ecn-flow-source-selected-store", "data"),
+    State("ecn-extra-flow-sources-store", "data"),
+    State("ecn-A", "value"), State("ecn-k", "value"),
+)
+def render_ecn_flow_source_settings(target_pair, selected, data, direct_A, direct_k):
+    if not target_pair:
+        return html.Div(
+            "Select the target / priced FX pair in a Tier flow-source dialog first.",
+            className="muted-note flow-source-empty",
+        )
+    extras = data or []
+    selected = selected or "direct"
+    if selected == "direct":
+        source = _direct_ecn_flow_source({"A": direct_A, "k": direct_k}, str(target_pair))
+    else:
+        try:
+            idx = int(str(selected).split("-", 1)[1])
+            source = extras[idx]
+        except (ValueError, IndexError):
+            source = _direct_ecn_flow_source({"A": direct_A, "k": direct_k}, str(target_pair))
+            selected = "direct"
+    return ecn_flow_source_settings_editor(selected, source, str(target_pair))
+
+
+@app.callback(
+    Output("ecn-flow-edit-cross-pair", "value"),
+    Input("ecn-flow-edit-pair", "value"),
+    State("flow-target-pair", "value"),
+    prevent_initial_call=True,
+)
+def derive_ecn_flow_source_cross_pair(source_pair, target_pair):
+    if not source_pair or not target_pair:
+        return no_update
+    return _derive_cross_pair(target_pair, source_pair) or no_update
+
+
+@app.callback(
+    Output("ecn-flow-edit-cross-mid", "value"),
+    Input("ecn-flow-edit-cross-pair", "value"),
+    prevent_initial_call=True,
+)
+def populate_ecn_flow_source_cross_mid(cross_pair):
+    mid = default_fx_mid(cross_pair)
+    return mid if mid is not None else no_update
+
+
+@app.callback(
+    Output("ecn-extra-flow-sources-store", "data"),
+    Output("ecn-flow-source-selected-store", "data", allow_duplicate=True),
+    Output("ecn-A", "value"), Output("ecn-k", "value"),
+    Input("ecn-flow-source-add", "n_clicks"),
+    Input("ecn-flow-source-remove-selected", "n_clicks"),
+    Input("ecn-flow-edit-pair", "value"), Input("ecn-flow-edit-cross-pair", "value"),
+    Input("ecn-flow-edit-cross-mid", "value"), Input("ecn-flow-edit-spread", "value"),
+    Input("ecn-flow-edit-A", "value"), Input("ecn-flow-edit-k", "value"),
+    State("flow-target-pair", "value"), State("ecn-flow-source-selected-store", "data"),
+    State("ecn-extra-flow-sources-store", "data"), State("ecn-A", "value"), State("ecn-k", "value"),
+    prevent_initial_call=True,
+)
+def update_ecn_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, spread, A, k,
+                                  target_pair, selected, data, direct_A, direct_k):
+    out = deepcopy(data or [])
+    selected = selected or "direct"
+    trigger = ctx.triggered_id
+
+    if trigger == "ecn-flow-source-add":
+        if not _add:
+            return (no_update,) * 4
+        if not target_pair:
+            return out, selected, direct_A, direct_k
+        out.append(_default_cross_ecn_flow_source(len(out), target_pair))
+        return out, f"extra-{len(out) - 1}", direct_A, direct_k
+
+    if trigger == "ecn-flow-source-remove-selected":
+        if not _remove:
+            return (no_update,) * 4
+        if selected.startswith("extra-"):
+            idx = int(selected.split("-", 1)[1])
+            if 0 <= idx < len(out):
+                out.pop(idx)
+        return out, "direct", direct_A, direct_k
+
+    if selected == "direct":
+        if A is not None and k is not None:
+            if float(A) < 0.0:
+                raise ValueError("ECN A must be nonnegative")
+            if float(k) <= 0.0:
+                raise ValueError("ECN k must be positive")
+            return out, no_update, float(A), float(k)
+        return out, no_update, direct_A, direct_k
+
+    if selected.startswith("extra-"):
+        idx = int(selected.split("-", 1)[1])
+        if 0 <= idx < len(out) and all(x is not None for x in (spread, A, k)):
+            src = out[idx]
+            chosen_pair = str(pair) if pair else None
+            derived_cross = _derive_cross_pair(target_pair, chosen_pair)
+            chosen_cross = derived_cross if trigger == "ecn-flow-edit-pair" and derived_cross else (str(cross_pair) if cross_pair else derived_cross)
+
+            chosen_mid = None if cross_mid is None else float(cross_mid)
+            if trigger in ("ecn-flow-edit-pair", "ecn-flow-edit-cross-pair"):
+                looked_up_mid = default_fx_mid(chosen_cross)
+                if looked_up_mid is not None:
+                    chosen_mid = looked_up_mid
+            if chosen_pair and chosen_mid is None:
+                raise ValueError(f"No default mid available for cross {chosen_cross}")
+            if chosen_mid is not None and chosen_mid <= 0.0:
+                raise ValueError("Cross mid must be positive")
+            if float(spread) <= 0.0:
+                raise ValueError("Source spread must be positive")
+            if float(A) < 0.0:
+                raise ValueError("ECN A must be nonnegative")
+            if float(k) <= 0.0:
+                raise ValueError("ECN k must be positive")
+
+            src.update({"name": chosen_pair or "Select FX pair", "pair": chosen_pair, "crossPair": chosen_cross})
+            src["mapping"] = {"type": "crossed", "crossMid": chosen_mid, "sourceSpreadPips": float(spread)}
+            src["flow"] = {"A": float(A), "k": float(k)}
+        return out, no_update, direct_A, direct_k
+
+    return out, no_update, direct_A, direct_k
+
+
+@app.callback(
     Output("config-store", "data"), Output("solution-store", "data"), Output("status", "children"), Output("status", "className"),
-    Input("solve", "n_clicks"), *CONFIG_STATES, prevent_initial_call=True,
+    Input("solve", "n_clicks"), *CONFIG_STATES,
+    State("extra-flow-sources-store", "data"), State("ecn-extra-flow-sources-store", "data"),
+    State("flow-target-pair", "value"), prevent_initial_call=True,
 )
 def solve_model(_clicks, *values):
     try:
-        cfg = build_config(dict(zip(CONFIG_KEYS, values, strict=True)))
+        *field_values, extra_sources, ecn_extra_sources, target_pair = values
+        cfg = build_config(dict(zip(CONFIG_KEYS, field_values, strict=True)))
+        for i, tier in enumerate(cfg.get("tiers", [])):
+            extras = (extra_sources or {}).get(str(i), [])
+            if extras:
+                if not target_pair:
+                    raise ValueError("Select the target / priced FX pair before adding crossed flow sources")
+                target_legs = _pair_legs(target_pair)
+                seen_pairs = set()
+                for source in extras:
+                    source_pair = source.get("pair")
+                    if not source_pair:
+                        raise ValueError("Select an FX pair for every flow source")
+                    source_legs = _pair_legs(source_pair)
+                    if not source_legs or not target_legs or source_legs[1] != target_legs[1]:
+                        raise ValueError(f"Flow source {source_pair} must share the quote currency of target pair {target_pair}")
+                    if source_pair == target_pair:
+                        raise ValueError(f"{source_pair} is already the direct target-pair source")
+                    if source_pair in seen_pairs:
+                        raise ValueError(f"Flow source {source_pair} is configured more than once")
+                    seen_pairs.add(source_pair)
+                direct = {"name": str(target_pair), "pair": str(target_pair), "flow": deepcopy(tier["flow"]), "mapping": {"type": "identity"}}
+                tier["flowSources"] = [direct] + deepcopy(extras)
+
+        ecn_extras = list(ecn_extra_sources or [])
+        if ecn_extras:
+            if not target_pair:
+                raise ValueError("Select the target / priced FX pair before adding crossed ECN flow sources")
+            target_legs = _pair_legs(target_pair)
+            seen_pairs = set()
+            for source in ecn_extras:
+                source_pair = source.get("pair")
+                if not source_pair:
+                    raise ValueError("Select an FX pair for every ECN flow source")
+                source_legs = _pair_legs(source_pair)
+                if not source_legs or not target_legs or source_legs[1] != target_legs[1]:
+                    raise ValueError(f"ECN flow source {source_pair} must share the quote currency of target pair {target_pair}")
+                if source_pair == target_pair:
+                    raise ValueError(f"{source_pair} is already the direct ECN target-pair source")
+                if source_pair in seen_pairs:
+                    raise ValueError(f"ECN flow source {source_pair} is configured more than once")
+                seen_pairs.add(source_pair)
+            ecn = cfg.get("passiveEcn", {})
+            direct = {
+                "name": str(target_pair), "pair": str(target_pair),
+                "flow": deepcopy(ecn.get("flow", {})), "mapping": {"type": "identity"},
+            }
+            ecn["flowSources"] = [direct] + deepcopy(ecn_extras)
+
+        if target_pair:
+            cfg["targetPair"] = str(target_pair)
         solution = ENGINES.get(cfg).solve()
         return cfg, solution, f"Solved · {solution['iterations']} Howard iterations", "status ready"
     except Exception as exc:
@@ -1164,15 +2037,13 @@ def expected_internalization_times(solution: dict[str, Any] | None, cfg: dict[st
     ecn_policy = solution.get("passiveEcn")
     ecn_cfg = cfg.get("passiveEcn", {})
     if ecn_policy and ecn_cfg.get("enabled", False):
-        A = float(ecn_cfg["flow"]["A"])
-        k = float(ecn_cfg["flow"]["k"])
         z = float(ecn_cfg["quoteSize"])
         for i, q in enumerate(q_grid):
             for side, direction in (("bid", 1.0), ("ask", -1.0)):
                 if not bool(ecn_policy[f"{side}Active"][i]):
                     continue
                 delta = float(ecn_policy[f"{side}Delta"][i])
-                rate = A * math.exp(-k * delta)
+                rate = float(_ecn_arrival_rate(cfg, delta))
                 q2 = float(q) + direction * z
                 if q_grid[0] - 1e-8 <= q2 <= q_grid[-1] + 1e-8:
                     add_transition(i, q2, rate)
@@ -1404,8 +2275,8 @@ def render_path(mc, path_index, quote_size, solution, cfg):
             ecn_ask_delta = ask_delta_grid[ecn_idx]
             ecn_bid_active = bid_active_grid[ecn_idx]
             ecn_ask_active = ask_active_grid[ecn_idx]
-            ecn_bid_px = np.where(ecn_bid_active, spots - ecn_bid_delta / 10_000.0, np.nan)
-            ecn_ask_px = np.where(ecn_ask_active, spots + ecn_ask_delta / 10_000.0, np.nan)
+            ecn_bid_px = np.where(ecn_bid_active, spots - spread * (0.5 - ecn_bid_delta), np.nan)
+            ecn_ask_px = np.where(ecn_ask_active, spots + spread * (0.5 - ecn_ask_delta), np.nan)
             ecn_size = float(ecn["quoteSize"])
 
             spot_fig.add_trace(go.Scatter(
@@ -1449,6 +2320,7 @@ def render_path(mc, path_index, quote_size, solution, cfg):
                     line=dict(color=color, width=2),
                 ),
                 customdata=[[
+                    str(e.get("source", "ECN")),
                     side.capitalize(),
                     fill_status,
                     float(e.get("tradeDistancePips", np.nan)),
@@ -1457,11 +2329,11 @@ def render_path(mc, path_index, quote_size, solution, cfg):
                     bool(e.get("quoteActive", False)),
                 ] for e in chosen],
                 hovertemplate=(
-                    "%{x|%H:%M:%S}<br>ECN %{customdata[0]} trade · %{customdata[1]}"
-                    "<br>plot px=%{y:.6f}<br>trade px=%{customdata[4]:.6f}"
-                    "<br>trade distance=%{customdata[2]:.2f} pips"
-                    "<br>quote depth=%{customdata[3]:.2f} pips"
-                    "<br>quote active=%{customdata[5]}<extra></extra>"
+                    "%{x|%H:%M:%S}<br>%{customdata[0]} ECN %{customdata[1]} trade · %{customdata[2]}"
+                    "<br>plot px=%{y:.6f}<br>trade px=%{customdata[5]:.6f}"
+                    "<br>target-equivalent trade distance=%{customdata[3]:.2f} pips"
+                    "<br>master quote depth=%{customdata[4]:.2f} pips"
+                    "<br>quote active=%{customdata[6]}<extra></extra>"
                 ),
             )
 
@@ -1478,7 +2350,7 @@ def render_path(mc, path_index, quote_size, solution, cfg):
     for side, symbol in (("bid", "triangle-up"), ("ask", "triangle-down")):
         fills_side = [
             f for f in path["fills"]
-            if str(f["side"]).lower() == side and str(f.get("tier", "")) != "Passive ECN"
+            if str(f["side"]).lower() == side and not str(f.get("tier", "")).startswith("Passive ECN")
         ]
         if fills_side:
             spot_fig.add_trace(go.Scatter(

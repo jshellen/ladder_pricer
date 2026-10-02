@@ -183,3 +183,164 @@ input[type="checkbox"] { accent-color: var(--accent); }
 .diagnostic-expander-body .dash-graph {
   width: 100%;
 }
+
+/* Flow-source configuration modal */
+.flow-source-config-line { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:8px 0 12px; }
+.flow-source-summary { color:var(--muted); font-size:12px; line-height:1.4; }
+.compact-button { padding:7px 10px !important; white-space:nowrap; }
+.flow-source-modal { position:fixed; inset:0; z-index:3000; align-items:center; justify-content:center; padding:28px; background:rgba(3,7,12,.78); backdrop-filter:blur(4px); }
+.flow-source-modal-card { width:min(980px, 96vw); max-height:90vh; overflow:auto; background:var(--panel); border:1px solid var(--border); border-radius:14px; box-shadow:0 24px 80px rgba(0,0,0,.5); padding:18px; }
+.modal-head { display:flex; align-items:flex-start; justify-content:space-between; gap:20px; border-bottom:1px solid var(--border); padding-bottom:12px; }
+.modal-title { margin:0; font-size:20px; }
+.modal-note { padding:6px 0 0 !important; max-width:760px; }
+.modal-close { border:0; background:transparent; color:var(--muted); font-size:28px; cursor:pointer; line-height:1; padding:0 4px; }
+.modal-close:hover { color:var(--text); }
+.flow-source-target-label { margin:14px 0; color:#d8dee9; font-weight:600; }
+.flow-source-editor { display:flex; flex-direction:column; gap:12px; }
+.flow-source-card { border:1px solid var(--border); border-radius:10px; background:#111821; padding:14px; }
+.flow-source-row-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+.flow-source-title { font-weight:700; color:var(--text); }
+.modal-actions { display:flex; justify-content:space-between; align-items:center; gap:12px; border-top:1px solid var(--border); margin-top:16px; padding-top:14px; }
+.modal-actions-right { display:flex; gap:8px; }
+.ghost-button { background:transparent; color:var(--muted); border:1px solid var(--border); border-radius:6px; padding:8px 12px; cursor:pointer; }
+.ghost-button:hover { color:var(--text); border-color:#526172; }
+.empty-flow-sources { border:1px dashed var(--border); border-radius:8px; text-align:center; }
+@media (max-width:700px) { .flow-source-config-line, .modal-actions { align-items:stretch; flex-direction:column; } .modal-actions-right { width:100%; } }
+
+/* Pair-card flow source editor */
+.flow-source-dialog-body { display:flex; flex-direction:column; gap:18px; }
+.flow-pair-cards { display:flex; flex-wrap:wrap; gap:10px; padding:2px 0 4px; }
+.flow-pair-card-wrap { position:relative; min-width:132px; }
+.flow-pair-card {
+  width:100%; min-height:66px; padding:13px 14px 24px; text-align:left;
+  border:1px solid var(--border); border-radius:10px; background:#111821;
+  color:var(--text); font-size:15px; font-weight:700; cursor:pointer;
+  transition:border-color .15s ease, background .15s ease, transform .15s ease;
+}
+.flow-pair-card:hover { border-color:#526172; background:#151e29; transform:translateY(-1px); }
+.flow-pair-card.selected { border-color:#58a6ff; background:#132236; box-shadow:0 0 0 1px rgba(88,166,255,.18) inset; }
+.flow-pair-badge {
+  position:absolute; left:14px; bottom:8px; pointer-events:none;
+  color:var(--muted); font-size:10px; font-weight:600; letter-spacing:.04em; text-transform:uppercase;
+}
+.flow-source-settings { border:1px solid var(--border); border-radius:12px; background:#111821; padding:16px; }
+.flow-calibration-grid { margin-top:6px; }
+.source-kind-note { padding:3px 0 0 !important; }
+.danger-ghost-button:hover { color:#ff7b72; border-color:#ff7b72; }
+@media (max-width:700px) {
+  .flow-pair-card-wrap { flex:1 1 calc(50% - 10px); min-width:110px; }
+  .flow-source-row-head { gap:10px; align-items:flex-start; }
+}
+
+/* Dash 3 / modern react-select dropdowns.
+   The flow-source dropdowns use a light control/menu surface, so force the
+   displayed text to render dark. Use broad `*=` selectors because modern
+   react-select / emotion class names are generated and often appear alongside
+   state classes (which breaks strict `$=` matching). */
+.field-dropdown .Select-control,
+.field-dropdown .Select-menu-outer,
+.field-dropdown .Select-menu,
+.field-dropdown [class*="-control"],
+.field-dropdown [class*="-menu"],
+.field-dropdown [class*="menuList"] {
+  background: #ffffff !important;
+  color: #111821 !important;
+  border-color: #526172 !important;
+}
+
+.field-dropdown .Select-value,
+.field-dropdown .Select-value-label,
+.field-dropdown .Select-placeholder,
+.field-dropdown .Select-input,
+.field-dropdown .Select-input > input,
+.field-dropdown input,
+.field-dropdown div[class*="singleValue"],
+.field-dropdown div[class*="placeholder"],
+.field-dropdown div[class*="input"],
+.field-dropdown div[class*="ValueContainer"],
+.field-dropdown div[class*="valueContainer"],
+.field-dropdown div[class*="-indicatorContainer"],
+.field-dropdown span[class*="singleValue"],
+.field-dropdown span[class*="placeholder"] {
+  color: #111821 !important;
+  caret-color: #111821 !important;
+}
+
+.field-dropdown .Select-placeholder,
+.field-dropdown div[class*="placeholder"],
+.field-dropdown span[class*="placeholder"] {
+  color: #687586 !important;
+}
+
+.field-dropdown .Select-option,
+.field-dropdown .VirtualizedSelectOption,
+.field-dropdown [class*="-option"] {
+  background: #ffffff !important;
+  color: #111821 !important;
+}
+
+.field-dropdown .Select-option.is-focused,
+.field-dropdown .VirtualizedSelectFocusedOption,
+.field-dropdown [class*="-option"]:hover,
+.field-dropdown [class*="option"][class*="focused"] {
+  background: #eef3f8 !important;
+  color: #111821 !important;
+}
+
+.field-dropdown .Select-option.is-selected,
+.field-dropdown [class*="option"][class*="selected"] {
+  background: #dcecff !important;
+  color: #111821 !important;
+}
+
+.field-dropdown svg,
+.field-dropdown path,
+.field-dropdown .Select-arrow,
+.field-dropdown [class*="indicator"] {
+  color: #334155 !important;
+  fill: #334155 !important;
+  border-top-color: #334155 !important;
+}
+
+/* -------------------------------------------------------------------------
+   Dash 4 dcc.Dropdown
+
+   Dash 4 no longer renders dcc.Dropdown with the old React-Select
+   `.Select-value-label` markup.  The visible selected value is rendered in a
+   button inside `.dash-dropdown-wrapper`.  Force that actual control (and its
+   text descendants) to use dark text on our white dropdown surface.
+   ------------------------------------------------------------------------- */
+.flow-source-modal .field-dropdown {
+  --Dash-Text-Primary: #111821;
+  --Dash-Text-Secondary: #334155;
+  --Dash-Fill-Inverse-Strong: #ffffff;
+  color: #111821 !important;
+}
+
+.flow-source-modal .field-dropdown .dash-dropdown-wrapper button,
+.flow-source-modal .field-dropdown > button,
+.flow-source-modal .field-dropdown button[aria-haspopup],
+.flow-source-modal .field-dropdown [role="combobox"] {
+  background: #ffffff !important;
+  color: #111821 !important;
+  -webkit-text-fill-color: #111821 !important;
+  opacity: 1 !important;
+  text-shadow: none !important;
+}
+
+.flow-source-modal .field-dropdown .dash-dropdown-wrapper button *,
+.flow-source-modal .field-dropdown > button *,
+.flow-source-modal .field-dropdown button[aria-haspopup] *,
+.flow-source-modal .field-dropdown [role="combobox"] * {
+  color: #111821 !important;
+  -webkit-text-fill-color: #111821 !important;
+  opacity: 1 !important;
+  text-shadow: none !important;
+}
+
+.flow-source-modal .field-dropdown input,
+.flow-source-modal .field-dropdown input::placeholder {
+  color: #111821 !important;
+  -webkit-text-fill-color: #111821 !important;
+  opacity: 1 !important;
+}

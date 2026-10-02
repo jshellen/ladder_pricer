@@ -65,6 +65,55 @@ std::vector<double> build_grid(const py::dict& spec) {
     return states;
 }
 
+
+LogisticFlow build_logistic_flow(const py::dict& flow) {
+    return LogisticFlow(number(flow, "A0"), number(flow, "theta"), number(flow, "beta"),
+                        number(flow, "shift"), number(flow, "steepness"), number(flow, "volumeShift"));
+}
+
+AggregatedFlow build_tier_flow(const py::dict& tier, double target_spread_pips) {
+    const py::str sources_key("flowSources");
+    if (!tier.contains(sources_key)) {
+        return AggregatedFlow(build_logistic_flow(py::cast<py::dict>(tier[py::str("flow")])));
+    }
+
+    std::vector<FlowSource> sources;
+    const py::list source_cfgs = py::cast<py::list>(tier[sources_key]);
+    sources.reserve(py::len(source_cfgs));
+    for (const py::handle item : source_cfgs) {
+        const py::dict source = py::cast<py::dict>(item);
+        const py::dict flow = py::cast<py::dict>(source[py::str("flow")]);
+        const std::string name = source.contains(py::str("name"))
+            ? text(source, "name") : std::string("source");
+
+        double delta_scale = 1.0;
+        double source_size_per_target = 1.0;
+        if (source.contains(py::str("mapping"))) {
+            const py::dict mapping = py::cast<py::dict>(source[py::str("mapping")]);
+            const std::string type = mapping.contains(py::str("type"))
+                ? text(mapping, "type") : std::string("identity");
+            if (type == "identity") {
+                // defaults above
+            } else if (type == "crossed") {
+                const double cross_mid = number(mapping, "crossMid");
+                const double source_spread_pips = number(mapping, "sourceSpreadPips");
+                if (cross_mid <= 0.0 || source_spread_pips <= 0.0) {
+                    throw std::invalid_argument("crossed flow mapping requires positive crossMid and sourceSpreadPips");
+                }
+                delta_scale = target_spread_pips / (cross_mid * source_spread_pips);
+                source_size_per_target = cross_mid;
+            } else if (type == "affine") {
+                delta_scale = number(mapping, "deltaScale");
+                source_size_per_target = optional_number(mapping, "sourceSizePerTarget", 1.0);
+            } else {
+                throw std::invalid_argument("flow source mapping type must be identity, crossed, or affine");
+            }
+        }
+        sources.emplace_back(name, build_logistic_flow(flow), delta_scale, source_size_per_target);
+    }
+    return AggregatedFlow(std::move(sources));
+}
+
 std::optional<DarkPool> build_dark_pool(const py::dict& cfg) {
     if (!boolean(cfg, "enabled")) return std::nullopt;
 
@@ -76,12 +125,57 @@ std::optional<DarkPool> build_dark_pool(const py::dict& cfg) {
         numbers(cfg[py::str("postedSizes")]));
 }
 
-std::optional<PassiveECN> build_passive_ecn(const py::dict& cfg) {
+AggregatedECNFlow build_ecn_flow(const py::dict& cfg, double target_spread_pips) {
+    const py::str sources_key("flowSources");
+    if (!cfg.contains(sources_key)) {
+        const py::dict flow = py::cast<py::dict>(cfg[py::str("flow")]);
+        return AggregatedECNFlow(ExponentialFlow(number(flow, "A"), number(flow, "k")));
+    }
+
+    std::vector<ECNFlowSource> sources;
+    const py::list source_cfgs = py::cast<py::list>(cfg[sources_key]);
+    sources.reserve(py::len(source_cfgs));
+    for (const py::handle item : source_cfgs) {
+        const py::dict source = py::cast<py::dict>(item);
+        const py::dict flow = py::cast<py::dict>(source[py::str("flow")]);
+        const std::string name = source.contains(py::str("name"))
+            ? text(source, "name") : std::string("source");
+
+        double delta_scale = 1.0;
+        double source_size_per_target = 1.0;
+        if (source.contains(py::str("mapping"))) {
+            const py::dict mapping = py::cast<py::dict>(source[py::str("mapping")]);
+            const std::string type = mapping.contains(py::str("type"))
+                ? text(mapping, "type") : std::string("identity");
+            if (type == "identity") {
+                // defaults above
+            } else if (type == "crossed") {
+                const double cross_mid = number(mapping, "crossMid");
+                const double source_spread_pips = number(mapping, "sourceSpreadPips");
+                if (cross_mid <= 0.0 || source_spread_pips <= 0.0) {
+                    throw std::invalid_argument("crossed ECN flow mapping requires positive crossMid and sourceSpreadPips");
+                }
+                delta_scale = target_spread_pips / (cross_mid * source_spread_pips);
+                source_size_per_target = cross_mid;
+            } else if (type == "affine") {
+                delta_scale = number(mapping, "deltaScale");
+                source_size_per_target = optional_number(mapping, "sourceSizePerTarget", 1.0);
+            } else {
+                throw std::invalid_argument("ECN flow source mapping type must be identity, crossed, or affine");
+            }
+        }
+        sources.emplace_back(
+            name, ExponentialFlow(number(flow, "A"), number(flow, "k")),
+            delta_scale, source_size_per_target);
+    }
+    return AggregatedECNFlow(std::move(sources));
+}
+
+std::optional<PassiveECN> build_passive_ecn(const py::dict& cfg, double target_spread_pips) {
     if (!boolean(cfg, "enabled")) return std::nullopt;
-    const py::dict flow = py::cast<py::dict>(cfg[py::str("flow")]);
     return PassiveECN(
         numbers(cfg[py::str("deltas")]),
-        ExponentialFlow(number(flow, "A"), number(flow, "k")),
+        build_ecn_flow(cfg, target_spread_pips),
         number(cfg, "quoteSize"), number(cfg, "makerFeePips") / 10000.0);
 }
 
@@ -91,12 +185,10 @@ PricingProblem build_problem(const py::dict& cfg, std::optional<double> gamma_ov
     for (const py::handle item : tier_cfgs) {
         const py::dict tier = py::cast<py::dict>(item);
         if (!boolean(tier, "enabled")) continue;
-        const py::dict flow = py::cast<py::dict>(tier[py::str("flow")]);
         const py::dict markout = py::cast<py::dict>(tier[py::str("markout")]);
         tiers.emplace_back(
             text(tier, "name"), numbers(tier[py::str("sizes")]),
-            LogisticFlow(number(flow, "A0"), number(flow, "theta"), number(flow, "beta"),
-                         number(flow, "shift"), number(flow, "steepness"), number(flow, "volumeShift")),
+            build_tier_flow(tier, number(cfg, "spreadPips")),
             SaturatingMarkout(number(markout, "impactScalePips") / 10000.0,
                               number(markout, "sizeExponent"), number(markout, "tauMinutes")),
             boolean(tier, "useMarkout"), number(tier, "deltaMin"), number(tier, "deltaMax"),
@@ -118,7 +210,7 @@ PricingProblem build_problem(const py::dict& cfg, std::optional<double> gamma_ov
         InternalizationTime(number(internal, "tau0"), number(internal, "tau1"), number(internal, "tau2")),
         std::move(tiers),
         build_dark_pool(py::cast<py::dict>(cfg[py::str("darkPool")])),
-        build_passive_ecn(py::cast<py::dict>(cfg[py::str("passiveEcn")])));
+        build_passive_ecn(py::cast<py::dict>(cfg[py::str("passiveEcn")]), number(cfg, "spreadPips")));
 }
 
 py::list matrix_value(const std::vector<std::vector<double>>& matrix) {
@@ -173,8 +265,8 @@ py::dict solution_value(const Solution& solution, const PricingProblem& problem)
         const auto& venue = *problem.passive_ecn();
         py::dict ecn;
         ecn["qGrid"] = policy.q_grid;
-        ecn["bidDelta"] = policy.bid_depth;
-        ecn["askDelta"] = policy.ask_depth;
+        ecn["bidDelta"] = policy.bid_delta;
+        ecn["askDelta"] = policy.ask_delta;
         ecn["bidActive"] = policy.bid_active;
         ecn["askActive"] = policy.ask_active;
         ecn["deltas"] = venue.deltas();
@@ -184,6 +276,21 @@ py::dict solution_value(const Solution& solution, const PricingProblem& problem)
             fill_rates.push_back(venue.flow().arrival_rate(delta));
         }
         ecn["fillRates"] = fill_rates;
+        py::list source_values;
+        for (const auto& source : venue.flow().sources()) {
+            py::dict item;
+            item["name"] = source.name();
+            item["A"] = source.flow().a();
+            item["k"] = source.flow().k();
+            item["deltaScale"] = source.delta_scale();
+            item["sourceSizePerTarget"] = source.source_size_per_target();
+            std::vector<double> source_rates;
+            source_rates.reserve(venue.deltas().size());
+            for (double delta : venue.deltas()) source_rates.push_back(source.arrival_rate(delta));
+            item["fillRates"] = std::move(source_rates);
+            source_values.append(std::move(item));
+        }
+        ecn["flowSources"] = std::move(source_values);
         ecn["quoteSize"] = venue.quote_size();
         ecn["makerFeePips"] = venue.maker_fee() * 10000.0;
         out["passiveEcn"] = std::move(ecn);
@@ -219,6 +326,7 @@ py::dict fill_value(const FillEvent& fill) {
 py::dict ecn_arrival_value(const EcnArrivalEvent& event) {
     py::dict out;
     out["time"] = event.time_minutes;
+    out["source"] = event.source;
     out["side"] = event.side;
     out["referencePrice"] = event.reference_price;
     out["tradeDistancePips"] = event.trade_distance_pips;
@@ -369,6 +477,7 @@ private:
 
 PYBIND11_MODULE(_native, module) {
     module.doc() = "C++ Howard pricing engine";
+    module.attr("ECN_PARAMETERIZATION_VERSION") = 3;
     py::class_<ladder_pricer::python::Engine>(module, "Engine")
         .def(py::init<py::dict>())
         .def("solve", &ladder_pricer::python::Engine::solve)

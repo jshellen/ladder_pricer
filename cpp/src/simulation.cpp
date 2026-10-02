@@ -25,6 +25,7 @@ struct Event {
     double delta = 0.0;
     double fee = 0.0;
     double rate = 0.0;
+    std::size_t ecn_source = 0;
 };
 
 std::size_t bracket_left(const std::vector<double>& grid, double q) {
@@ -95,22 +96,33 @@ std::vector<Event> events(const PricingProblem& problem, const Solution& solutio
         const std::size_t i = bracket_left(policy.q_grid, q);
         const double z = venue.quote_size();
 
-        // ECN market trades are a marked Poisson process. Buy and sell trades each
-        // arrive exogenously at rate A. Their distance D from mid is sampled later
-        // from Exp(k). An active passive quote at depth delta fills iff D >= delta,
-        // which implies lambda_fill(delta) = A * P(D >= delta) = A exp(-k delta).
-        // For retained paths we keep both sides even when no quote is active so the
-        // price chart can show market trades that we did not win. Hidden paths may
-        // omit an inactive side because it cannot affect inventory or PnL.
+        // Each ECN source has its own exogenous market-trade clock and reach
+        // distribution.  The policy chooses one master target-pair delta.  A
+        // crossed source maps it to d_source = 0.5 + alpha(d_target-0.5), so
+        // its fill threshold is alpha*(0.5-d_target) in source spread units.
+        // Keeping the parent clocks separate preserves the exact sum of the
+        // source-specific fill curves and lets retained paths identify which
+        // ECN pair generated an arrival/fill.
         for (Side side : {Side::Bid, Side::Ask}) {
             const bool policy_active = side == Side::Bid ? policy.bid_active[i] : policy.ask_active[i];
-            const double depth = side == Side::Bid ? policy.bid_depth[i] : policy.ask_depth[i];
+            const double delta = side == Side::Bid ? policy.bid_delta[i] : policy.ask_delta[i];
             const double dir = direction(side);
             const bool quote_active = policy_active && problem.grid().admissible(q, dir * z);
             if (!record_all_ecn_arrivals && !quote_active) continue;
-            const double rate = venue.flow().a();
-            if (rate > 0.0) {
-                out.push_back({false, true, false, quote_active, 0, side, z, depth, venue.maker_fee(), rate});
+            const auto& sources = venue.flow().sources();
+            for (std::size_t s = 0; s < sources.size(); ++s) {
+                const double rate = sources[s].flow().a();
+                if (rate <= 0.0) continue;
+                Event event;
+                event.ecn = true;
+                event.ecn_quote_active = quote_active;
+                event.side = side;
+                event.size = z;
+                event.delta = delta;
+                event.fee = venue.maker_fee();
+                event.rate = rate;
+                event.ecn_source = s;
+                out.push_back(std::move(event));
             }
         }
     }
@@ -341,22 +353,29 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                 } else if (chosen->ecn) {
                     const auto& venue = *problem_.passive_ecn();
 
-                    // A parent ECN market trade has arrived. Sample its distance D
-                    // from the contemporaneous mid/reference in pips. Because
-                    // D ~ Exp(k), P(D >= delta) = exp(-k delta), so an active quote
-                    // at depth delta has exactly the HJB fill intensity A exp(-k delta).
-                    std::exponential_distribution<double> distance_distribution(venue.flow().k());
-                    const double trade_distance_pips = distance_distribution(event_rng);
-                    const double signed_distance = trade_distance_pips / 10000.0;
+                    // A parent trade arrived on one concrete ECN source. Sample
+                    // reach in that source pair, then convert it back into the
+                    // target-pair spread coordinate for diagnostics.  The quote
+                    // wins exactly when source_reach >= alpha*(0.5-d_target).
+                    const auto& source = venue.flow().sources().at(chosen->ecn_source);
+                    std::exponential_distribution<double> reach_distribution(source.flow().k());
+                    const double source_reach = reach_distribution(event_rng);
+                    const double target_trade_reach = source.target_reach(source_reach);
+                    const double target_quote_reach = 0.5 - chosen->delta;
+                    const double signed_distance = problem_.spread() * target_trade_reach;
+                    const double trade_distance_pips = signed_distance * 10000.0;
+                    const double quote_depth_pips = problem_.spread() * target_quote_reach * 10000.0;
                     const double trade_price = chosen->side == Side::Bid
                         ? spot - signed_distance
                         : spot + signed_distance;
-                    const bool won = chosen->ecn_quote_active && trade_distance_pips + 1e-12 >= chosen->delta;
+                    const bool won = chosen->ecn_quote_active &&
+                        source_reach + 1e-12 >= source.delta_scale() * target_quote_reach;
 
                     if (retain) {
                         detailed.ecn_arrivals.push_back({
-                            t, side_name(chosen->side), spot, trade_distance_pips, trade_price,
-                            chosen->delta, chosen->ecn_quote_active, won
+                            t, source.name(), side_name(chosen->side), spot,
+                            trade_distance_pips, trade_price, quote_depth_pips,
+                            chosen->ecn_quote_active, won
                         });
                     }
                     if (!won) {
@@ -371,7 +390,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                     }
 
                     // We execute passively at our quote, not at the aggressor's limit.
-                    const double quote_distance = chosen->delta / 10000.0;
+                    const double quote_distance = problem_.spread() * (0.5 - chosen->delta);
                     execution = chosen->side == Side::Bid ? spot - quote_distance : spot + quote_distance;
                 }
 
@@ -388,8 +407,13 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                 ++trades;
 
                 if (retain) {
-                    detailed.fills.push_back({t, chosen->dark ? "Dark pool" : "Passive ECN",
-                                              side_name(chosen->side), executed_size, execution, before, q});
+                    std::string venue_name = chosen->dark ? "Dark pool" : "Passive ECN";
+                    if (chosen->ecn) {
+                        const auto& source = problem_.passive_ecn()->flow().sources().at(chosen->ecn_source);
+                        venue_name += " · " + source.name();
+                    }
+                    detailed.fills.push_back({t, venue_name, side_name(chosen->side),
+                                              executed_size, execution, before, q});
                 }
             }
 

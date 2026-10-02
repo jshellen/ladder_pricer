@@ -3,23 +3,89 @@ from __future__ import annotations
 from copy import deepcopy
 
 
-ECN_DISTANCE_STEP_PIPS = 0.01
 
-def ecn_distance_grid(min_distance_pips: float, max_distance_pips: float) -> list[float]:
-    lo = float(min_distance_pips)
-    hi = float(max_distance_pips)
-    if lo < 0.0:
-        raise ValueError("ECN minimum distance from mid must be nonnegative")
+# Temporary reference FX mids used by the dashboard when configuring crossed
+# customer-flow sources.  In production this should be replaced by a market-
+# data/database lookup.  Values are deliberately centralized here so the UI
+# and model configuration never hard-code reference rates.
+DEFAULT_FX_MIDS: dict[str, float] = {
+    "EURSEK": 11.50,
+    "USDSEK": 9.7458,
+    "GBPSEK": 13.0682,
+    "NOKSEK": 0.9914,
+    "DKKSEK": 1.5416,
+    "EURNOK": 11.60,
+    "USDNOK": 9.8305,
+    "GBPNOK": 13.1818,
+    "SEKNOK": 1.0087,
+    "DKKNOK": 1.5549,
+    "EURDKK": 7.46,
+    "USDDKK": 6.3220,
+    "GBPDKK": 8.4773,
+    "SEKDKK": 0.6487,
+    "NOKDKK": 0.6431,
+    "EURUSD": 1.18,
+    "GBPUSD": 1.3409,
+    "AUDUSD": 0.6600,
+    "NZDUSD": 0.5750,
+    "USDCAD": 1.3600,
+    "USDCHF": 0.8000,
+    "USDJPY": 147.00,
+    "EURGBP": 0.8800,
+    "EURCHF": 0.9440,
+    "EURJPY": 173.46,
+    "GBPCHF": 1.0727,
+    "GBPJPY": 197.11,
+    "AUDJPY": 97.02,
+    "NZDJPY": 84.53,
+}
+
+
+def default_fx_mid(pair: str | None) -> float | None:
+    """Return a temporary reference mid for *pair*, including inverse pairs.
+
+    The dashboard may derive a cross in an orientation that is not normally
+    quoted in the market (for example ``USDEUR``).  Keeping reciprocal handling
+    here lets callers ask for the economically required orientation directly.
+    """
+    key = str(pair or "").upper().strip()
+    if len(key) != 6 or not key.isalpha():
+        return None
+    if key in DEFAULT_FX_MIDS:
+        return float(DEFAULT_FX_MIDS[key])
+    inverse = key[3:] + key[:3]
+    value = DEFAULT_FX_MIDS.get(inverse)
+    if value is None or value <= 0.0:
+        return None
+    return 1.0 / float(value)
+
+ECN_DELTA_STEP = 0.01
+
+def ecn_delta_grid(min_delta: float, max_delta: float) -> list[float]:
+    """Return the passive-ECN price-improvement grid.
+
+    ECN delta uses the same convention as customer tiers: d=0 is the
+    same-side touch and d=0.5 is mid.  One grid step (0.01) is one
+    percentage point of the displayed spread.  Negative deltas are allowed
+    for quotes outside the touch; passive quotes may not cross through mid.
+    """
+    lo = float(min_delta)
+    hi = float(max_delta)
     if hi < lo:
-        raise ValueError("ECN maximum distance from mid must be >= minimum distance")
-    n = int(round((hi - lo) / ECN_DISTANCE_STEP_PIPS))
-    if abs(lo + n * ECN_DISTANCE_STEP_PIPS - hi) > 1e-9:
-        raise ValueError("ECN min/max distances must lie on the 0.5-pip grid")
-    return [round(lo + ECN_DISTANCE_STEP_PIPS * i, 10) for i in range(n + 1)]
+        raise ValueError("ECN maximum delta must be >= minimum delta")
+    if hi > 0.5 + 1e-12:
+        raise ValueError("ECN maximum delta must be <= 0.5 (mid)")
+    for value in (lo, hi):
+        snapped = round(value / ECN_DELTA_STEP) * ECN_DELTA_STEP
+        if abs(snapped - value) > 1e-9:
+            raise ValueError("ECN min/max deltas must lie on the 0.01 grid")
+    n = int(round((hi - lo) / ECN_DELTA_STEP))
+    return [round(lo + ECN_DELTA_STEP * i, 10) for i in range(n + 1)]
 
-ECN_DISTANCE_GRID = ecn_distance_grid(0.0, 20.0)
+ECN_DELTA_GRID = ecn_delta_grid(0.0, 0.5)
 
 _DEFAULT_CONFIG = {
+    "targetPair": "EURSEK",
     "spot": 11.5,
     "spreadPips": 20.0,
     "spotDrift": 0.0,
@@ -80,16 +146,16 @@ _DEFAULT_CONFIG = {
     },
     "passiveEcn": {
         "enabled": True,
-        # Hedge-only ECN quoting. Delta is the absolute distance from the moving
-        # reference/mid, measured directly in pips. The optimizer chooses NONE or
-        # one point on the 0.5-pip grid between minDistancePips and maxDistancePips.
-        "minDistancePips": 0.0,
-        "maxDistancePips": 20.0,
-        "deltas": ECN_DISTANCE_GRID,
-        # Empirical-style exponential arrival curve in pip distance from mid:
-        # ECN market trades arrive independently on each side at rate A. Their
-        # distance D from mid is Exp(k), so an active quote at depth delta has
-        # fill intensity A * P(D >= delta) = A * exp(-k * delta).
+        # Hedge-only ECN quoting using the same normalized delta convention as
+        # customer tiers: d=0 is the same-side touch and d=0.5 is mid.  The
+        # optimizer chooses NONE or one point on a 0.01 (one percentage-point)
+        # grid.  Negative d is allowed if the user wants to quote outside touch.
+        "minDelta": 0.0,
+        "maxDelta": 0.5,
+        "deltas": ECN_DELTA_GRID,
+        # A is the fill/market-trade intensity at mid. Moving away from mid by
+        # x=0.5-d spread fractions reduces intensity exponentially:
+        # lambda(d) = A * exp(-k * (0.5 - d)).
         "flow": {"A": 4.0, "k": 8.4},
         "quoteSize": 1.0,
         "makerFeePips": 3.0,

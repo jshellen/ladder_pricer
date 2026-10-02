@@ -164,12 +164,12 @@ PnlStatistics PnlAnalytics::statistics(double horizon, double sigma, double q0) 
             const double z=venue.quote_size();
             for(Side side:{Side::Bid,Side::Ask}){
                 const bool active=side==Side::Bid?p.bid_active[i]:p.ask_active[i];
-                const double depth=side==Side::Bid?p.bid_depth[i]:p.ask_depth[i];
+                const double delta=side==Side::Bid?p.bid_delta[i]:p.ask_delta[i];
                 if(!active) continue;
-                const double rate=venue.flow().arrival_rate(depth); const double dir=direction(side);
+                const double rate=venue.flow().arrival_rate(delta); const double dir=direction(side);
                 if(rate<=0.0) continue;
                 std::vector<double> shift(nvars,0.0);
-                shift[static_cast<std::size_t>(pnlvar)]=z*(depth/10000.0-venue.maker_fee());
+                shift[static_cast<std::size_t>(pnlvar)]=z*(problem_.spread()*(0.5-delta)-venue.maker_fee());
                 events.push_back({q+dir*z,rate,std::move(shift)});
             }
         }

@@ -70,6 +70,48 @@ private:
     double volume_shift_;
 };
 
+
+class FlowSource {
+public:
+    FlowSource(std::string name, LogisticFlow flow,
+               double delta_scale = 1.0, double source_size_per_target = 1.0);
+
+    const std::string& name() const noexcept { return name_; }
+    const LogisticFlow& flow() const noexcept { return flow_; }
+    double delta_scale() const noexcept { return delta_scale_; }
+    double source_size_per_target() const noexcept { return source_size_per_target_; }
+
+    double implied_delta(double target_delta) const noexcept;
+    double source_size(double target_size) const noexcept;
+    double rfq_arrival_rate(double target_size) const;
+    double win_probability(double target_delta, double target_size) const;
+    double arrival_rate(double target_delta, double target_size) const;
+    double target_center(double target_size) const;
+    double effective_steepness() const noexcept;
+
+private:
+    std::string name_;
+    LogisticFlow flow_;
+    double delta_scale_;
+    double source_size_per_target_;
+};
+
+class AggregatedFlow {
+public:
+    explicit AggregatedFlow(LogisticFlow direct_flow);
+    explicit AggregatedFlow(std::vector<FlowSource> sources);
+
+    const std::vector<FlowSource>& sources() const noexcept { return sources_; }
+    double rfq_arrival_rate(double target_size) const;
+    double win_probability(double target_delta, double target_size) const;
+    double arrival_rate(double target_delta, double target_size) const;
+    double optimal_delta(double target_size, double spread, double additive_value,
+                         double lower, double upper) const;
+
+private:
+    std::vector<FlowSource> sources_;
+};
+
 class SaturatingMarkout {
 public:
     SaturatingMarkout(double impact_scale, double size_exponent, double tau_minutes);
@@ -121,10 +163,13 @@ public:
     Tier(std::string name, std::vector<double> sizes, LogisticFlow flow,
          SaturatingMarkout markout, bool use_markout,
          double delta_min, double delta_max, double fee = 0.0);
+    Tier(std::string name, std::vector<double> sizes, AggregatedFlow flow,
+         SaturatingMarkout markout, bool use_markout,
+         double delta_min, double delta_max, double fee = 0.0);
 
     const std::string& name() const noexcept { return name_; }
     const std::vector<double>& sizes() const noexcept { return sizes_; }
-    const LogisticFlow& flow() const noexcept { return flow_; }
+    const AggregatedFlow& flow() const noexcept { return flow_; }
     const SaturatingMarkout& markout() const noexcept { return markout_; }
     bool use_markout() const noexcept { return use_markout_; }
     double delta_min() const noexcept { return delta_min_; }
@@ -134,7 +179,7 @@ public:
 private:
     std::string name_;
     std::vector<double> sizes_;
-    LogisticFlow flow_;
+    AggregatedFlow flow_;
     SaturatingMarkout markout_;
     bool use_markout_;
     double delta_min_;
@@ -195,10 +240,10 @@ class ExponentialFlow {
 public:
     ExponentialFlow(double a, double k);
 
-    // ECN delta is absolute distance from the moving reference/mid in pips.
-    // Buy and sell ECN market trades each arrive at exogenous rate A, with
-    // trade distance D ~ Exp(k). Therefore an active quote at depth delta has
-    // fill intensity lambda_fill(delta)=A exp(-k delta).
+    // ECN delta uses the same normalized price-improvement convention as tiers:
+    // d=0 is the same-side touch and d=0.5 is mid.  If X=0.5-d is the quote
+    // depth from mid measured in spread fractions, then
+    // lambda_fill(d)=A exp(-k X)=A exp(-k(0.5-d)).
     double arrival_rate(double delta) const;
     double a() const noexcept { return a_; }
     double k() const noexcept { return k_; }
@@ -208,13 +253,54 @@ private:
     double k_;
 };
 
+class ECNFlowSource {
+public:
+    ECNFlowSource(std::string name, ExponentialFlow flow,
+                  double delta_scale = 1.0, double source_size_per_target = 1.0);
+
+    const std::string& name() const noexcept { return name_; }
+    const ExponentialFlow& flow() const noexcept { return flow_; }
+    double delta_scale() const noexcept { return delta_scale_; }
+    double source_size_per_target() const noexcept { return source_size_per_target_; }
+
+    // Map the target-pair master delta into the source-pair quote.  The same
+    // affine convention is used by customer Tier flow sources:
+    // d_source = 0.5 + alpha * (d_target - 0.5).
+    double implied_delta(double target_delta) const noexcept;
+    double arrival_rate(double target_delta) const;
+
+    // Convert a source-pair trade reach X_source (spread fractions from mid)
+    // into the equivalent target-pair reach X_target.
+    double target_reach(double source_reach) const noexcept;
+
+private:
+    std::string name_;
+    ExponentialFlow flow_;
+    double delta_scale_;
+    double source_size_per_target_;
+};
+
+class AggregatedECNFlow {
+public:
+    explicit AggregatedECNFlow(ExponentialFlow direct_flow);
+    explicit AggregatedECNFlow(std::vector<ECNFlowSource> sources);
+
+    const std::vector<ECNFlowSource>& sources() const noexcept { return sources_; }
+    double arrival_rate(double target_delta) const;
+
+private:
+    std::vector<ECNFlowSource> sources_;
+};
+
 class PassiveECN {
 public:
     PassiveECN(std::vector<double> deltas, ExponentialFlow flow,
                double quote_size, double maker_fee);
+    PassiveECN(std::vector<double> deltas, AggregatedECNFlow flow,
+               double quote_size, double maker_fee);
 
     const std::vector<double>& deltas() const noexcept { return deltas_; }
-    const ExponentialFlow& flow() const noexcept { return flow_; }
+    const AggregatedECNFlow& flow() const noexcept { return flow_; }
     double quote_size() const noexcept { return quote_size_; }
     double maker_fee() const noexcept { return maker_fee_; }
     bool side_allowed(double inventory, Side side) const noexcept;
@@ -222,7 +308,7 @@ public:
 
 private:
     std::vector<double> deltas_;
-    ExponentialFlow flow_;
+    AggregatedECNFlow flow_;
     double quote_size_;
     double maker_fee_;
 };
@@ -244,8 +330,8 @@ struct DarkPoolPolicy {
 
 struct PassiveECNPolicy {
     std::vector<double> q_grid;
-    std::vector<double> bid_depth;
-    std::vector<double> ask_depth;
+    std::vector<double> bid_delta;
+    std::vector<double> ask_delta;
     std::vector<bool> bid_active;
     std::vector<bool> ask_active;
 };

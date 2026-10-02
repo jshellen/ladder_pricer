@@ -64,8 +64,8 @@ double max_abs_policy(const Policy& policy) {
         out = std::max(out, max_abs(policy.dark_pool->ask_size));
     }
     if (policy.passive_ecn) {
-        out = std::max(out, max_abs(policy.passive_ecn->bid_depth));
-        out = std::max(out, max_abs(policy.passive_ecn->ask_depth));
+        out = std::max(out, max_abs(policy.passive_ecn->bid_delta));
+        out = std::max(out, max_abs(policy.passive_ecn->ask_delta));
     }
     return out;
 }
@@ -113,8 +113,8 @@ PassiveECNPolicy slice_policy(const PassiveECNPolicy& policy,
     PassiveECNPolicy out;
     out.q_grid = q_grid;
     for (auto i : indices) {
-        out.bid_depth.push_back(policy.bid_depth[i]);
-        out.ask_depth.push_back(policy.ask_depth[i]);
+        out.bid_delta.push_back(policy.bid_delta[i]);
+        out.ask_delta.push_back(policy.ask_delta[i]);
         out.bid_active.push_back(policy.bid_active[i]);
         out.ask_active.push_back(policy.ask_active[i]);
     }
@@ -177,11 +177,11 @@ HowardSolver::AffineOperator HowardSolver::fixed_policy_operator(const Policy& p
             const double z = venue.quote_size();
             for (Side side : {Side::Bid, Side::Ask}) {
                 const bool active = side == Side::Bid ? p.bid_active[i] : p.ask_active[i];
-                const double depth = side == Side::Bid ? p.bid_depth[i] : p.ask_depth[i];
+                const double delta = side == Side::Bid ? p.bid_delta[i] : p.ask_delta[i];
                 if (!active) continue;
-                const double rate = venue.flow().arrival_rate(depth);
+                const double rate = venue.flow().arrival_rate(delta);
                 const double dir = direction(side);
-                op.reward[i] += rate * z * (depth / 10000.0 - venue.maker_fee());
+                op.reward[i] += rate * z * (problem_.spread() * (0.5 - delta) - venue.maker_fee());
                 add_transition(op.generator, states, i, q + dir * z, rate);
             }
         }
@@ -226,9 +226,9 @@ double HowardSolver::policy_change(const Policy& lhs, const Policy& rhs) {
         }
     }
     if (lhs.passive_ecn && rhs.passive_ecn) {
-        for (std::size_t i = 0; i < lhs.passive_ecn->bid_depth.size(); ++i) {
-            out = std::max(out, std::abs(lhs.passive_ecn->bid_depth[i] - rhs.passive_ecn->bid_depth[i]));
-            out = std::max(out, std::abs(lhs.passive_ecn->ask_depth[i] - rhs.passive_ecn->ask_depth[i]));
+        for (std::size_t i = 0; i < lhs.passive_ecn->bid_delta.size(); ++i) {
+            out = std::max(out, std::abs(lhs.passive_ecn->bid_delta[i] - rhs.passive_ecn->bid_delta[i]));
+            out = std::max(out, std::abs(lhs.passive_ecn->ask_delta[i] - rhs.passive_ecn->ask_delta[i]));
             if (lhs.passive_ecn->bid_active[i] != rhs.passive_ecn->bid_active[i] ||
                 lhs.passive_ecn->ask_active[i] != rhs.passive_ecn->ask_active[i]) out = std::max(out, 1.0);
         }

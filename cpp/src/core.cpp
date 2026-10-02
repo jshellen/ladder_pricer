@@ -221,13 +221,182 @@ ExponentialFlow::ExponentialFlow(double a, double k) : a_(a), k_(k) {
 }
 
 double ExponentialFlow::arrival_rate(double delta) const {
-    // delta is quote distance from mid in pips. Under the marked ECN process,
-    // each side has market-trade arrival rate A and D~Exp(k), hence the quote
-    // fill intensity is A*P(D>=delta)=A*exp(-k*delta).
-    const double x = -k_ * delta;
+    // delta uses the tier convention: d=0 is touch and d=0.5 is mid.
+    // With X=0.5-d as distance from mid in spread fractions and X~Exp(k),
+    // lambda_fill(d)=A*P(X_reach>=0.5-d)=A*exp(-k*(0.5-d)).
+    const double x = -k_ * (0.5 - delta);
     if (x >= 709.0) return std::numeric_limits<double>::infinity();
     if (x <= -745.0) return 0.0;
     return a_ * std::exp(x);
+}
+
+
+ECNFlowSource::ECNFlowSource(std::string name, ExponentialFlow flow,
+                             double delta_scale, double source_size_per_target)
+    : name_(std::move(name)), flow_(std::move(flow)), delta_scale_(delta_scale),
+      source_size_per_target_(source_size_per_target) {
+    require(!name_.empty(), "ECN flow source name must not be empty");
+    require(delta_scale_ > 0.0, "ECN flow source delta scale must be positive");
+    require(source_size_per_target_ > 0.0,
+            "ECN flow source size scale must be positive");
+}
+
+double ECNFlowSource::implied_delta(double target_delta) const noexcept {
+    return 0.5 + delta_scale_ * (target_delta - 0.5);
+}
+
+double ECNFlowSource::arrival_rate(double target_delta) const {
+    return flow_.arrival_rate(implied_delta(target_delta));
+}
+
+double ECNFlowSource::target_reach(double source_reach) const noexcept {
+    return source_reach / delta_scale_;
+}
+
+AggregatedECNFlow::AggregatedECNFlow(ExponentialFlow direct_flow)
+    : sources_{ECNFlowSource("direct", std::move(direct_flow), 1.0, 1.0)} {}
+
+AggregatedECNFlow::AggregatedECNFlow(std::vector<ECNFlowSource> sources)
+    : sources_(std::move(sources)) {
+    require(!sources_.empty(), "aggregated ECN flow requires at least one source");
+}
+
+double AggregatedECNFlow::arrival_rate(double target_delta) const {
+    double total = 0.0;
+    for (const auto& source : sources_) total += source.arrival_rate(target_delta);
+    return total;
+}
+
+
+FlowSource::FlowSource(std::string name, LogisticFlow flow,
+                       double delta_scale, double source_size_per_target)
+    : name_(std::move(name)), flow_(std::move(flow)), delta_scale_(delta_scale),
+      source_size_per_target_(source_size_per_target) {
+    require(!name_.empty(), "flow source name must not be empty");
+    require(delta_scale_ > 0.0, "flow source delta scale must be positive");
+    require(source_size_per_target_ > 0.0,
+            "flow source size scale must be positive");
+}
+
+double FlowSource::implied_delta(double target_delta) const noexcept {
+    return 0.5 + delta_scale_ * (target_delta - 0.5);
+}
+
+double FlowSource::source_size(double target_size) const noexcept {
+    return target_size * source_size_per_target_;
+}
+
+double FlowSource::rfq_arrival_rate(double target_size) const {
+    return flow_.rfq_arrival_rate(source_size(target_size));
+}
+
+double FlowSource::win_probability(double target_delta, double target_size) const {
+    return flow_.win_probability(implied_delta(target_delta), source_size(target_size));
+}
+
+double FlowSource::arrival_rate(double target_delta, double target_size) const {
+    return flow_.arrival_rate(implied_delta(target_delta), source_size(target_size));
+}
+
+double FlowSource::target_center(double target_size) const {
+    return 0.5 + (flow_.center(source_size(target_size)) - 0.5) / delta_scale_;
+}
+
+double FlowSource::effective_steepness() const noexcept {
+    return flow_.steepness() * delta_scale_;
+}
+
+AggregatedFlow::AggregatedFlow(LogisticFlow direct_flow)
+    : sources_{FlowSource("direct", std::move(direct_flow), 1.0, 1.0)} {}
+
+AggregatedFlow::AggregatedFlow(std::vector<FlowSource> sources)
+    : sources_(std::move(sources)) {
+    require(!sources_.empty(), "aggregated flow requires at least one source");
+}
+
+double AggregatedFlow::rfq_arrival_rate(double target_size) const {
+    double total = 0.0;
+    for (const auto& source : sources_) total += source.rfq_arrival_rate(target_size);
+    return total;
+}
+
+double AggregatedFlow::arrival_rate(double target_delta, double target_size) const {
+    double total = 0.0;
+    for (const auto& source : sources_) total += source.arrival_rate(target_delta, target_size);
+    return total;
+}
+
+double AggregatedFlow::win_probability(double target_delta, double target_size) const {
+    const double rfq = rfq_arrival_rate(target_size);
+    return rfq > 0.0 ? arrival_rate(target_delta, target_size) / rfq : 0.0;
+}
+
+double AggregatedFlow::optimal_delta(double target_size, double spread, double additive_value,
+                                     double lower, double upper) const {
+    require(target_size > 0.0, "trade size must be positive");
+    require(spread > 0.0, "spread must be positive");
+    require(lower <= upper, "lower delta bound must not exceed upper bound");
+
+    if (sources_.size() == 1 &&
+        std::abs(sources_.front().delta_scale() - 1.0) <= 1e-14 &&
+        std::abs(sources_.front().source_size_per_target() - 1.0) <= 1e-14) {
+        return std::clamp(
+            sources_.front().flow().optimal_delta(target_size, spread, additive_value),
+            lower, upper);
+    }
+
+    const auto objective = [&](double delta) {
+        const double bracket = target_size * spread * (0.5 - delta) + additive_value;
+        return arrival_rate(delta, target_size) * bracket;
+    };
+
+    const double break_even = 0.5 + additive_value / (target_size * spread);
+    if (break_even <= lower) return lower;
+    const double search_upper = std::min(upper, break_even);
+    if (search_upper <= lower + 1e-14) return lower;
+
+    std::vector<double> knots{lower, search_upper};
+    for (const auto& source : sources_) {
+        const double center = source.target_center(target_size);
+        const double k = source.effective_steepness();
+        knots.push_back(std::clamp(center, lower, search_upper));
+        for (double width : {1.0, 2.0, 4.0, 8.0}) {
+            knots.push_back(std::clamp(center - width / k, lower, search_upper));
+            knots.push_back(std::clamp(center + width / k, lower, search_upper));
+        }
+    }
+    knots.push_back(std::clamp(break_even, lower, search_upper));
+    std::sort(knots.begin(), knots.end());
+    knots.erase(std::unique(knots.begin(), knots.end(), [](double a, double b) {
+        return std::abs(a - b) <= 1e-12;
+    }), knots.end());
+
+    std::size_t best = 0;
+    double best_value = objective(knots[0]);
+    for (std::size_t i = 1; i < knots.size(); ++i) {
+        const double value = objective(knots[i]);
+        if (value > best_value) { best = i; best_value = value; }
+    }
+
+    double a = best == 0 ? knots[best] : knots[best - 1];
+    double b = best + 1 >= knots.size() ? knots[best] : knots[best + 1];
+    if (b <= a + 1e-13) return knots[best];
+
+    constexpr double phi = 0.6180339887498948482;
+    double c = b - phi * (b - a);
+    double d = a + phi * (b - a);
+    double fc = objective(c), fd = objective(d);
+    for (int iter = 0; iter < 48; ++iter) {
+        if (fc < fd) {
+            a = c; c = d; fc = fd;
+            d = a + phi * (b - a); fd = objective(d);
+        } else {
+            b = d; d = c; fd = fc;
+            c = b - phi * (b - a); fc = objective(c);
+        }
+    }
+    const double candidate = 0.5 * (a + b);
+    return objective(candidate) >= best_value ? candidate : knots[best];
 }
 
 SaturatingMarkout::SaturatingMarkout(double impact_scale, double size_exponent, double tau_minutes)
@@ -265,6 +434,12 @@ double QuadraticPenalty::value(double inventory) const noexcept {
 }
 
 Tier::Tier(std::string name, std::vector<double> sizes, LogisticFlow flow,
+           SaturatingMarkout markout, bool use_markout,
+           double delta_min, double delta_max, double fee)
+    : Tier(std::move(name), std::move(sizes), AggregatedFlow(std::move(flow)),
+           std::move(markout), use_markout, delta_min, delta_max, fee) {}
+
+Tier::Tier(std::string name, std::vector<double> sizes, AggregatedFlow flow,
            SaturatingMarkout markout, bool use_markout,
            double delta_min, double delta_max, double fee)
     : name_(std::move(name)), sizes_(std::move(sizes)), flow_(std::move(flow)),
@@ -364,10 +539,15 @@ bool DarkPool::risk_reducing(double inventory, Side side, double size) const noe
 
 PassiveECN::PassiveECN(std::vector<double> deltas, ExponentialFlow flow,
                        double quote_size, double maker_fee)
+    : PassiveECN(std::move(deltas), AggregatedECNFlow(std::move(flow)),
+                 quote_size, maker_fee) {}
+
+PassiveECN::PassiveECN(std::vector<double> deltas, AggregatedECNFlow flow,
+                       double quote_size, double maker_fee)
     : deltas_(std::move(deltas)), flow_(std::move(flow)),
       quote_size_(quote_size), maker_fee_(maker_fee) {
     require(!deltas_.empty(), "passive ECN deltas must not be empty");
-    require(deltas_.front() >= -kTolerance, "passive ECN distances must be nonnegative");
+    require(deltas_.back() <= 0.5 + kTolerance, "passive ECN delta must not cross through mid (d <= 0.5)");
     require(quote_size_ > 0.0, "passive ECN quote size must be positive");
     require(maker_fee_ >= 0.0, "passive ECN maker fee must be nonnegative");
     for (std::size_t i = 1; i < deltas_.size(); ++i) {
@@ -515,7 +695,8 @@ std::vector<double> PolicyBuilder::build_ladder(const Tier& tier,
             ? tier.markout().expected(z, problem_.internalization_time().value(q_next))
             : 0.0;
         const double additive = -z * (markout + tier.fee()) + grid.interpolate(value, q_next) - hq;
-        const double unconstrained = tier.flow().optimal_delta(z, problem_.spread(), additive);
+        const double unconstrained = tier.flow().optimal_delta(
+            z, problem_.spread(), additive, lower, upper);
         row.push_back(std::clamp(unconstrained, lower, upper));
     }
     return row;
@@ -640,8 +821,8 @@ Policy PolicyBuilder::initial_policy() const {
     if (problem_.passive_ecn()) {
         PassiveECNPolicy p;
         p.q_grid = q_grid;
-        p.bid_depth.assign(q_grid.size(), 0.0);
-        p.ask_depth.assign(q_grid.size(), 0.0);
+        p.bid_delta.assign(q_grid.size(), 0.0);
+        p.ask_delta.assign(q_grid.size(), 0.0);
         p.bid_active.assign(q_grid.size(), false);
         p.ask_active.assign(q_grid.size(), false);
         policy.passive_ecn = std::move(p);
@@ -704,8 +885,8 @@ PassiveECNPolicy PolicyBuilder::improve_passive_ecn(const std::vector<double>& v
     const auto& q_grid = problem_.grid().states();
     PassiveECNPolicy policy;
     policy.q_grid = q_grid;
-    policy.bid_depth.assign(q_grid.size(), 0.0);
-    policy.ask_depth.assign(q_grid.size(), 0.0);
+    policy.bid_delta.assign(q_grid.size(), 0.0);
+    policy.ask_delta.assign(q_grid.size(), 0.0);
     policy.bid_active.assign(q_grid.size(), false);
     policy.ask_active.assign(q_grid.size(), false);
     const double z = venue.quote_size();
@@ -716,21 +897,21 @@ PassiveECNPolicy PolicyBuilder::improve_passive_ecn(const std::vector<double>& v
             if (!venue.risk_reducing(q, side, z) || !problem_.grid().admissible(q, dir * z)) continue;
             const double hq = problem_.grid().interpolate(value, q);
             double best_value = 0.0;  // OFF is always available.
-            double best_depth = 0.0;
+            double best_delta = 0.0;
             bool active = false;
             for (std::size_t j = 0; j < venue.deltas().size(); ++j) {
                 const double delta = venue.deltas()[j];
                 const double rate = venue.flow().arrival_rate(delta);
-                const double edge = z * (delta / 10000.0 - venue.maker_fee());
+                const double edge = z * (problem_.spread() * (0.5 - delta) - venue.maker_fee());
                 const double candidate = rate * (edge + problem_.grid().interpolate(value, q + dir * z) - hq);
                 if (candidate > best_value + kTolerance) {
                     best_value = candidate;
-                    best_depth = delta;
+                    best_delta = delta;
                     active = true;
                 }
             }
-            if (side == Side::Bid) { policy.bid_active[i] = active; policy.bid_depth[i] = best_depth; }
-            else { policy.ask_active[i] = active; policy.ask_depth[i] = best_depth; }
+            if (side == Side::Bid) { policy.bid_active[i] = active; policy.bid_delta[i] = best_delta; }
+            else { policy.ask_active[i] = active; policy.ask_delta[i] = best_delta; }
         }
     }
     return policy;
@@ -916,11 +1097,11 @@ std::vector<double> BellmanModel::rhs(const std::vector<double>& value, const Po
             const double z = venue.quote_size();
             for (Side side : {Side::Bid, Side::Ask}) {
                 const bool active = side == Side::Bid ? p.bid_active[i] : p.ask_active[i];
-                const double depth = side == Side::Bid ? p.bid_depth[i] : p.ask_depth[i];
+                const double delta = side == Side::Bid ? p.bid_delta[i] : p.ask_delta[i];
                 if (!active) continue;
-                const double rate = venue.flow().arrival_rate(depth);
+                const double rate = venue.flow().arrival_rate(delta);
                 const double dir = direction(side);
-                const double edge = z * (depth / 10000.0 - venue.maker_fee());
+                const double edge = z * (problem_.spread() * (0.5 - delta) - venue.maker_fee());
                 total += rate * (edge + grid.interpolate(value, q + dir * z) - hq);
             }
         }

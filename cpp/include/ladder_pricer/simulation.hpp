@@ -20,6 +20,7 @@ struct FillEvent {
 
 struct EcnArrivalEvent {
     double time_minutes = 0.0;
+    std::string source;
     std::string side;
     double reference_price = 0.0;
     double trade_distance_pips = 0.0;

@@ -26,11 +26,61 @@ The C++17 library contains:
 - saturating adverse-selection markout;
 - per-tier trading fees that enter quote optimization, analytical PnL and Monte Carlo PnL;
 - dark-pool controls;
-- optional Crisafi-style passive ECN hedge control: `NONE` or a quote distance from the moving mid/reference in pips. The default action grid runs from 0 to 20 pips in 0.5-pip increments, and ECN fills are strictly risk-reducing;
+- optional Crisafi-style passive ECN hedge control: `NONE` or a Tier-style price-improvement delta `d`. Here `d=0` is the same-side touch and `d=0.5` is mid; the default action grid is 0.00 to 0.50 in 0.01 increments, and ECN fills are strictly risk-reducing;
 - event-driven fills with an independent continuous market-price process;
 - corrected impact-aware closed-form terminal PnL mean and standard deviation.
 
 The Dash layer does **not** implement pricing mathematics.
+
+
+### Aggregating customer flow into one target FX risk
+
+A customer tier can now be driven by several FX-pair flow sources while the HJB keeps a
+single target-pair quote control and inventory state. Existing configs that provide only
+`tier["flow"]` are unchanged. To combine EURSEK and crossed USDSEK flow, use
+`tier["flowSources"]` instead:
+
+```python
+config["tiers"][0]["flowSources"] = [
+    {
+        "name": "EURSEK",
+        "flow": config["tiers"][0]["flow"],
+        "mapping": {"type": "identity"},
+    },
+    {
+        "name": "USDSEK",
+        "flow": {
+            "A0": 0.010,
+            "theta": 0.20,
+            "beta": 0.08,
+            "steepness": 7.0,
+            "shift": 0.50,
+            "volumeShift": 0.02,
+        },
+        "mapping": {
+            "type": "crossed",
+            "crossMid": 1.18,          # EURUSD: USD per EUR
+            "sourceSpreadPips": 18.0, # USDSEK full customer spread
+        },
+    },
+]
+```
+
+For a crossed source the target EURSEK delta is converted to the source-pair delta by
+
+```text
+source_delta = 0.5 + delta_scale * (target_delta - 0.5)
+delta_scale  = target_spread / (cross_mid * source_spread)
+```
+
+and a target EUR-equivalent size `z` is evaluated on the source flow curve at
+`source_size = cross_mid * z`. The aggregate won-trade intensity is the sum of the
+pair-specific won-trade intensities. The Monte Carlo RFQ clock likewise sums source RFQ
+arrival rates and uses their RFQ-rate-weighted aggregate win probability.
+
+Because several transformed logistic curves no longer have the single-curve Lambert-W
+optimum, aggregated tiers use a bounded one-dimensional numerical quote optimization.
+Single-source legacy tiers retain the original analytical fast path.
 
 ## Python API
 
@@ -66,19 +116,37 @@ The application has three main work areas:
 ### Passive ECN hedge
 
 The optional passive ECN module is deliberately reduced-form and does not use `xfills`.
-ECN quotes use their own coordinate system: `delta` is the absolute distance from the moving
-mid/reference, measured directly in pips. Buy and sell ECN market trades are modeled as two
-independent Poisson processes, each with exogenous rate `A`. When a market trade arrives, its
-distance `D` from mid is sampled from `Exp(k)`. An active quote at depth `delta` fills iff
-`D >= delta`, so the implied quote-fill intensity is exactly
-`lambda_fill(delta) = A exp(-k delta)`. Defaults are `A=0.15` trades/min **per side** and
-`k=0.24 1/pip`. The optimizer evaluates `NONE` plus a 0.5-pip grid between configurable
-`minDistancePips` and `maxDistancePips`, which default to 0 and 20 pips.
-At every inventory state the Howard improvement compares `NONE` with every allowed distance.
-ECN quotes are hedge-only: positive inventory may only post an ask, negative inventory may
-only post a bid, flat inventory posts nothing, and a fill is never allowed to cross through
-zero and create risk on the opposite side. A passive ECN fill at distance `delta` earns
-`size * (delta pips - maker fee)` before continuation-value effects.
+ECN quotes use the same normalized price-improvement convention as customer tiers: `d=0` is
+the same-side touch and `d=0.5` is mid. If `S` is the full spread, the quote depth from mid
+is `S * (0.5-d)`.
+
+The ECN can now aggregate several streamed FX pairs into one target-risk quote control. The
+direct target pair and every crossed ECN source have their own exponential curve
+`lambda_s(d_s)=A_s exp(-k_s(0.5-d_s))`. The optimizer still chooses only one master target-pair
+delta `d`. For a crossed source,
+
+```text
+d_source   = 0.5 + alpha * (d_target - 0.5)
+alpha      = target_spread / (cross_mid * source_spread)
+sourceSize = cross_mid * targetSize
+```
+
+so EURSEK can be the master quote while USDSEK and GBPSEK inherit economically equivalent
+quotes derived through EURUSD and EURGBP. The HJB fill intensity is the sum of the mapped
+source-specific intensities. Because the target-equivalent execution edge and inventory jump
+are common across sources, this is exactly the sum of their source Hamiltonians when the ECN
+maker fee is shared. Monte Carlo keeps the source clocks separate: source `s` has parent
+trade intensity `A_s`, source reach `X_s ~ Exp(k_s)`, and a fill occurs when
+`X_s >= alpha_s * (0.5-d_target)`. Retained paths record which ECN source generated each
+arrival and fill.
+
+The optimizer evaluates `NONE` plus a 0.01 grid between configurable `minDelta` and `maxDelta`,
+defaulting to 0.00 and 0.50. One 0.01 step is one percentage point of spread. At every
+inventory state the Howard improvement compares `NONE` with every allowed delta. ECN quotes
+are hedge-only: positive inventory may only post an ask, negative inventory may only post a
+bid, flat inventory posts nothing, and a fill is never allowed to cross through zero and
+create risk on the opposite side. A passive ECN fill at target delta `d` earns
+`size * (spread * (0.5-d) - maker fee)` before continuation-value effects.
 
 ### Monte Carlo
 
@@ -260,7 +328,7 @@ The Policy → Dark pool tab mirrors the Streamlit-style diagnostic layout: plot
 
 ### UI diagnostics
 
-- **Passive ECN diagnostics** show exponential-flow parameters, the flow curve, relative intensity, optimal trade intensity vs inventory, quotes vs inventory, and the discrete optimal distance policy. The ECN action grid is configurable from min to max distance from mid in fixed 0.5-pip increments (plus `NONE`).
+- **Passive ECN diagnostics** show every direct/crossed exponential-flow source, its FX mapping, source-specific and total fill curves, optimal trade intensity vs inventory, quotes vs inventory, and the discrete master-delta policy. The ECN action grid is configurable from `minDelta` to `maxDelta` in fixed 0.01 increments (one percentage point of spread), plus `NONE`.
 - **Inventory grid** is fixed to uniform 1M spacing; only the maximum absolute inventory is configurable.
 
 
@@ -269,7 +337,7 @@ The Policy → Dark pool tab mirrors the Streamlit-style diagnostic layout: plot
 
 ### Passive ECN exponential flow
 
-Passive ECN market trades arrive independently on the buy and sell sides at rate `A`. Their distance from mid is `D ~ Exp(k)`, so an active quote at depth `delta` has fill intensity `lambda_fill(delta)=A exp(-k delta)`. Defaults: A=0.15 trades/min per side, k=0.24 1/pip, and a 0-to-20-pip quote grid in 0.5-pip increments.
+Each passive ECN source has its own parent trade intensity `A_s` and reach distribution `X_s ~ Exp(k_s)`. Direct sources use the master delta unchanged. Crossed sources use the same affine FX mapping as Tier flow sources, so their target-delta fill contribution is `A_s exp(-k_s alpha_s (0.5-d))`. The total ECN fill intensity is the sum across sources. The default direct EURSEK source remains A=4.0 trades/min per side, k=8.4, with a 0.00-to-0.50 master-delta grid in 0.01 increments.
 
 
 ## Dark pool model
@@ -295,3 +363,13 @@ Only a won RFQ changes inventory and cash.  The RFQ markout shock is applied on
 every RFQ, including lost RFQs; for a won RFQ, inventory/cash are updated before
 the markout is applied.  The product `lambda_RFQ(z) * p_win(delta,z)` remains
 the won-trade intensity used by the current HJB/closed-form policy machinery.
+
+
+### Temporary FX reference mids
+
+The Dash flow-source editor currently obtains crossed-source reference mids from
+`trinity.defaults.DEFAULT_FX_MIDS`. `default_fx_mid(pair)` also resolves inverse
+orientations (for example `USDEUR` from `EURUSD`). This is intentionally a
+temporary market-data boundary: a production deployment should replace the
+default lookup with the bank's/database market-data source while leaving the
+flow-source and HJB interfaces unchanged.
