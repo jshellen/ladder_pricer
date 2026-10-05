@@ -17,7 +17,9 @@ def ui_values_from_default():
             f"{p}-enabled": ["on"] if tier["enabled"] else [],
             f"{p}-name": tier["name"],
             f"{p}-sizes": ", ".join(str(x) for x in tier["sizes"]),
-            f"{p}-A0": tier["flow"]["A0"], f"{p}-theta": tier["flow"]["theta"], f"{p}-beta": tier["flow"]["beta"],
+            f"{p}-rfq-size-step": tier.get("rfqSizeStep", 1.0),
+            f"{p}-A0": tier["flow"]["A0"],
+            f"{p}-theta": tier["flow"]["theta"], f"{p}-beta": tier["flow"]["beta"],
             f"{p}-steep": tier["flow"]["steepness"], f"{p}-shift": tier["flow"]["shift"], f"{p}-vshift": tier["flow"]["volumeShift"],
             f"{p}-fee": tier.get("feePips", 0.0),
             f"{p}-markout-enabled": ["on"] if tier["useMarkout"] else [],
@@ -34,6 +36,7 @@ def ui_values_from_default():
     values.update({
         "ecn-enabled": ["on"] if ecn["enabled"] else [],
         "ecn-A": ecn["flow"]["A"], "ecn-k": ecn["flow"]["k"],
+        "ecn-mean-size": ecn["meanTradeSize"],
         "ecn-dmin": ecn["minDelta"], "ecn-dmax": ecn["maxDelta"],
         "ecn-size": ecn["quoteSize"], "ecn-fee": ecn["makerFeePips"],
     })
@@ -171,6 +174,7 @@ def test_continuous_parameters_accept_extra_decimal_precision():
         "dp-fee": 0.3125,
         "ecn-A": 0.15125,
         "ecn-k": 0.24125,
+        "ecn-mean-size": 0.8125,
         "ecn-size": 1.125,
         "ecn-fee": 3.125,
     })
@@ -186,8 +190,32 @@ def test_continuous_parameters_accept_extra_decimal_precision():
     assert cfg["darkPool"]["p0"] == 0.1125
     assert cfg["darkPool"]["feePips"] == 0.3125
     assert cfg["passiveEcn"]["flow"]["A"] == 0.15125
+    assert cfg["passiveEcn"]["meanTradeSize"] == 0.8125
     assert cfg["passiveEcn"]["quoteSize"] == 1.125
 
+
+def test_rfq_flow_curve_itself_defines_size_density():
+    cfg = build_config(ui_values_from_default())
+    flow = cfg["tiers"][0]["flow"]
+    assert "A0" in flow
+    assert "totalRfqRate" not in flow
+    assert "sizeProbabilities" not in flow
+
+    tier = cfg["tiers"][0]
+    assert tier["sizes"] == [1, 2, 3, 5, 10, 20]
+    assert tier["rfqSizeStep"] == 1.0
+    rfq_sizes = list(range(1, 21))
+    weights = [z ** (-flow["theta"] - flow["beta"] * z) for z in rfq_sizes]
+    probabilities = [w / sum(weights) for w in weights]
+    assert sum(probabilities) == pytest.approx(1.0)
+
+    from pathlib import Path
+    app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
+    assert 'A0 · exogenous intensity scale' in app_source
+    assert 'intensity curve itself is the density' in app_source
+    assert 'RFQ size probabilities' not in app_source
+    assert 'RFQ size step [EUR M]' in app_source
+    assert 'prices between knots are linearly interpolated' in app_source
 
 def test_dark_pool_is_zero_inflated_poisson_only():
     cfg = build_config(ui_values_from_default())
@@ -229,5 +257,81 @@ def test_ecn_flow_source_ui_is_wired_for_crossed_sources():
     assert 'id="open-ecn-flow-sources"' in app_source
     assert 'id="ecn-extra-flow-sources-store"' in app_source
     assert 'ecn["flowSources"] = [direct] + deepcopy(ecn_extras)' in app_source
-    assert 'if not _remove:\n            return (no_update,) * 4' in app_source
-    assert 'if not _add:\n            return (no_update,) * 4' in app_source
+    assert 'if not _remove:\n            return (no_update,) * 5' in app_source
+    assert 'if not _add:\n            return (no_update,) * 5' in app_source
+
+
+def test_fill_by_tier_plot_can_switch_between_trade_count_and_volume():
+    from pathlib import Path
+
+    app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
+    assert '"fill-tier-metric"' in app_source
+    assert '{"label": "Number of trades", "value": "count"}' in app_source
+    assert '{"label": "Total volume", "value": "volume"}' in app_source
+    assert 'fill_aggregates = list(mc.get("fillAggregates", []))' in app_source
+    assert 'value / fill_total if fill_total > 0.0 else 0.0' in app_source
+    assert 'yaxis_title="Share of executed volume" if fill_metric == "volume" else "Share of trades"' in app_source
+    assert 'title="Fills by tier and side · all simulated paths"' in app_source
+
+
+def test_realized_rfq_hit_ratio_chart_uses_population_aggregates():
+    from pathlib import Path
+
+    app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
+    assert 'diagnostic_expander("RFQ hit ratios", graph("rfq-realized-hit-chart", 360))' in app_source
+    assert 'list(mc.get("rfqAggregates", []))' in app_source
+    assert 'wins = [int(row.get("wins", 0)) for row in rfq_aggregates]' in app_source
+    assert 'requests = [int(row.get("requests", 0)) for row in rfq_aggregates]' in app_source
+    assert 'rfq_hit.add_trace(go.Bar(' in app_source
+    assert 'title="Realized RFQ hit ratio by size · all simulated paths"' in app_source
+    assert 'yaxis_title="Won RFQs / total RFQs"' in app_source
+
+
+def test_mc_rfq_validation_uses_all_path_population_aggregates_and_tier_selector():
+    from pathlib import Path
+
+    app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
+    assert 'diagnostic_expander("RFQ Monte Carlo validation", [' in app_source
+    assert 'select("Tier", "mc-rfq-tier-select", [], None)' in app_source
+    assert 'mc.get("rfqTierSizeAggregates", [])' in app_source
+    assert 'mc.get("rfqDeltaAggregates", [])' in app_source
+    assert 'mc.get("rfqInventoryAggregates", [])' in app_source
+    assert 'requests_by_size.get(float(z), 0) / exposure' in app_source
+    assert 'int(row.get("admissibleRequests", 0))' in app_source
+    assert 'title=f"Implied hit ratios by inventory · {tier_name}"' in app_source
+
+
+def test_mc_progress_bar_uses_string_html_attributes():
+    """Dash html.Progress validates value/max as strings in the deployed UI version."""
+    from pathlib import Path
+
+    app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
+    assert 'html.Progress(id="mc-progress-bar", value="0", max="100"' in app_source
+    assert 'str(percent), "Monte Carlo failed"' in app_source
+    assert 'str(percent), message' in app_source
+    assert '"100", "Monte Carlo complete"' in app_source
+
+
+def test_mc_completed_job_is_retained_for_late_progress_polls():
+    """Late dcc.Interval polls must not invalidate an already-completed MC result."""
+    from pathlib import Path
+
+    app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
+    assert '_MC_JOB_RETENTION_SECONDS = 300.0' in app_source
+    assert '_prune_finished_mc_jobs_locked()' in app_source
+    assert 'finishedAt=time.time()' in app_source
+    assert '_MC_JOBS.pop(str(job_id), None)' not in app_source
+    assert 'Returning the same completed payload is intentionally idempotent.' in app_source
+
+
+def test_native_rfq_sampling_is_independent_of_pricing_knots():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    simulation = (root / "cpp/src/simulation.cpp").read_text()
+    core = (root / "cpp/src/core.cpp").read_text()
+    bindings = (root / "cpp/src/python_bindings.cpp").read_text()
+    assert 'source.target_sizes().at(size_idx)' in simulation
+    assert 'policy_delta_for_size(policy, rfq_side, rfq_size, q)' in simulation
+    assert 'linear interpolation of delta is exactly linear interpolation of price' in simulation
+    assert 'build_rfq_size_support' in core
+    assert 'optional_number(tier, "rfqSizeStep", 1.0)' in bindings

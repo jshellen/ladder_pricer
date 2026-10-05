@@ -55,18 +55,21 @@ def build_config(values: Mapping[str, Any]) -> dict[str, Any]:
     tiers: list[dict[str, Any]] = []
     for i in range(3):
         p = f"t{i}"
+        sizes = parse_numbers(values.get(f"{p}-sizes", ""))
+        flow = {
+            "A0": _number(values, f"{p}-A0"),
+            "theta": _number(values, f"{p}-theta"),
+            "beta": _number(values, f"{p}-beta"),
+            "steepness": _number(values, f"{p}-steep"),
+            "shift": _number(values, f"{p}-shift"),
+            "volumeShift": _number(values, f"{p}-vshift"),
+        }
         tiers.append({
             "enabled": checked(values.get(f"{p}-enabled")),
             "name": str(values.get(f"{p}-name", f"Tier {i + 1}")),
-            "sizes": parse_numbers(values.get(f"{p}-sizes", "")),
-            "flow": {
-                "A0": _number(values, f"{p}-A0"),
-                "theta": _number(values, f"{p}-theta"),
-                "beta": _number(values, f"{p}-beta"),
-                "steepness": _number(values, f"{p}-steep"),
-                "shift": _number(values, f"{p}-shift"),
-                "volumeShift": _number(values, f"{p}-vshift"),
-            },
+            "sizes": sizes,
+            "rfqSizeStep": _number(values, f"{p}-rfq-size-step") if values.get(f"{p}-rfq-size-step") is not None else 1.0,
+            "flow": flow,
             "markout": {
                 "impactScalePips": _number(values, f"{p}-impact"),
                 "sizeExponent": _number(values, f"{p}-impact-beta"),
@@ -99,6 +102,7 @@ def build_config(values: Mapping[str, Any]) -> dict[str, Any]:
             "A": _number(values, "ecn-A") if values.get("ecn-A") is not None else ecn_default["flow"]["A"],
             "k": _number(values, "ecn-k") if values.get("ecn-k") is not None else ecn_default["flow"]["k"],
         },
+        "meanTradeSize": _number(values, "ecn-mean-size") if values.get("ecn-mean-size") is not None else ecn_default["meanTradeSize"],
         "quoteSize": _number(values, "ecn-size") if values.get("ecn-size") is not None else ecn_default["quoteSize"],
         "makerFeePips": _number(values, "ecn-fee") if values.get("ecn-fee") is not None else ecn_default["makerFeePips"],
     }

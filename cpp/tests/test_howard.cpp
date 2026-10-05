@@ -44,8 +44,8 @@ int main() {
         const double target_spread = 20.0;
         const double source_spread = 25.0;
         const double alpha = target_spread / (cross_mid * source_spread);
-        ECNFlowSource direct("EURSEK", ExponentialFlow(0.15, 2.4), 1.0, 1.0);
-        ECNFlowSource crossed("USDSEK", ExponentialFlow(0.20, 3.0), alpha, cross_mid);
+        ECNFlowSource direct("EURSEK", ExponentialFlow(0.15, 2.4), 1.0, 1.0, 0.80);
+        ECNFlowSource crossed("USDSEK", ExponentialFlow(0.20, 3.0), alpha, cross_mid, 1.80);
         assert(std::abs(crossed.implied_delta(0.30) -
                         (0.5 + alpha * (0.30 - 0.5))) < 1e-15);
         assert(std::abs(crossed.target_reach(alpha * 0.25) - 0.25) < 1e-15);
@@ -53,6 +53,24 @@ int main() {
         const double expected = direct.arrival_rate(0.30) + crossed.arrival_rate(0.30);
         assert(std::abs(combined.arrival_rate(0.30) - expected) < 1e-15);
         assert(crossed.arrival_rate(0.30) > 0.0);
+
+        // Trade sizes are exponential in source-base millions and map back to
+        // target-base inventory before being capped by our posted target size.
+        assert(std::abs(direct.mean_target_trade_size() - 0.80) < 1e-15);
+        assert(std::abs(crossed.mean_target_trade_size() - 1.50) < 1e-15);
+        const double posted = 1.0;
+        assert(std::abs(direct.full_fill_probability(posted) - std::exp(-posted / 0.80)) < 1e-15);
+        assert(std::abs(direct.expected_fill_size(posted) - 0.80 * (1.0 - std::exp(-posted / 0.80))) < 1e-15);
+        const auto components = direct.fill_components(posted, {0.25, 0.50, 0.75});
+        double probability = 0.0;
+        double expected_fill = 0.0;
+        for (const auto& [fill, p] : components) {
+            assert(fill > 0.0 && fill <= posted + 1e-15);
+            probability += p;
+            expected_fill += p * fill;
+        }
+        assert(std::abs(probability - 1.0) < 1e-12);
+        assert(std::abs(expected_fill - direct.expected_fill_size(posted)) < 1e-12);
     }
     {
         std::vector<double> deltas;
@@ -130,15 +148,42 @@ int main() {
         const double delta_scale = target_spread / (cross_mid * source_spread);
         FlowSource eur("EURSEK", eur_flow, 1.0, 1.0);
         FlowSource usd("USDSEK", usd_flow, delta_scale, cross_mid);
+        const std::vector<double> rfq_sizes{1.0, 2.0, 3.0, 5.0};
+        eur.configure_target_sizes(rfq_sizes);
+        usd.configure_target_sizes(rfq_sizes);
         assert(std::abs(usd.implied_delta(0.30) -
                         (0.5 + delta_scale * (0.30 - 0.5))) < 1e-15);
         assert(std::abs(usd.source_size(2.0) - 2.4) < 1e-15);
         AggregatedFlow combined(std::vector<FlowSource>{eur, usd});
+        // The calibrated exogenous intensity curve lambda_side(z)=A0*shape(z)
+        // defines both the HJB pricing-knot intensities and, after normalization
+        // on the separately configured customer RFQ support, the Monte Carlo
+        // size distribution.  The MC source clock pools both sides.
+        double eur_rfq_total = 0.0;
+        double usd_rfq_total = 0.0;
+        for (double z : rfq_sizes) {
+            eur_rfq_total += eur.rfq_arrival_rate(z);
+            usd_rfq_total += usd.rfq_arrival_rate(z);
+        }
+        assert(std::abs(2.0 * eur_rfq_total - eur.total_rfq_rate()) < 1e-14);
+        assert(std::abs(2.0 * usd_rfq_total - usd.total_rfq_rate()) < 1e-14);
         const double expected = eur.arrival_rate(0.30, 2.0) + usd.arrival_rate(0.30, 2.0);
         assert(std::abs(combined.arrival_rate(0.30, 2.0) - expected) < 1e-15);
         const double rfq = eur.rfq_arrival_rate(2.0) + usd.rfq_arrival_rate(2.0);
         assert(std::abs(combined.rfq_arrival_rate(2.0) - rfq) < 1e-15);
         assert(std::abs(combined.win_probability(0.30, 2.0) - expected / rfq) < 1e-15);
+
+        // The RFQ-size PMF is not a second calibration input: it is exactly the
+        // normalized exogenous arrival-intensity curve on the configured RFQ support.
+        double curve_mass = 0.0;
+        for (double z : rfq_sizes) curve_mass += eur_flow.rfq_arrival_rate(z);
+        for (std::size_t j = 0; j < rfq_sizes.size(); ++j) {
+            const double expected_probability = eur_flow.rfq_arrival_rate(rfq_sizes[j]) / curve_mass;
+            assert(std::abs(eur.size_probabilities()[j] - expected_probability) < 1e-15);
+            assert(std::abs(eur.rfq_arrival_rate(rfq_sizes[j])
+                            - eur_flow.rfq_arrival_rate(rfq_sizes[j])) < 1e-15);
+        }
+
         const double d = combined.optimal_delta(2.0, 0.002, 0.0, -10.0, 100.0);
         assert(std::isfinite(d));
         assert(d >= -10.0 && d <= 100.0);

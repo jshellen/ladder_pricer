@@ -17,6 +17,19 @@ const std::vector<double>& row(const LadderPolicy& p, Side side, std::size_t i) 
     return side == Side::Bid ? p.bid[i] : p.ask[i];
 }
 
+double interpolate_size_row(const std::vector<double>& sizes,
+                            const std::vector<double>& values, double z) {
+    if (sizes.size() != values.size() || sizes.empty())
+        throw std::invalid_argument("pricing-size row has inconsistent dimensions");
+    if (z <= sizes.front() + kTol) return values.front();
+    if (z >= sizes.back() - kTol) return values.back();
+    auto upper = std::upper_bound(sizes.begin(), sizes.end(), z);
+    const auto right = static_cast<std::size_t>(std::distance(sizes.begin(), upper));
+    const auto left = right - 1;
+    const double w = (z - sizes[left]) / (sizes[right] - sizes[left]);
+    return (1.0 - w) * values[left] + w * values[right];
+}
+
 struct Weights { std::size_t left, right; double wl, wr; };
 Weights weights(const std::vector<double>& grid, double q) {
     if (q <= grid.front() + kTol) return {0,0,1,0};
@@ -66,6 +79,26 @@ std::vector<std::pair<Exponent,double>> shifted_expansion(const Exponent& expone
 }
 
 struct MomentEvent { double target_q; double rate; std::vector<double> shift; };
+
+std::vector<double> fill_breakpoints(const std::vector<double>& grid, std::size_t i,
+                                     double dir, double posted_size) {
+    std::vector<double> out;
+    const double q = grid[i];
+    if (dir > 0.0) {
+        for (std::size_t j = i + 1; j < grid.size(); ++j) {
+            const double x = grid[j] - q;
+            if (x >= posted_size - kTol) break;
+            if (x > kTol) out.push_back(x);
+        }
+    } else {
+        for (std::size_t j = i; j-- > 0;) {
+            const double x = q - grid[j];
+            if (x >= posted_size - kTol) break;
+            if (x > kTol) out.push_back(x);
+        }
+    }
+    return out;
+}
 
 }  // namespace
 
@@ -133,13 +166,13 @@ PnlStatistics PnlAnalytics::statistics(double horizon, double sigma, double q0) 
             const auto& policy=solution_.solve_tier_policies[k];
             for(Side side:{Side::Bid,Side::Ask}){
                 const double dir=direction(side); const auto& deltas=row(policy,side,i);
-                for(std::size_t j=0;j<tier.sizes().size();++j){
-                    const double z=tier.sizes()[j];
+                for(double z:tier.rfq_sizes()){
                     if(!problem_.grid().admissible(q,dir*z)) continue;
-                    const double rate=tier.flow().arrival_rate(deltas[j],z);
+                    const double delta=interpolate_size_row(tier.sizes(),deltas,z);
+                    const double rate=tier.flow().arrival_rate(delta,z);
                     if(rate<=0.0) continue;
                     std::vector<double> shift(nvars,0.0);
-                    shift[static_cast<std::size_t>(pnlvar)]=z*(problem_.spread()*(0.5-deltas[j])-tier.fee());
+                    shift[static_cast<std::size_t>(pnlvar)]=z*(problem_.spread()*(0.5-delta)-tier.fee());
                     if(tier.use_markout()) shift[static_cast<std::size_t>(tau_to_var[tier.markout().tau_minutes()])]=-dir*tier.markout().asymptotic(z);
                     events.push_back({q+dir*z,rate,std::move(shift)});
                 }
@@ -166,11 +199,27 @@ PnlStatistics PnlAnalytics::statistics(double horizon, double sigma, double q0) 
                 const bool active=side==Side::Bid?p.bid_active[i]:p.ask_active[i];
                 const double delta=side==Side::Bid?p.bid_delta[i]:p.ask_delta[i];
                 if(!active) continue;
-                const double rate=venue.flow().arrival_rate(delta); const double dir=direction(side);
-                if(rate<=0.0) continue;
-                std::vector<double> shift(nvars,0.0);
-                shift[static_cast<std::size_t>(pnlvar)]=z*(problem_.spread()*(0.5-delta)-venue.maker_fee());
-                events.push_back({q+dir*z,rate,std::move(shift)});
+                const double dir=direction(side);
+                auto breaks=fill_breakpoints(qgrid,i,dir,z);
+                // PnL variance depends on higher fill-size moments. Add a fine
+                // integration mesh on top of inventory-grid knots so the
+                // continuous exponential size distribution is represented
+                // accurately in the second-moment calculation.
+                constexpr int kSizeMomentSlices=32;
+                for(int m=1;m<kSizeMomentSlices;++m){
+                    breaks.push_back(z*static_cast<double>(m)/kSizeMomentSlices);
+                }
+                for(const auto& source:venue.flow().sources()){
+                    const double hit_rate=source.arrival_rate(delta);
+                    if(hit_rate<=0.0) continue;
+                    for(const auto& [fill,probability]:source.fill_components(z,breaks)){
+                        const double rate=hit_rate*probability;
+                        if(rate<=0.0) continue;
+                        std::vector<double> shift(nvars,0.0);
+                        shift[static_cast<std::size_t>(pnlvar)]=fill*(problem_.spread()*(0.5-delta)-venue.maker_fee());
+                        events.push_back({q+dir*fill,rate,std::move(shift)});
+                    }
+                }
             }
         }
 

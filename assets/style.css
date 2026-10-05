@@ -344,3 +344,38 @@ input[type="checkbox"] { accent-color: var(--accent); }
   -webkit-text-fill-color: #111821 !important;
   opacity: 1 !important;
 }
+
+/* Monte-Carlo progress modal */
+.mc-progress-modal-card {
+  width:min(540px, 94vw);
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:14px;
+  box-shadow:0 24px 80px rgba(0,0,0,.5);
+  padding:18px;
+}
+.mc-progress-body { padding:24px 2px 4px; }
+.mc-progress-message { color:var(--text); font-size:15px; margin-bottom:12px; }
+.mc-progress-bar {
+  display:block;
+  width:100%;
+  height:18px;
+  overflow:hidden;
+  border:0;
+  border-radius:999px;
+  background:#202b38;
+  appearance:none;
+  -webkit-appearance:none;
+}
+.mc-progress-bar::-webkit-progress-bar { background:#202b38; border-radius:999px; }
+.mc-progress-bar::-webkit-progress-value { background:var(--accent); border-radius:999px; }
+.mc-progress-bar::-moz-progress-bar { background:var(--accent); border-radius:999px; }
+.mc-progress-meta {
+  display:flex;
+  justify-content:space-between;
+  gap:16px;
+  margin-top:10px;
+  color:var(--muted);
+  font-size:13px;
+}
+.status.running { color:#d29922; border-color:#6b5522; }

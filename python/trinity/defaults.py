@@ -102,6 +102,11 @@ _DEFAULT_CONFIG = {
             "enabled": True,
             "name": "Tier 1",
             "sizes": [1, 2, 3, 5, 10, 20],
+            "rfqSizeStep": 1.0,
+            # One-sided exogenous RFQ-arrival intensity curve:
+            # lambda_RFQ(z) = A0 * z^(-theta-beta*z).  Monte Carlo evaluates
+            # this curve on the full RFQ-size support (1M steps by default),
+            # independently of the pricing-size knots below.
             "flow": {"A0": 0.0155, "theta": 0.144, "beta": 0.0857, "steepness": 8.42, "shift": 0.52, "volumeShift": 0.026},
             "markout": {"impactScalePips": 1.0, "sizeExponent": 0.5, "tauMinutes": 0.5},
             "useMarkout": True,
@@ -113,6 +118,7 @@ _DEFAULT_CONFIG = {
             "enabled": True,
             "name": "Tier 2",
             "sizes": [1, 2, 3, 5, 10, 20],
+            "rfqSizeStep": 1.0,
             "flow": {"A0": 0.0232, "theta": 0.303, "beta": 0.122, "steepness": 2.86, "shift": 0.48, "volumeShift": 0.020},
             "markout": {"impactScalePips": 1.0, "sizeExponent": 0.5, "tauMinutes": 0.5},
             "useMarkout": True,
@@ -124,6 +130,7 @@ _DEFAULT_CONFIG = {
             "enabled": False,
             "name": "Tier 3",
             "sizes": [1],
+            "rfqSizeStep": 1.0,
             "flow": {"A0": 1.0, "theta": 0.144, "beta": 0.0857, "steepness": 20.0, "shift": 0.52, "volumeShift": 0.026},
             "markout": {"impactScalePips": 4.0, "sizeExponent": 0.5, "tauMinutes": 0.10},
             "useMarkout": True,
@@ -157,6 +164,10 @@ _DEFAULT_CONFIG = {
         # x=0.5-d spread fractions reduces intensity exponentially:
         # lambda(d) = A * exp(-k * (0.5 - d)).
         "flow": {"A": 4.0, "k": 8.4},
+        # Mean parent ECN trade size in millions of the direct source pair's
+        # base currency. Crossed sources configure their own meanTradeSize.
+        # Realized fill = min(parent trade size, posted size).
+        "meanTradeSize": 1.0,
         "quoteSize": 1.0,
         "makerFeePips": 3.0,
     },

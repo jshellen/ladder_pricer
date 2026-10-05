@@ -5,6 +5,7 @@
 #include <map>
 #include <random>
 #include <stdexcept>
+#include <tuple>
 
 namespace ladder_pricer {
 namespace {
@@ -26,6 +27,7 @@ struct Event {
     double fee = 0.0;
     double rate = 0.0;
     std::size_t ecn_source = 0;
+    std::size_t flow_source = 0;
 };
 
 std::size_t bracket_left(const std::vector<double>& grid, double q) {
@@ -37,6 +39,24 @@ std::size_t bracket_left(const std::vector<double>& grid, double q) {
     return right - 1;
 }
 
+std::size_t nearest_index(const std::vector<double>& grid, double q) {
+    if (q <= grid.front() + kTol) return 0;
+    if (q >= grid.back() - kTol) return grid.size() - 1;
+    auto it = std::lower_bound(grid.begin(), grid.end(), q);
+    const std::size_t right = static_cast<std::size_t>(std::distance(grid.begin(), it));
+    if (std::abs(grid[right] - q) <= kTol) return right;
+    const std::size_t left = right - 1;
+    return (q - grid[left] <= grid[right] - q) ? left : right;
+}
+
+struct RfqValidationStats {
+    std::uint64_t wins = 0;
+    std::uint64_t requests = 0;
+    std::uint64_t admissible_requests = 0;
+    double expected_wins = 0.0;
+    double x_sum = 0.0;
+};
+
 double policy_delta(const LadderPolicy& policy, Side side, std::size_t size_idx, double q) {
     const auto& grid = policy.q_grid;
     const auto& mat = side == Side::Bid ? policy.bid : policy.ask;
@@ -45,6 +65,26 @@ double policy_delta(const LadderPolicy& policy, Side side, std::size_t size_idx,
     const std::size_t right = left + 1;
     const double w = (q - grid[left]) / (grid[right] - grid[left]);
     return (1.0 - w) * mat[left][size_idx] + w * mat[right][size_idx];
+}
+
+double policy_delta_for_size(const LadderPolicy& policy, Side side, double size, double q) {
+    const auto& sizes = policy.sizes;
+    if (sizes.empty()) throw std::invalid_argument("ladder policy has no pricing sizes");
+    if (size <= sizes.front() + kTol) return policy_delta(policy, side, 0, q);
+    if (size >= sizes.back() - kTol) return policy_delta(policy, side, sizes.size() - 1, q);
+
+    const auto right_it = std::upper_bound(sizes.begin(), sizes.end(), size);
+    const std::size_t right = static_cast<std::size_t>(right_it - sizes.begin());
+    const std::size_t left = right - 1;
+    const double z0 = sizes[left];
+    const double z1 = sizes[right];
+    const double d0 = policy_delta(policy, side, left, q);
+    const double d1 = policy_delta(policy, side, right, q);
+    const double w = (size - z0) / (z1 - z0);
+
+    // Execution price is affine in delta for a fixed side/reference spot, so
+    // linear interpolation of delta is exactly linear interpolation of price.
+    return (1.0 - w) * d0 + w * d1;
 }
 
 double dark_posted(const DarkPoolPolicy& policy, Side side, double q) {
@@ -60,16 +100,21 @@ std::vector<Event> events(const PricingProblem& problem, const Solution& solutio
     std::vector<Event> out;
     for (std::size_t k = 0; k < problem.tiers().size(); ++k) {
         const auto& tier = problem.tiers()[k];
-        const auto& policy = solution.solve_tier_policies[k];
-        for (Side side : {Side::Bid, Side::Ask}) {
-            for (std::size_t j = 0; j < tier.sizes().size(); ++j) {
-                const double z = tier.sizes()[j];
-                // Customer RFQs arrive exogenously.  Our quote controls only the
-                // conditional win probability; it must not thin the RFQ event clock.
-                const double delta = policy_delta(policy, side, j, q);
-                const double rate = tier.flow().rfq_arrival_rate(z);
-                if (rate > 0.0) out.push_back({false, false, true, false, k, side, z, delta, tier.fee(), rate});
-            }
+        // One exogenous RFQ clock per customer-flow source.  When it rings,
+        // customer direction is sampled 50/50 (the current symmetric-flow
+        // assumption) and requested size is sampled from the source's
+        // size distribution implied by the calibrated exogenous arrival-intensity curve.
+        for (std::size_t s = 0; s < tier.flow().sources().size(); ++s) {
+            const auto& source = tier.flow().sources()[s];
+            const double rate = source.total_rfq_rate();
+            if (rate <= 0.0) continue;
+            Event event;
+            event.tier_rfq = true;
+            event.tier = k;
+            event.fee = tier.fee();
+            event.rate = rate;
+            event.flow_source = s;
+            out.push_back(event);
         }
     }
     if (problem.dark_pool() && solution.solve_dark_pool_policy) {
@@ -107,7 +152,8 @@ std::vector<Event> events(const PricingProblem& problem, const Solution& solutio
             const bool policy_active = side == Side::Bid ? policy.bid_active[i] : policy.ask_active[i];
             const double delta = side == Side::Bid ? policy.bid_delta[i] : policy.ask_delta[i];
             const double dir = direction(side);
-            const bool quote_active = policy_active && problem.grid().admissible(q, dir * z);
+            const bool quote_active = policy_active && venue.risk_reducing(q, side, z) &&
+                                      problem.grid().admissible(q, dir * z);
             if (!record_all_ecn_arrivals && !quote_active) continue;
             const auto& sources = venue.flow().sources();
             for (std::size_t s = 0; s < sources.size(); ++s) {
@@ -162,7 +208,8 @@ double percentile(std::vector<double> values, double p) {
 
 MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigma,
                                            double q0, std::uint64_t seed,
-                                           int retained_paths, int sample_points) const {
+                                           int retained_paths, int sample_points,
+                                           const std::function<void(int, int)>& progress) const {
     if (horizon < 0.0 || paths <= 0 || sigma < 0.0 || sample_points < 2) {
         throw std::invalid_argument("invalid Monte Carlo settings");
     }
@@ -188,6 +235,27 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
         result.sample_times[s] = horizon * static_cast<double>(s) / static_cast<double>(sample_points - 1);
     }
     std::vector<std::vector<double>> inventories(sample_points, std::vector<double>(paths));
+    std::map<std::pair<std::string, std::string>, std::pair<std::uint64_t, double>> fill_aggregates;
+    std::map<double, std::pair<std::uint64_t, std::uint64_t>> rfq_aggregates;  // wins, requests
+    std::map<std::pair<std::string, double>, std::pair<std::uint64_t, std::uint64_t>>
+        rfq_tier_size_aggregates;  // wins, requests
+    // Delta is compacted into 1%-wide buckets.  The plotted x-coordinate is the
+    // mean actual delta in the bucket, so this remains faithful when policy
+    // interpolation produces non-grid quote deltas.
+    constexpr double kDeltaDiagnosticBin = 0.01;
+    std::map<std::tuple<std::string, double, long long>, RfqValidationStats>
+        rfq_delta_aggregates;
+    // Inventory can become continuous through ECN partial fills.  Bucket RFQs to
+    // the nearest HJB inventory state while preserving the mean actual q in each
+    // bucket for the diagnostic x-coordinate.
+    std::map<std::tuple<std::string, std::string, double, std::size_t>, RfqValidationStats>
+        rfq_inventory_aggregates;
+
+    auto record_fill_aggregate = [&](const std::string& tier, Side side, double size) {
+        auto& aggregate = fill_aggregates[{tier, side_name(side)}];
+        ++aggregate.first;
+        aggregate.second += size;
+    };
 
     for (int path_idx = 0; path_idx < paths; ++path_idx) {
         const std::uint64_t path_seed = seed + kPathStride * static_cast<std::uint64_t>(path_idx + 1);
@@ -295,40 +363,81 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
             }
 
             const double before = q;
-            const double dir = direction(chosen->side);
 
             if (chosen->tier_rfq) {
+                const Side rfq_side = uniform(event_rng) < 0.5 ? Side::Bid : Side::Ask;
+                const double dir = direction(rfq_side);
                 const auto& tier = problem_.tiers()[chosen->tier];
-                const bool admissible = problem_.grid().admissible(q, dir * chosen->size);
+                const auto& policy = solution_.solve_tier_policies[chosen->tier];
+                const auto& source = tier.flow().sources().at(chosen->flow_source);
+                const std::size_t size_idx = source.sample_target_size_index(event_rng);
+                const double rfq_size = source.target_sizes().at(size_idx);
+                const double rfq_delta = policy_delta_for_size(policy, rfq_side, rfq_size, q);
+                const bool admissible = problem_.grid().admissible(q, dir * rfq_size);
                 const double p_win = admissible
-                    ? tier.flow().win_probability(chosen->delta, chosen->size)
+                    ? source.win_probability(rfq_delta, rfq_size)
                     : 0.0;
                 const bool won = uniform(event_rng) < p_win;
+
+                auto& rfq_aggregate = rfq_aggregates[rfq_size];
+                ++rfq_aggregate.second;
+                if (won) ++rfq_aggregate.first;
+
+                auto& tier_size_aggregate = rfq_tier_size_aggregates[{tier.name(), rfq_size}];
+                ++tier_size_aggregate.second;
+                if (won) ++tier_size_aggregate.first;
+
+                const long long delta_bucket = static_cast<long long>(
+                    std::llround(rfq_delta / kDeltaDiagnosticBin));
+                auto& delta_aggregate = rfq_delta_aggregates[
+                    {tier.name(), rfq_size, delta_bucket}];
+                ++delta_aggregate.requests;
+                if (admissible) ++delta_aggregate.admissible_requests;
+                if (won) ++delta_aggregate.wins;
+                delta_aggregate.expected_wins += p_win;
+                delta_aggregate.x_sum += rfq_delta;
+
+                const std::size_t inventory_bucket = nearest_index(policy.q_grid, q);
+                auto& inventory_aggregate = rfq_inventory_aggregates[
+                    {tier.name(), side_name(rfq_side), rfq_size, inventory_bucket}];
+                ++inventory_aggregate.requests;
+                if (won) ++inventory_aggregate.wins;
+                inventory_aggregate.expected_wins += p_win;
+                inventory_aggregate.x_sum += q;
+
+                if (retain) {
+                    detailed.rfq_events.push_back({
+                        t, tier.name(), side_name(rfq_side), rfq_size,
+                        rfq_delta, p_win, won
+                    });
+                }
 
                 double execution = spot;
                 if (won) {
                     // Inventory/cash are updated first for a won RFQ.  The markout
                     // shock below is then applied to the post-trade inventory state.
-                    execution = chosen->side == Side::Bid
-                        ? spot - problem_.spread() * (0.5 - chosen->delta)
-                        : spot + problem_.spread() * (0.5 - chosen->delta);
-                    if (chosen->side == Side::Bid) cash -= chosen->size * execution;
-                    else cash += chosen->size * execution;
-                    cash -= chosen->fee * chosen->size;
-                    q += dir * chosen->size;
+                    execution = rfq_side == Side::Bid
+                        ? spot - problem_.spread() * (0.5 - rfq_delta)
+                        : spot + problem_.spread() * (0.5 - rfq_delta);
+                    if (rfq_side == Side::Bid) cash -= rfq_size * execution;
+                    else cash += rfq_size * execution;
+                    cash -= chosen->fee * rfq_size;
+                    q += dir * rfq_size;
                     ++trades;
+                    record_fill_aggregate(tier.name(), rfq_side, rfq_size);
                 }
 
                 // An RFQ is an information event whether or not we win it.
                 if (tier.use_markout()) {
-                    impacts[tier.markout().tau_minutes()] += -dir * tier.markout().asymptotic(chosen->size);
+                    impacts[tier.markout().tau_minutes()] += -dir * tier.markout().asymptotic(rfq_size);
                 }
 
                 if (retain && won) {
-                    detailed.fills.push_back({t, tier.name(), side_name(chosen->side),
-                                              chosen->size, execution, before, q});
+                    detailed.fills.push_back({t, tier.name(), side_name(rfq_side),
+                                              rfq_size, execution, before, q});
                 }
             } else {
+                const double dir = direction(chosen->side);
                 double execution = spot;
                 double executed_size = chosen->size;
 
@@ -359,7 +468,9 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                     // wins exactly when source_reach >= alpha*(0.5-d_target).
                     const auto& source = venue.flow().sources().at(chosen->ecn_source);
                     std::exponential_distribution<double> reach_distribution(source.flow().k());
+                    std::exponential_distribution<double> size_distribution(1.0 / source.mean_trade_size());
                     const double source_reach = reach_distribution(event_rng);
+                    const double source_trade_size = size_distribution(event_rng);
                     const double target_trade_reach = source.target_reach(source_reach);
                     const double target_quote_reach = 0.5 - chosen->delta;
                     const double signed_distance = problem_.spread() * target_trade_reach;
@@ -370,11 +481,15 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                         : spot + signed_distance;
                     const bool won = chosen->ecn_quote_active &&
                         source_reach + 1e-12 >= source.delta_scale() * target_quote_reach;
+                    const double source_posted_size = chosen->size * source.source_size_per_target();
+                    const double target_fill_size =
+                        std::min(source_trade_size, source_posted_size) / source.source_size_per_target();
 
                     if (retain) {
                         detailed.ecn_arrivals.push_back({
                             t, source.name(), side_name(chosen->side), spot,
                             trade_distance_pips, trade_price, quote_depth_pips,
+                            source_trade_size, won ? target_fill_size : 0.0,
                             chosen->ecn_quote_active, won
                         });
                     }
@@ -387,6 +502,11 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                             detailed.cashes.push_back(cash);
                         }
                         continue;
+                    }
+
+                    executed_size = target_fill_size;
+                    if (!venue.risk_reducing(q, chosen->side, executed_size)) {
+                        throw std::runtime_error("sampled ECN fill is not risk reducing");
                     }
 
                     // We execute passively at our quote, not at the aggressor's limit.
@@ -406,12 +526,14 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                 q += dir * executed_size;
                 ++trades;
 
+                std::string venue_name = chosen->dark ? "Dark pool" : "Passive ECN";
+                if (chosen->ecn) {
+                    const auto& source = problem_.passive_ecn()->flow().sources().at(chosen->ecn_source);
+                    venue_name += " · " + source.name();
+                }
+                record_fill_aggregate(venue_name, chosen->side, executed_size);
+
                 if (retain) {
-                    std::string venue_name = chosen->dark ? "Dark pool" : "Passive ECN";
-                    if (chosen->ecn) {
-                        const auto& source = problem_.passive_ecn()->flow().sources().at(chosen->ecn_source);
-                        venue_name += " · " + source.name();
-                    }
                     detailed.fills.push_back({t, venue_name, side_name(chosen->side),
                                               executed_size, execution, before, q});
                 }
@@ -440,6 +562,17 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
         result.final_spot[path_idx] = spot;
         result.trade_count[path_idx] = trades;
         if (retain) result.sample_paths.push_back(std::move(detailed));
+
+        // Report genuine completed-path progress at most about 100 times per run.
+        // The callback is optional, so native analytics/tests pay essentially no
+        // cost when the UI does not request progress updates.
+        if (progress) {
+            const int completed = path_idx + 1;
+            const int report_every = std::max(1, paths / 100);
+            if (completed == paths || completed % report_every == 0) {
+                progress(completed, paths);
+            }
+        }
     }
 
     result.inventory_lower.resize(sample_points);
@@ -449,6 +582,68 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
         result.inventory_lower[s] = percentile(inventories[s], 0.025);
         result.inventory_median[s] = percentile(inventories[s], 0.50);
         result.inventory_upper[s] = percentile(inventories[s], 0.975);
+    }
+
+    // Emit fill summaries in stable business order rather than stochastic
+    // first-hit order: customer tiers, dark pool, then each ECN source.
+    auto append_fill_summary = [&](const std::string& tier_name, const std::string& side) {
+        const auto it = fill_aggregates.find({tier_name, side});
+        const std::uint64_t count = it == fill_aggregates.end() ? 0 : it->second.first;
+        const double volume = it == fill_aggregates.end() ? 0.0 : it->second.second;
+        result.fill_aggregates.push_back({tier_name, side, count, volume});
+    };
+    for (const auto& tier : problem_.tiers()) {
+        append_fill_summary(tier.name(), "bid");
+        append_fill_summary(tier.name(), "ask");
+    }
+    if (problem_.dark_pool()) {
+        append_fill_summary("Dark pool", "bid");
+        append_fill_summary("Dark pool", "ask");
+    }
+    if (problem_.passive_ecn()) {
+        for (const auto& source : problem_.passive_ecn()->flow().sources()) {
+            const std::string name = "Passive ECN · " + source.name();
+            append_fill_summary(name, "bid");
+            append_fill_summary(name, "ask");
+        }
+    }
+
+    result.rfq_aggregates.reserve(rfq_aggregates.size());
+    for (const auto& [size, aggregate] : rfq_aggregates) {
+        result.rfq_aggregates.push_back({size, aggregate.first, aggregate.second});
+    }
+
+    result.rfq_tier_size_aggregates.reserve(rfq_tier_size_aggregates.size());
+    for (const auto& [key, aggregate] : rfq_tier_size_aggregates) {
+        const auto& [tier_name, size] = key;
+        result.rfq_tier_size_aggregates.push_back(
+            {tier_name, size, aggregate.first, aggregate.second});
+    }
+
+    result.rfq_delta_aggregates.reserve(rfq_delta_aggregates.size());
+    for (const auto& [key, aggregate] : rfq_delta_aggregates) {
+        const auto& [tier_name, size, bucket] = key;
+        (void)bucket;
+        const double mean_delta = aggregate.requests > 0
+            ? aggregate.x_sum / static_cast<double>(aggregate.requests)
+            : 0.0;
+        result.rfq_delta_aggregates.push_back({
+            tier_name, size, mean_delta, aggregate.wins, aggregate.requests,
+            aggregate.admissible_requests, aggregate.expected_wins,
+        });
+    }
+
+    result.rfq_inventory_aggregates.reserve(rfq_inventory_aggregates.size());
+    for (const auto& [key, aggregate] : rfq_inventory_aggregates) {
+        const auto& [tier_name, side, size, bucket] = key;
+        (void)bucket;
+        const double mean_inventory = aggregate.requests > 0
+            ? aggregate.x_sum / static_cast<double>(aggregate.requests)
+            : 0.0;
+        result.rfq_inventory_aggregates.push_back({
+            tier_name, side, size, mean_inventory, aggregate.wins,
+            aggregate.requests, aggregate.expected_wins,
+        });
     }
     return result;
 }

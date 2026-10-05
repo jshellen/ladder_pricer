@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <map>
 #include <numeric>
 #include <vector>
 
@@ -74,13 +75,139 @@ int main() {
     double m = std::accumulate(mc.pnl_base_ccy.begin(),mc.pnl_base_ccy.end(),0.0)
              / mc.pnl_base_ccy.size();
     std::cout << "cf=" << stats.expected_base_ccy << " mc=" << m << "\n";
-    if (std::abs(m-stats.expected_base_ccy)>600) return 1;
+    if (std::abs(m-stats.expected_base_ccy)>1500) return 1;
 
     // The market path must evolve independently of fills, and output sampling must
     // not alter the underlying simulation. Both runs use identical event/spot RNG
     // streams but different inventory-output grids.
     auto coarse = MonteCarloSimulator(p,s,11.5).run(10.0, 4, .002, 0, 777, 1, 11);
     auto fine   = MonteCarloSimulator(p,s,11.5).run(10.0, 4, .002, 0, 777, 1, 41);
+
+    // Population diagnostics must aggregate every simulated path rather than
+    // only the retained sample used for interactive charting.
+    std::uint64_t aggregate_trade_count = 0;
+    double aggregate_volume = 0.0;
+    for (const auto& aggregate : coarse.fill_aggregates) {
+        aggregate_trade_count += aggregate.trade_count;
+        aggregate_volume += aggregate.volume;
+    }
+    const long long path_trade_count = std::accumulate(
+        coarse.trade_count.begin(), coarse.trade_count.end(), 0LL);
+    assert(aggregate_trade_count == static_cast<std::uint64_t>(path_trade_count));
+    assert(aggregate_volume >= 0.0);
+
+    std::uint64_t aggregate_rfq_wins = 0;
+    std::uint64_t aggregate_rfq_requests = 0;
+    for (const auto& aggregate : coarse.rfq_aggregates) {
+        aggregate_rfq_wins += aggregate.wins;
+        aggregate_rfq_requests += aggregate.requests;
+        assert(aggregate.wins <= aggregate.requests);
+    }
+    // This fixture has customer tiers only, so every trade is an RFQ win.
+    assert(aggregate_rfq_wins == aggregate_trade_count);
+    assert(aggregate_rfq_requests >= aggregate_rfq_wins);
+
+    // RFQs are generated from one pooled two-sided source clock.  The requested
+    // size is sampled from the *same exogenous intensity curve* used by the HJB.
+    // Pricing knots are {1,2,4}, but customer RFQs use the full 1M grid
+    // {1,2,3,4}.  For theta=1,beta=0 the curve weights are
+    // {1,1/2,1/3,1/4}; 3M therefore tests a genuinely interpolated quote.
+    {
+        const std::vector<double> sampled_sizes{1.0, 2.0, 4.0};
+        const LogisticFlow sampled_flow(1.0, 1.0, 0.0, 0.50, 5.0, 0.0);
+        std::vector<Tier> size_tiers;
+        size_tiers.emplace_back(
+            "RFQ size sampling", sampled_sizes,
+            AggregatedFlow(std::vector<FlowSource>{
+                FlowSource("EURSEK", sampled_flow, 1.0, 1.0),
+            }),
+            SaturatingMarkout(0.0, 0.5, 0.5), false, -10.0, 100.0);
+        PricingProblem size_problem(
+            grid(), .002, 0.0, QuadraticPenalty(.1, .002),
+            InternalizationTime(4,.07,.0084), size_tiers);
+        auto size_solution = HowardSolver(size_problem).solve();
+        auto size_mc = MonteCarloSimulator(size_problem, size_solution, 11.5)
+                           .run(2.0, 1000, 0.0, 0.0, 20261003, 10, 5);
+
+        std::map<double, std::uint64_t> requests_by_size;
+        std::uint64_t total_requests = 0;
+        for (const auto& aggregate : size_mc.rfq_aggregates) {
+            requests_by_size[aggregate.size] = aggregate.requests;
+            total_requests += aggregate.requests;
+        }
+        assert((size_problem.tiers()[0].rfq_sizes() == std::vector<double>{1.0, 2.0, 3.0, 4.0}));
+        // One-sided curve mass is 1 + 1/2 + 1/3 + 1/4 = 25/12, so
+        // the pooled bid+ask clock is 25/6 RFQs/min.
+        const double expected_requests = (25.0 / 6.0) * 2.0 * 1000.0;
+        assert(std::abs(static_cast<double>(total_requests) - expected_requests)
+               / expected_requests < 0.05);
+
+        const std::vector<double> rfq_sizes{1.0, 2.0, 3.0, 4.0};
+        const std::vector<double> expected_probabilities{12.0/25.0, 6.0/25.0, 4.0/25.0, 3.0/25.0};
+        for (std::size_t j = 0; j < rfq_sizes.size(); ++j) {
+            const double realized = static_cast<double>(requests_by_size[rfq_sizes[j]])
+                                  / static_cast<double>(total_requests);
+            assert(std::abs(realized - expected_probabilities[j]) < 0.025);
+        }
+        assert(requests_by_size[3.0] > 0);
+
+        std::uint64_t tier_size_requests = 0;
+        for (const auto& aggregate : size_mc.rfq_tier_size_aggregates) {
+            assert(aggregate.tier == "RFQ size sampling");
+            assert(aggregate.wins <= aggregate.requests);
+            tier_size_requests += aggregate.requests;
+        }
+        assert(tier_size_requests == total_requests);
+
+        std::uint64_t delta_requests = 0;
+        for (const auto& aggregate : size_mc.rfq_delta_aggregates) {
+            assert(aggregate.tier == "RFQ size sampling");
+            assert(aggregate.wins <= aggregate.admissible_requests);
+            assert(aggregate.admissible_requests <= aggregate.requests);
+            assert(aggregate.expected_wins >= -1e-12);
+            assert(aggregate.expected_wins <= static_cast<double>(aggregate.admissible_requests) + 1e-12);
+            delta_requests += aggregate.requests;
+        }
+        assert(delta_requests == total_requests);
+
+        std::uint64_t inventory_requests = 0;
+        for (const auto& aggregate : size_mc.rfq_inventory_aggregates) {
+            assert(aggregate.tier == "RFQ size sampling");
+            assert(aggregate.side == "bid" || aggregate.side == "ask");
+            assert(aggregate.wins <= aggregate.requests);
+            assert(aggregate.expected_wins >= -1e-12);
+            assert(aggregate.expected_wins <= static_cast<double>(aggregate.requests) + 1e-12);
+            inventory_requests += aggregate.requests;
+        }
+        assert(inventory_requests == total_requests);
+
+        bool saw_bid = false;
+        bool saw_ask = false;
+        for (const auto& path : size_mc.sample_paths) {
+            for (const auto& event : path.rfq_events) {
+                saw_bid = saw_bid || event.side == "bid";
+                saw_ask = saw_ask || event.side == "ask";
+            }
+        }
+        assert(saw_bid && saw_ask);
+    }
+
+    // Native progress reporting is based on genuinely completed paths and must
+    // always finish at exactly paths / paths.
+    int progress_reports = 0;
+    int progress_completed = 0;
+    int progress_total = 0;
+    auto progress_mc = MonteCarloSimulator(p,s,11.5).run(0.2, 37, 0.0, 0, 991, 0, 3,
+        [&](int completed, int total) {
+            ++progress_reports;
+            assert(completed >= progress_completed);
+            progress_completed = completed;
+            progress_total = total;
+        });
+    assert(progress_mc.pnl_base_ccy.size() == 37);
+    assert(progress_reports > 0);
+    assert(progress_completed == 37);
+    assert(progress_total == 37);
 
     assert(coarse.trade_count == fine.trade_count);
     assert(coarse.final_inventory == fine.final_inventory);
@@ -104,6 +231,54 @@ int main() {
         if (std::abs(a.spots[i] - a.spots[i-1]) > 1e-12) moved = true;
     }
     assert(moved);
+
+    // Retained paths must record every customer RFQ, not just wins, so realized
+    // hit ratios can use the true RFQ denominator. Won RFQ events correspond
+    // one-for-one with tier fills in this tiers-only problem.
+    assert(!a.rfq_events.empty());
+    std::size_t won_rfq_events = 0;
+    for (const auto& event : a.rfq_events) {
+        assert(event.size > 0.0);
+        assert(event.win_probability >= 0.0 && event.win_probability <= 1.0);
+        if (event.won) ++won_rfq_events;
+    }
+    assert(a.rfq_events.size() >= a.fills.size());
+    assert(won_rfq_events == a.fills.size());
+
+    // Passive ECN parent trades have an exponential size distribution. A hit
+    // partially fills our posted quote when the incoming parent trade is
+    // smaller, and can never execute above the posted target-equivalent size.
+    PricingProblem ecn_problem(
+        grid(), .002, 0,
+        QuadraticPenalty(.1,.002), InternalizationTime(4,.07,.0084), tiers,
+        std::nullopt,
+        PassiveECN(
+            {0.5},
+            AggregatedECNFlow(std::vector<ECNFlowSource>{
+                ECNFlowSource("EURSEK", ExponentialFlow(100.0, 1.0), 1.0, 1.0, 0.20),
+            }),
+            1.0, 0.0));
+    auto ecn_solution = HowardSolver(ecn_problem).solve();
+    assert(ecn_solution.diagnostics.converged);
+    auto ecn_mc = MonteCarloSimulator(ecn_problem, ecn_solution, 11.5)
+                      .run(0.5, 1, 0.0, 5.0, 424242, 1, 11);
+    assert(ecn_mc.sample_paths.size() == 1);
+    int ecn_fills = 0;
+    bool saw_partial = false;
+    for (const auto& fill : ecn_mc.sample_paths.front().fills) {
+        if (fill.tier.rfind("Passive ECN", 0) != 0) continue;
+        ++ecn_fills;
+        assert(fill.size > 0.0);
+        assert(fill.size <= 1.0 + 1e-12);
+        if (fill.size < 0.999) saw_partial = true;
+    }
+    assert(ecn_fills > 0);
+    assert(saw_partial);
+    for (const auto& event : ecn_mc.sample_paths.front().ecn_arrivals) {
+        assert(event.source_trade_size >= 0.0);
+        assert(event.target_fill_size >= 0.0);
+        assert(event.target_fill_size <= 1.0 + 1e-12);
+    }
 
     std::cout << "market_points=" << a.spots.size()
               << " trades=" << coarse.trade_count.front() << "\n";

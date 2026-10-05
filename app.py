@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import math
+import threading
+import time
+import uuid
 from datetime import datetime, timedelta
 from copy import deepcopy
 from typing import Any
@@ -116,6 +119,7 @@ PLOT_ACCENT = "#58a6ff"
 BID_COLOR = "#58a6ff"
 ASK_COLOR = "#ff5c5c"
 SIZE_DASHES = ["solid", "dot", "dash", "longdash", "dashdot", "longdashdot"]
+SIZE_COLORS = ["#58a6ff", "#f0883e", "#3fb950", "#d2a8ff", "#f778ba", "#a5d6ff", "#e3b341", "#7ee787"]
 
 _trinity_dark = go.layout.Template(pio.templates["plotly_dark"])
 _trinity_dark.layout.update(
@@ -156,6 +160,37 @@ pio.templates.default = "trinity_dark"
 
 app = Dash(__name__, title=APP_TITLE, suppress_callback_exceptions=True)
 server = app.server
+
+
+# Monte-Carlo jobs run in a worker thread so the Dash request that starts a
+# large simulation returns immediately.  The native simulator releases the GIL
+# and reports completed-path progress back through a sparse callback, while a
+# lightweight dcc.Interval polls this in-process registry for the modal UI.
+# This keeps the existing in-process Engine cache (and its solved policy) rather
+# than re-solving the model in a separate background process.
+_MC_JOBS: dict[str, dict[str, Any]] = {}
+_MC_JOBS_LOCK = threading.RLock()
+_MC_JOB_RETENTION_SECONDS = 300.0
+
+
+def _prune_finished_mc_jobs_locked(now: float | None = None) -> None:
+    """Drop only old completed jobs.
+
+    Completed/error jobs deliberately remain in the registry for a short grace
+    period.  dcc.Interval can have another poll request already in flight when
+    the first completion response is being serialized.  Keeping the result
+    makes those late polls idempotent instead of turning them into a spurious
+    "state unavailable" error.
+    """
+    now = time.time() if now is None else float(now)
+    stale = [
+        job_id
+        for job_id, job in _MC_JOBS.items()
+        if str(job.get("state")) in {"done", "error"}
+        and now - float(job.get("finishedAt", now)) > _MC_JOB_RETENTION_SECONDS
+    ]
+    for job_id in stale:
+        _MC_JOBS.pop(job_id, None)
 
 
 def number_input(label: str, component_id: str, value: float, step: float | str = "any"):
@@ -252,15 +287,17 @@ def _default_cross_ecn_flow_source(index: int = 0, target_pair: str | None = Non
         "crossPair": None,
         "mapping": {"type": "crossed", "crossMid": None, "sourceSpreadPips": 20.0},
         "flow": {"A": 0.10, "k": 8.4},
+        "meanTradeSize": 1.0,
     }
 
 
-def _direct_ecn_flow_source(flow: dict[str, Any], target_pair: str) -> dict[str, Any]:
+def _direct_ecn_flow_source(flow: dict[str, Any], target_pair: str, mean_trade_size: float = 1.0) -> dict[str, Any]:
     return {
         "name": str(target_pair),
         "pair": str(target_pair),
         "mapping": {"type": "identity"},
         "flow": deepcopy(flow),
+        "meanTradeSize": float(mean_trade_size),
     }
 
 
@@ -329,10 +366,14 @@ def flow_source_settings_editor(source_key: str, source: dict[str, Any], target_
     return html.Div([
         header,
         *source_fields,
+        html.Div(
+            "The exogenous RFQ-arrival curve λ(z)=A0·z^(-θ-βz) defines both the size-specific arrival intensities and the RFQ-size distribution. Monte Carlo samples from the full RFQ-size grid between the smallest and largest pricing knots; prices between knots are linearly interpolated.",
+            className="muted-note modal-note",
+        ),
         html.Div([
-            number_input("A0 / min", "flow-edit-A0", float(flow.get("A0", 0.01)), "any"),
-            number_input("Theta", "flow-edit-theta", float(flow.get("theta", 0.144)), "any"),
-            number_input("Beta", "flow-edit-beta", float(flow.get("beta", 0.0857)), "any"),
+            number_input("A0 · exogenous intensity scale", "flow-edit-A0", float(flow.get("A0", 0.01)), "any"),
+            number_input("Size θ", "flow-edit-theta", float(flow.get("theta", 0.144)), "any"),
+            number_input("Size β", "flow-edit-beta", float(flow.get("beta", 0.0857)), "any"),
             number_input("Steepness", "flow-edit-steep", float(flow.get("steepness", 8.42)), "any"),
             number_input("Shift", "flow-edit-shift", float(flow.get("shift", 0.52)), "any"),
             number_input("Volume shift", "flow-edit-vshift", float(flow.get("volumeShift", 0.026)), "any"),
@@ -404,6 +445,7 @@ def ecn_flow_source_settings_editor(source_key: str, source: dict[str, Any], tar
         html.Div([
             number_input("A at mid / side [trades/min]", "ecn-flow-edit-A", float(flow.get("A", 0.10)), "any"),
             number_input("k", "ecn-flow-edit-k", float(flow.get("k", 8.4)), "any"),
+            number_input("Mean trade size [source CCY M]", "ecn-flow-edit-mean-size", float(source.get("meanTradeSize", 1.0)), "any"),
         ], className="grid-2 flow-calibration-grid"),
     ], className="flow-source-settings")
 
@@ -413,14 +455,15 @@ def tier_panel(index: int, tier: dict[str, Any], open_: bool = False):
     return panel(tier["name"], [
         checkbox("Enabled", f"{p}-enabled", tier["enabled"]),
         text_input("Name", f"{p}-name", tier["name"]),
-        text_input("Sizes [EUR M]", f"{p}-sizes", ", ".join(str(x) for x in tier["sizes"])),
+        text_input("Pricing sizes [EUR M]", f"{p}-sizes", ", ".join(str(x) for x in tier["sizes"])),
+        number_input("RFQ size step [EUR M]", f"{p}-rfq-size-step", float(tier.get("rfqSizeStep", 1.0)), "any"),
         html.Div([
             html.Button("Configure flow sources", id={"type": "open-flow-sources", "tier": index}, className="secondary-button compact-button", n_clicks=0),
         ], className="flow-source-config-line"),
         # Keep the original direct-flow inputs mounted for backward-compatible config
         # construction.  Their values are synchronized from the modal editor.
         html.Div([
-            number_input("A0 / min", f"{p}-A0", tier["flow"]["A0"], "any"),
+            number_input("A0", f"{p}-A0", tier["flow"].get("A0", 0.0), "any"),
             number_input("Theta", f"{p}-theta", tier["flow"]["theta"], "any"),
             number_input("Beta", f"{p}-beta", tier["flow"]["beta"], "any"),
             number_input("Steepness", f"{p}-steep", tier["flow"]["steepness"], "any"),
@@ -483,9 +526,94 @@ def _logistic(x: np.ndarray | float) -> np.ndarray | float:
     return float(out) if out.ndim == 0 else out
 
 
+def _source_size_scale(source: dict[str, Any]) -> float:
+    mapping = source.get("mapping", {}) or {}
+    mapping_type = str(mapping.get("type", "identity"))
+    if mapping_type == "crossed":
+        return float(mapping.get("crossMid", 1.0))
+    if mapping_type == "affine":
+        return float(mapping.get("sourceSizePerTarget", 1.0))
+    return 1.0
+
+
+def _tier_flow_sources(tier: dict[str, Any]) -> list[dict[str, Any]]:
+    sources = tier.get("flowSources")
+    if sources:
+        return list(sources)
+    return [{"name": tier.get("name", "direct"), "flow": tier["flow"], "mapping": {"type": "identity"}}]
+
+
+def _rfq_size_grid(tier: dict[str, Any]) -> np.ndarray:
+    """Customer RFQ sizes, independent of the pricing-control knots."""
+    pricing = np.asarray(tier["sizes"], dtype=float)
+    if pricing.size == 0 or np.any(pricing <= 0.0):
+        raise ValueError("Pricing sizes must be positive")
+    step = float(tier.get("rfqSizeStep", 1.0))
+    if not np.isfinite(step) or step <= 0.0:
+        raise ValueError("RFQ size step must be positive")
+    lo, hi = float(pricing[0]), float(pricing[-1])
+    regular = np.arange(lo, hi + 0.5 * step, step, dtype=float)
+    regular = regular[regular <= hi + 1e-12]
+    values = np.unique(np.round(np.concatenate([regular, pricing, [hi]]), 12))
+    return values[(values >= lo - 1e-12) & (values <= hi + 1e-12)]
+
+
+def _source_curve_at_sizes(tier: dict[str, Any], source: dict[str, Any], target_sizes) -> np.ndarray:
+    """Unnormalised RFQ-size density implied by the calibrated arrival curve."""
+    sizes = np.asarray(target_sizes, dtype=float) * _source_size_scale(source)
+    flow = source["flow"]
+    exponent = -float(flow["theta"]) - float(flow["beta"]) * sizes
+    weights = np.power(sizes, exponent)
+    if np.any(~np.isfinite(weights)) or np.any(weights < 0.0):
+        raise ValueError("RFQ arrival-intensity curve must be finite and nonnegative")
+    return weights
+
+
+def _source_curve_shape(tier: dict[str, Any], source: dict[str, Any]) -> np.ndarray:
+    weights = _source_curve_at_sizes(tier, source, _rfq_size_grid(tier))
+    if float(np.sum(weights)) <= 0.0:
+        raise ValueError("RFQ arrival-intensity curve must have positive mass")
+    return weights
+
+
+def _source_a0(tier: dict[str, Any], source: dict[str, Any]) -> float:
+    flow = source["flow"]
+    if "A0" in flow:
+        return float(flow["A0"])
+    if "totalRfqRate" in flow:
+        # Compatibility with the short-lived total-rate config format.  Recover
+        # the original one-sided curve scale on the *full* RFQ size support.
+        shape_mass = float(np.sum(_source_curve_shape(tier, source)))
+        return float(flow["totalRfqRate"]) / (2.0 * shape_mass)
+    raise ValueError("RFQ flow requires A0")
+
+
+def _source_size_distribution(tier: dict[str, Any], source: dict[str, Any]) -> np.ndarray:
+    # There is no independent RFQ-size calibration: the exogenous arrival
+    # intensity curve itself is the density.  Normalize it on the full customer
+    # RFQ grid, not only on the pricing-control knots.
+    weights = _source_curve_shape(tier, source)
+    return weights / float(np.sum(weights))
+
+
+def _source_rfq_rates_per_side(tier: dict[str, Any], source: dict[str, Any]) -> np.ndarray:
+    return _source_a0(tier, source) * _source_curve_shape(tier, source)
+
+
+def _source_rfq_rate_at(tier: dict[str, Any], source: dict[str, Any], z: float) -> float:
+    shape = float(_source_curve_at_sizes(tier, source, [float(z)])[0])
+    return _source_a0(tier, source) * shape
+
+
+def _source_total_rfq_rate(tier: dict[str, Any], source: dict[str, Any]) -> float:
+    # One pooled source clock across bid and ask customer RFQs.
+    return 2.0 * float(np.sum(_source_rfq_rates_per_side(tier, source)))
+
+
 def _activity(tier: dict[str, Any], z: float) -> float:
-    flow = tier["flow"]
-    return float(flow["A0"]) * float(z) ** (-float(flow["theta"]) - float(flow["beta"]) * float(z))
+    """One-sided exogenous RFQ arrival intensity at target size z."""
+    return sum(_source_rfq_rate_at(tier, source, float(z))
+               for source in _tier_flow_sources(tier))
 
 
 def _delta50(tier: dict[str, Any], z: float) -> float:
@@ -493,13 +621,46 @@ def _delta50(tier: dict[str, Any], z: float) -> float:
     return float(flow["shift"]) - float(flow["volumeShift"]) * (float(z) - 1.0)
 
 
-def _hit_ratio(tier: dict[str, Any], delta, z: float):
-    kappa = float(tier["flow"]["steepness"])
-    return _logistic(kappa * (np.asarray(delta, dtype=float) - _delta50(tier, z)))
+def _source_delta_scale(source: dict[str, Any], target_spread_pips: float) -> float:
+    mapping = source.get("mapping", {}) or {}
+    mapping_type = str(mapping.get("type", "identity"))
+    if mapping_type == "crossed":
+        cross_mid = float(mapping.get("crossMid", 0.0))
+        source_spread = float(mapping.get("sourceSpreadPips", 0.0))
+        if cross_mid <= 0.0 or source_spread <= 0.0:
+            raise ValueError("Crossed RFQ source requires positive cross mid and source spread")
+        return float(target_spread_pips) / (cross_mid * source_spread)
+    if mapping_type == "affine":
+        return float(mapping.get("deltaScale", 1.0))
+    if mapping_type != "identity":
+        raise ValueError(f"Unsupported RFQ flow-source mapping {mapping_type}")
+    return 1.0
 
 
-def _arrival_rate(tier: dict[str, Any], delta, z: float):
-    return _activity(tier, z) * _hit_ratio(tier, delta, z)
+def _source_hit_ratio(source: dict[str, Any], target_delta, target_size: float, target_spread_pips: float):
+    flow = source["flow"]
+    delta = np.asarray(target_delta, dtype=float)
+    source_delta = 0.5 + _source_delta_scale(source, target_spread_pips) * (delta - 0.5)
+    source_size = float(target_size) * _source_size_scale(source)
+    center = float(flow["shift"]) - float(flow["volumeShift"]) * (source_size - 1.0)
+    return _logistic(float(flow["steepness"]) * (source_delta - center))
+
+
+def _hit_ratio(tier: dict[str, Any], delta, z: float, target_spread_pips: float):
+    numerator = np.zeros_like(np.asarray(delta, dtype=float), dtype=float)
+    denominator = 0.0
+    for source in _tier_flow_sources(tier):
+        rate = _source_rfq_rate_at(tier, source, float(z))
+        numerator = numerator + rate * np.asarray(
+            _source_hit_ratio(source, delta, z, target_spread_pips), dtype=float
+        )
+        denominator += rate
+    result = numerator / denominator if denominator > 0.0 else np.zeros_like(numerator)
+    return float(result) if result.ndim == 0 else result
+
+
+def _arrival_rate(tier: dict[str, Any], delta, z: float, target_spread_pips: float):
+    return _activity(tier, z) * _hit_ratio(tier, delta, z, target_spread_pips)
 
 
 def _markout_pips(tier: dict[str, Any], z: float, t_minutes):
@@ -534,33 +695,33 @@ def _simple_table(columns: list[str], rows: list[list[Any]]) -> html.Table:
     return html.Table([header, body], className="data-table")
 
 
-def flow_curve_figure(tier: dict[str, Any]) -> go.Figure:
+def flow_curve_figure(tier: dict[str, Any], target_spread_pips: float) -> go.Figure:
     grid = np.linspace(-1.0, 1.0, 160)
     fig = go.Figure()
     for z in tier["sizes"]:
-        fig.add_trace(go.Scatter(x=grid, y=_arrival_rate(tier, grid, float(z)), mode="lines", name=f"{float(z):g}M"))
-    fig.update_layout(title=f"Won-trade intensity λ_RFQ(z) × p_win(δ,z) · {tier['name']}", xaxis_title="δ", yaxis_title="Won trades [1/min]", template="trinity_dark")
+        fig.add_trace(go.Scatter(x=grid, y=_arrival_rate(tier, grid, float(z), target_spread_pips), mode="lines", name=f"{float(z):g}M"))
+    fig.update_layout(title=f"Won-trade intensity per side · {tier['name']}", xaxis_title="δ", yaxis_title="Won trades [1/min]", template="trinity_dark")
     return fig
 
 
 def exogenous_arrival_figure(tier: dict[str, Any]) -> go.Figure:
-    sizes = np.asarray(tier["sizes"], dtype=float)
+    sizes = _rfq_size_grid(tier)
     rates = np.asarray([_activity(tier, float(z)) for z in sizes], dtype=float)
     fig = go.Figure(go.Scatter(x=sizes, y=rates, mode="lines+markers", name="RFQ arrivals"))
     fig.update_layout(
         title=f"Exogenous RFQ arrival intensity λ_RFQ(z) · {tier['name']}",
         xaxis_title="RFQ size [EUR M]",
-        yaxis_title="RFQs [1/min]",
+        yaxis_title="RFQs / side [1/min]",
         template="trinity_dark",
     )
     return fig
 
 
-def hit_ratio_figure(tier: dict[str, Any]) -> go.Figure:
+def hit_ratio_figure(tier: dict[str, Any], target_spread_pips: float) -> go.Figure:
     grid = np.linspace(-1.0, 1.0, 160)
     fig = go.Figure()
     for z in tier["sizes"]:
-        fig.add_trace(go.Scatter(x=grid, y=_hit_ratio(tier, grid, float(z)), mode="lines", name=f"{float(z):g}M"))
+        fig.add_trace(go.Scatter(x=grid, y=_hit_ratio(tier, grid, float(z), target_spread_pips), mode="lines", name=f"{float(z):g}M"))
     fig.update_layout(title=f"Win probabilities p_win(δ,z) · {tier['name']}", xaxis_title="δ", yaxis_title="Win probability", yaxis_range=[0,1], template="trinity_dark")
     return fig
 
@@ -575,15 +736,180 @@ def implied_hit_ratio_figure(solution: dict[str, Any], cfg: dict[str, Any], tier
         bid = np.asarray([row[j] for row in tier_sol["bid"]], dtype=float)
         ask = np.asarray([row[j] for row in tier_sol["ask"]], dtype=float)
         fig.add_trace(go.Scatter(
-            x=q, y=_hit_ratio(tier, bid, z), mode="lines", name=f"{z:g}M bid",
+            x=q, y=_hit_ratio(tier, bid, z, float(cfg["spreadPips"])), mode="lines", name=f"{z:g}M bid",
             line=dict(color=BID_COLOR, dash=dash), legendgroup=f"size-{j}",
         ))
         fig.add_trace(go.Scatter(
-            x=q, y=_hit_ratio(tier, ask, z), mode="lines", name=f"{z:g}M ask",
+            x=q, y=_hit_ratio(tier, ask, z, float(cfg["spreadPips"])), mode="lines", name=f"{z:g}M ask",
             line=dict(color=ASK_COLOR, dash=dash), legendgroup=f"size-{j}",
         ))
     fig.update_layout(title=f"Implied win probabilities vs inventory · {tier['name']}", xaxis_title="Inventory q [EUR M]", yaxis_title="Win probability", yaxis_range=[0,1], template="trinity_dark")
     return fig
+
+
+def mc_rfq_validation_figures(
+    mc: dict[str, Any], solution: dict[str, Any], cfg: dict[str, Any], tier_index: int,
+) -> tuple[go.Figure, go.Figure, go.Figure]:
+    """Compare all-path Monte Carlo RFQ samples with the model inputs used by MC."""
+    ti = int(tier_index)
+    tier = _tier_cfg(cfg, ti)
+    tier_sol = solution["tiers"][ti]
+    tier_name = str(tier["name"])
+    spread_pips = float(cfg["spreadPips"])
+    q_grid = np.asarray(solution["qGrid"], dtype=float)
+    pricing_sizes = [float(z) for z in tier_sol["sizes"]]
+
+    # --- 1) Exogenous RFQ arrival intensity by size -----------------------
+    # RFQ requests pool bid + ask.  The model curve is one-sided, therefore
+    # divide the observed request count by 2 * path-minutes.
+    arrival_fig = go.Figure()
+    size_rows = [
+        row for row in mc.get("rfqTierSizeAggregates", [])
+        if str(row.get("tier", "")) == tier_name
+    ]
+    requests_by_size = {
+        float(row.get("size", 0.0)): int(row.get("requests", 0))
+        for row in size_rows
+    }
+    rfq_sizes = np.asarray(_rfq_size_grid(tier), dtype=float)
+    model_arrivals = np.asarray([_activity(tier, float(z)) for z in rfq_sizes], dtype=float)
+    n_paths = len(mc.get("pnlBase", []))
+    exposure = 2.0 * float(n_paths) * SESSION_HORIZON
+    mc_arrivals = np.asarray([
+        requests_by_size.get(float(z), 0) / exposure if exposure > 0.0 else 0.0
+        for z in rfq_sizes
+    ], dtype=float)
+    arrival_fig.add_trace(go.Scatter(
+        x=rfq_sizes, y=model_arrivals, mode="lines+markers", name="Model input λ_RFQ(z)",
+        line=dict(width=2.5),
+    ))
+    arrival_fig.add_trace(go.Scatter(
+        x=rfq_sizes, y=mc_arrivals, mode="markers", name="MC estimate",
+        marker=dict(size=9, symbol="circle-open"),
+        customdata=np.asarray([requests_by_size.get(float(z), 0) for z in rfq_sizes]),
+        hovertemplate=(
+            "RFQ size=%{x:g}M<br>MC λ=%{y:.6f} /min/side"
+            "<br>Requests=%{customdata:,.0f}<extra></extra>"
+        ),
+    ))
+    arrival_fig.update_layout(
+        title=f"Exogenous RFQ arrival intensity · {tier_name}",
+        xaxis_title="RFQ size [EUR M]", yaxis_title="RFQs / side [1/min]",
+        template="trinity_dark", hovermode="x unified",
+    )
+
+    # --- 2) Win probability as a function of quoted delta ----------------
+    # Only admissible RFQs enter the empirical denominator here.  Otherwise
+    # inventory-boundary clipping (where MC deliberately uses p=0) would be
+    # mixed into the calibration curve p_win(delta, z).
+    win_fig = go.Figure()
+    delta_rows = [
+        row for row in mc.get("rfqDeltaAggregates", [])
+        if str(row.get("tier", "")) == tier_name
+    ]
+    for j, z in enumerate(pricing_sizes):
+        color = SIZE_COLORS[j % len(SIZE_COLORS)]
+        rows = sorted(
+            [row for row in delta_rows if abs(float(row.get("size", 0.0)) - z) <= 1e-9],
+            key=lambda row: float(row.get("delta", 0.0)),
+        )
+
+        # Plot the model only over the quote-delta domain actually reachable by
+        # this rung's HJB policy (plus a small visual margin).
+        bid_policy = np.asarray([row[j] for row in tier_sol["bid"]], dtype=float)
+        ask_policy = np.asarray([row[j] for row in tier_sol["ask"]], dtype=float)
+        policy_domain = np.concatenate([bid_policy, ask_policy])
+        lo = float(np.nanmin(policy_domain)) if policy_domain.size else -1.0
+        hi = float(np.nanmax(policy_domain)) if policy_domain.size else 1.0
+        if rows:
+            lo = min(lo, min(float(row.get("delta", lo)) for row in rows))
+            hi = max(hi, max(float(row.get("delta", hi)) for row in rows))
+        pad = max(0.02, 0.05 * max(hi - lo, 0.1))
+        grid = np.linspace(lo - pad, hi + pad, 180)
+        win_fig.add_trace(go.Scatter(
+            x=grid, y=_hit_ratio(tier, grid, z, spread_pips), mode="lines",
+            name=f"{z:g}M · model", legendgroup=f"mc-win-{j}",
+            line=dict(color=color, width=2),
+        ))
+
+        empirical = [row for row in rows if int(row.get("admissibleRequests", 0)) > 0]
+        if empirical:
+            x = [float(row.get("delta", 0.0)) for row in empirical]
+            n = [int(row.get("admissibleRequests", 0)) for row in empirical]
+            wins = [int(row.get("wins", 0)) for row in empirical]
+            y = [w / count for w, count in zip(wins, n)]
+            win_fig.add_trace(go.Scatter(
+                x=x, y=y, mode="markers", name=f"{z:g}M · MC",
+                legendgroup=f"mc-win-{j}",
+                marker=dict(color=color, size=8, symbol="circle-open"),
+                customdata=np.column_stack([wins, n]),
+                hovertemplate=(
+                    f"{z:g}M RFQ<br>δ=%{{x:.4f}}<br>MC win probability=%{{y:.1%}}"
+                    "<br>Wins=%{customdata[0]:.0f} / admissible RFQs=%{customdata[1]:.0f}<extra></extra>"
+                ),
+            ))
+    win_fig.update_layout(
+        title=f"Win probability p_win(δ,z) · {tier_name}",
+        xaxis_title="Quoted δ", yaxis_title="Win probability", yaxis_range=[0, 1],
+        template="trinity_dark",
+    )
+    win_fig.update_yaxes(tickformat=".0%")
+
+    # --- 3) Effective / implied win probability by inventory -------------
+    # The model line uses the exact tier policy on the HJB q-grid and applies
+    # the same hard-inventory admissibility check as the native MC engine.
+    inventory_fig = go.Figure()
+    inventory_rows = [
+        row for row in mc.get("rfqInventoryAggregates", [])
+        if str(row.get("tier", "")) == tier_name
+    ]
+    q_min = float(np.min(q_grid)) if q_grid.size else 0.0
+    q_max = float(np.max(q_grid)) if q_grid.size else 0.0
+    for j, z in enumerate(pricing_sizes):
+        dash = SIZE_DASHES[j % len(SIZE_DASHES)]
+        for side, color, direction in (("bid", BID_COLOR, 1.0), ("ask", ASK_COLOR, -1.0)):
+            policy = np.asarray([row[j] for row in tier_sol[side]], dtype=float)
+            model_p = np.asarray(_hit_ratio(tier, policy, z, spread_pips), dtype=float)
+            admissible = (q_grid + direction * z >= q_min - 1e-10) & (q_grid + direction * z <= q_max + 1e-10)
+            model_p = np.where(admissible, model_p, 0.0)
+            label_side = side.capitalize()
+            inventory_fig.add_trace(go.Scatter(
+                x=q_grid, y=model_p, mode="lines",
+                name=f"{z:g}M {label_side} · model", legendgroup=f"mc-inv-{side}-{j}",
+                line=dict(color=color, dash=dash, width=2),
+            ))
+
+            empirical = sorted(
+                [
+                    row for row in inventory_rows
+                    if str(row.get("side", "")).lower() == side
+                    and abs(float(row.get("size", 0.0)) - z) <= 1e-9
+                    and int(row.get("requests", 0)) > 0
+                ],
+                key=lambda row: float(row.get("inventory", 0.0)),
+            )
+            if empirical:
+                x = [float(row.get("inventory", 0.0)) for row in empirical]
+                requests = [int(row.get("requests", 0)) for row in empirical]
+                wins = [int(row.get("wins", 0)) for row in empirical]
+                y = [w / n for w, n in zip(wins, requests)]
+                inventory_fig.add_trace(go.Scatter(
+                    x=x, y=y, mode="markers",
+                    name=f"{z:g}M {label_side} · MC", legendgroup=f"mc-inv-{side}-{j}",
+                    marker=dict(color=color, size=7, symbol="circle-open"),
+                    customdata=np.column_stack([wins, requests]),
+                    hovertemplate=(
+                        f"{z:g}M {label_side}<br>Inventory=%{{x:.3f}}M"
+                        "<br>MC hit ratio=%{y:.1%}<br>Wins=%{customdata[0]:.0f} / RFQs=%{customdata[1]:.0f}<extra></extra>"
+                    ),
+                ))
+    inventory_fig.update_layout(
+        title=f"Implied hit ratios by inventory · {tier_name}",
+        xaxis_title="Inventory q [EUR M]", yaxis_title="Win probability", yaxis_range=[0, 1],
+        template="trinity_dark",
+    )
+    inventory_fig.update_yaxes(tickformat=".0%")
+    return arrival_fig, win_fig, inventory_fig
 
 
 def quote_inventory_figure(solution: dict[str, Any], cfg: dict[str, Any], tier_index: int) -> go.Figure:
@@ -654,13 +980,19 @@ def ladder_figure(solution: dict[str, Any], cfg: dict[str, Any], tier_index: int
 
 def flow_parameter_table(tier: dict[str, Any]) -> html.Table:
     rows=[]
-    for z in tier["sizes"]:
+    one_side_total = sum(0.5 * _source_total_rfq_rate(tier, source) for source in _tier_flow_sources(tier))
+    pricing = np.asarray(tier["sizes"], dtype=float)
+    for z in _rfq_size_grid(tier):
+        rate = _activity(tier, float(z))
+        size_share = rate / one_side_total if one_side_total > 0.0 else 0.0
+        is_knot = bool(np.any(np.isclose(pricing, float(z), rtol=0.0, atol=1e-12)))
         rows.append([
-            f"{float(z):g}", f"{_activity(tier,float(z)):.6g}", f"{_delta50(tier,float(z)):.4f}",
+            f"{float(z):g}" + (" · price knot" if is_knot else ""),
+            f"{100.0 * size_share:.2f}%", f"{rate:.6g}", f"{_delta50(tier,float(z)):.4f}",
             f"{float(tier['flow']['steepness']):.4g}", f"{float(tier.get('feePips', 0.0)):.3f}",
             f"{float(_markout_pips(tier,float(z),1.0)):.3f}",
         ])
-    return _simple_table(["Size [M]","λ_RFQ(z) [1/min]","δ50(z)","Steepness","Fee [pips]","Markout @1m [pips]"], rows)
+    return _simple_table(["Size [M]","RFQ size share","λ_RFQ(z) [1/min]","δ50(z)","Steepness","Fee [pips]","Markout @1m [pips]"], rows)
 
 
 def ladder_table(solution: dict[str, Any], cfg: dict[str, Any], tier_index: int, q_value: float) -> html.Table:
@@ -783,6 +1115,7 @@ def _ecn_flow_sources(cfg: dict[str, Any]) -> list[dict[str, Any]]:
         configured = [{
             "name": str(cfg.get("targetPair", "direct")),
             "flow": e.get("flow", {}),
+            "meanTradeSize": e.get("meanTradeSize", 1.0),
             "mapping": {"type": "identity"},
         }]
 
@@ -810,6 +1143,8 @@ def _ecn_flow_sources(cfg: dict[str, Any]) -> list[dict[str, Any]]:
             "name": str(raw.get("name") or raw.get("pair") or "source"),
             "A": float(flow.get("A", 0.0)),
             "k": float(flow.get("k", 1.0)),
+            "meanTradeSize": float(raw.get("meanTradeSize", 1.0)),
+            "meanTargetTradeSize": float(raw.get("meanTradeSize", 1.0)) / size_scale,
             "alpha": alpha,
             "sourceSizePerTarget": size_scale,
             "mapping": mapping,
@@ -903,17 +1238,25 @@ def passive_ecn_parameter_table(cfg: dict[str, Any]) -> html.Table:
             )
         else:
             mapping_text = "direct"
+        mean_target = float(source["meanTargetTradeSize"])
+        p_full = float(np.exp(-z / mean_target)) if mean_target > 0.0 else 0.0
+        expected_fill = mean_target * (1.0 - p_full) if mean_target > 0.0 else 0.0
         rows.append([
             str(source["name"]),
             f"{float(source['A']):.6g}",
             f"{float(source['k']):.4g}",
+            f"{float(source['meanTradeSize']):.4g}",
+            f"{mean_target:.4g}",
+            f"{expected_fill:.4g}",
+            f"{100.0 * p_full:.1f}%",
             mapping_text,
             f"{float(source['sourceSizePerTarget']):.6g}",
             f"{z:g}",
             f"{fee:.4f}",
         ])
     return _simple_table(
-        ["ECN source", "A = mid intensity/side", "k", "Mapping",
+        ["ECN source", "A = mid intensity/side", "k", "Mean trade [source M]",
+         "Mean trade [target M]", "E[fill] [target M]", "P(full fill)", "Mapping",
          "Source size / target size", "Target-equivalent quote [M]", "Maker fee [pips]"],
         rows,
     )
@@ -1090,11 +1433,12 @@ sidebar = html.Aside([
         html.Div([
             html.Button("Configure flow sources", id="open-ecn-flow-sources", className="secondary-button compact-button", n_clicks=0),
         ], className="flow-source-config-line"),
-        # Direct ECN A/k remain mounted for backward-compatible config building.
+        # Direct ECN calibration remains mounted for config building.
         # The modal editor synchronizes these values for the target-pair source.
         html.Div([
             number_input("A at mid / side [trades/min]", "ecn-A", DEFAULT["passiveEcn"]["flow"]["A"], "any"),
             number_input("k", "ecn-k", DEFAULT["passiveEcn"]["flow"]["k"], "any"),
+            number_input("Mean trade size [source CCY M]", "ecn-mean-size", DEFAULT["passiveEcn"]["meanTradeSize"], "any"),
         ], style={"display": "none"}),
         html.Div([
             number_input("Min delta", "ecn-dmin", DEFAULT["passiveEcn"]["minDelta"], 0.01),
@@ -1211,9 +1555,34 @@ mc_tab = html.Div([
             ),
         ),
         diagnostic_expander("Fills by tier and side", [
+            html.Div([
+                select(
+                    "Measure",
+                    "fill-tier-metric",
+                    [
+                        {"label": "Number of trades", "value": "count"},
+                        {"label": "Total volume", "value": "volume"},
+                    ],
+                    "count",
+                ),
+            ], className="toolbar toolbar-wide fill-tier-toolbar"),
             graph("fill-counts-chart", 360),
             html.Div("Fill tape", className="card-title table-section-title"),
             html.Div(id="fill-tape", className="table-wrap tall-table"),
+        ]),
+        diagnostic_expander("RFQ hit ratios", graph("rfq-realized-hit-chart", 360)),
+        diagnostic_expander("RFQ Monte Carlo validation", [
+            html.Div([
+                select("Tier", "mc-rfq-tier-select", [], None),
+            ], className="toolbar toolbar-wide"),
+            html.Div(
+                "Markers are empirical estimates from all simulated paths; lines are the corresponding model curves used by the simulator. "
+                "The arrival curve is reported per side. Win-probability calibration excludes RFQs blocked only by the hard inventory limit, while the inventory chart includes that boundary effect.",
+                className="muted-note",
+            ),
+            graph("mc-rfq-arrival-validation-chart", 380),
+            graph("mc-rfq-win-validation-chart", 440),
+            graph("mc-rfq-inventory-validation-chart", 500),
         ]),
     ], className="diagnostics-stack mc-diagnostics-stack"),
 ], className="tab-inner")
@@ -1239,6 +1608,8 @@ app.layout = html.Div([
     dcc.Store(id="mc-store"),
     dcc.Store(id="stats-store"),
     dcc.Store(id="frontier-store"),
+    dcc.Store(id="mc-job-store"),
+    dcc.Interval(id="mc-progress-poll", interval=250, n_intervals=0, disabled=True),
     dcc.Store(id="extra-flow-sources-store", data={"0": [], "1": [], "2": []}),
     dcc.Store(id="flow-source-tier-store", data=None),
     dcc.Store(id="flow-source-selected-store", data="direct"),
@@ -1280,7 +1651,7 @@ app.layout = html.Div([
             html.Div([
                 html.Div([
                     html.H2("Configure ECN flow sources", className="modal-title"),
-                    html.Div("The ECN optimizer chooses one master delta on the target pair. Crossed ECN pairs inherit that quote through the same FX transformation used by Tier flow sources, while keeping their own A and k curves.", className="muted-note modal-note"),
+                    html.Div("The ECN optimizer chooses one master delta on the target pair. Crossed ECN pairs inherit that quote through the same FX transformation used by Tier flow sources, while keeping their own A, k and exponential trade-size calibration.", className="muted-note modal-note"),
                 ]),
                 html.Button("×", id="ecn-flow-source-close", className="modal-close", n_clicks=0),
             ], className="modal-head"),
@@ -1298,6 +1669,27 @@ app.layout = html.Div([
             ], className="modal-actions"),
         ], className="flow-source-modal-card"),
     ], id="ecn-flow-source-modal", className="flow-source-modal", style={"display": "none"}),
+    html.Div([
+        html.Div([
+            html.Div([
+                html.Div([
+                    html.H2("Running Monte Carlo", className="modal-title"),
+                    html.Div(
+                        "The progress bar reflects completed native simulation paths.",
+                        className="muted-note modal-note",
+                    ),
+                ]),
+            ], className="modal-head"),
+            html.Div([
+                html.Div(id="mc-progress-message", children="Starting simulation…", className="mc-progress-message"),
+                html.Progress(id="mc-progress-bar", value="0", max="100", className="mc-progress-bar"),
+                html.Div([
+                    html.Span(id="mc-progress-count", children="0 / 0 paths"),
+                    html.Span(id="mc-progress-percent", children="0%"),
+                ], className="mc-progress-meta"),
+            ], className="mc-progress-body"),
+        ], className="mc-progress-modal-card"),
+    ], id="mc-progress-modal", className="flow-source-modal mc-progress-modal", style={"display": "none"}),
     sidebar,
     html.Main([
         html.Header([
@@ -1324,7 +1716,7 @@ CONFIG_FIELDS = [
 for i in range(3):
     p = f"t{i}"
     for suffix in (
-        "enabled", "name", "sizes", "A0", "theta", "beta", "steep", "shift", "vshift",
+        "enabled", "name", "sizes", "rfq-size-step", "A0", "theta", "beta", "steep", "shift", "vshift",
         "fee", "markout-enabled", "impact", "impact-beta", "impact-tau", "dmin", "dmax",
     ):
         CONFIG_FIELDS.append((f"{p}-{suffix}", State(f"{p}-{suffix}", "value")))
@@ -1333,7 +1725,7 @@ for component_id in (
 ):
     CONFIG_FIELDS.append((component_id, State(component_id, "value")))
 for component_id in (
-    "ecn-enabled", "ecn-A", "ecn-k", "ecn-dmin", "ecn-dmax", "ecn-size", "ecn-fee",
+    "ecn-enabled", "ecn-A", "ecn-k", "ecn-mean-size", "ecn-dmin", "ecn-dmax", "ecn-size", "ecn-fee",
 ):
     CONFIG_FIELDS.append((component_id, State(component_id, "value")))
 
@@ -1670,9 +2062,9 @@ def render_ecn_flow_source_cards(target_pair, selected, data):
     Input("flow-target-pair", "value"),
     Input("ecn-flow-source-selected-store", "data"),
     State("ecn-extra-flow-sources-store", "data"),
-    State("ecn-A", "value"), State("ecn-k", "value"),
+    State("ecn-A", "value"), State("ecn-k", "value"), State("ecn-mean-size", "value"),
 )
-def render_ecn_flow_source_settings(target_pair, selected, data, direct_A, direct_k):
+def render_ecn_flow_source_settings(target_pair, selected, data, direct_A, direct_k, direct_mean_size):
     if not target_pair:
         return html.Div(
             "Select the target / priced FX pair in a Tier flow-source dialog first.",
@@ -1681,13 +2073,13 @@ def render_ecn_flow_source_settings(target_pair, selected, data, direct_A, direc
     extras = data or []
     selected = selected or "direct"
     if selected == "direct":
-        source = _direct_ecn_flow_source({"A": direct_A, "k": direct_k}, str(target_pair))
+        source = _direct_ecn_flow_source({"A": direct_A, "k": direct_k}, str(target_pair), direct_mean_size)
     else:
         try:
             idx = int(str(selected).split("-", 1)[1])
             source = extras[idx]
         except (ValueError, IndexError):
-            source = _direct_ecn_flow_source({"A": direct_A, "k": direct_k}, str(target_pair))
+            source = _direct_ecn_flow_source({"A": direct_A, "k": direct_k}, str(target_pair), direct_mean_size)
             selected = "direct"
     return ecn_flow_source_settings_editor(selected, source, str(target_pair))
 
@@ -1717,51 +2109,53 @@ def populate_ecn_flow_source_cross_mid(cross_pair):
 @app.callback(
     Output("ecn-extra-flow-sources-store", "data"),
     Output("ecn-flow-source-selected-store", "data", allow_duplicate=True),
-    Output("ecn-A", "value"), Output("ecn-k", "value"),
+    Output("ecn-A", "value"), Output("ecn-k", "value"), Output("ecn-mean-size", "value"),
     Input("ecn-flow-source-add", "n_clicks"),
     Input("ecn-flow-source-remove-selected", "n_clicks"),
     Input("ecn-flow-edit-pair", "value"), Input("ecn-flow-edit-cross-pair", "value"),
     Input("ecn-flow-edit-cross-mid", "value"), Input("ecn-flow-edit-spread", "value"),
-    Input("ecn-flow-edit-A", "value"), Input("ecn-flow-edit-k", "value"),
+    Input("ecn-flow-edit-A", "value"), Input("ecn-flow-edit-k", "value"), Input("ecn-flow-edit-mean-size", "value"),
     State("flow-target-pair", "value"), State("ecn-flow-source-selected-store", "data"),
-    State("ecn-extra-flow-sources-store", "data"), State("ecn-A", "value"), State("ecn-k", "value"),
+    State("ecn-extra-flow-sources-store", "data"), State("ecn-A", "value"), State("ecn-k", "value"), State("ecn-mean-size", "value"),
     prevent_initial_call=True,
 )
-def update_ecn_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, spread, A, k,
-                                  target_pair, selected, data, direct_A, direct_k):
+def update_ecn_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, spread, A, k, mean_size,
+                                  target_pair, selected, data, direct_A, direct_k, direct_mean_size):
     out = deepcopy(data or [])
     selected = selected or "direct"
     trigger = ctx.triggered_id
 
     if trigger == "ecn-flow-source-add":
         if not _add:
-            return (no_update,) * 4
+            return (no_update,) * 5
         if not target_pair:
-            return out, selected, direct_A, direct_k
+            return out, selected, direct_A, direct_k, direct_mean_size
         out.append(_default_cross_ecn_flow_source(len(out), target_pair))
-        return out, f"extra-{len(out) - 1}", direct_A, direct_k
+        return out, f"extra-{len(out) - 1}", direct_A, direct_k, direct_mean_size
 
     if trigger == "ecn-flow-source-remove-selected":
         if not _remove:
-            return (no_update,) * 4
+            return (no_update,) * 5
         if selected.startswith("extra-"):
             idx = int(selected.split("-", 1)[1])
             if 0 <= idx < len(out):
                 out.pop(idx)
-        return out, "direct", direct_A, direct_k
+        return out, "direct", direct_A, direct_k, direct_mean_size
 
     if selected == "direct":
-        if A is not None and k is not None:
+        if A is not None and k is not None and mean_size is not None:
             if float(A) < 0.0:
                 raise ValueError("ECN A must be nonnegative")
             if float(k) <= 0.0:
                 raise ValueError("ECN k must be positive")
-            return out, no_update, float(A), float(k)
-        return out, no_update, direct_A, direct_k
+            if float(mean_size) <= 0.0:
+                raise ValueError("ECN mean trade size must be positive")
+            return out, no_update, float(A), float(k), float(mean_size)
+        return out, no_update, direct_A, direct_k, direct_mean_size
 
     if selected.startswith("extra-"):
         idx = int(selected.split("-", 1)[1])
-        if 0 <= idx < len(out) and all(x is not None for x in (spread, A, k)):
+        if 0 <= idx < len(out) and all(x is not None for x in (spread, A, k, mean_size)):
             src = out[idx]
             chosen_pair = str(pair) if pair else None
             derived_cross = _derive_cross_pair(target_pair, chosen_pair)
@@ -1782,13 +2176,16 @@ def update_ecn_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, sp
                 raise ValueError("ECN A must be nonnegative")
             if float(k) <= 0.0:
                 raise ValueError("ECN k must be positive")
+            if float(mean_size) <= 0.0:
+                raise ValueError("ECN mean trade size must be positive")
 
             src.update({"name": chosen_pair or "Select FX pair", "pair": chosen_pair, "crossPair": chosen_cross})
             src["mapping"] = {"type": "crossed", "crossMid": chosen_mid, "sourceSpreadPips": float(spread)}
             src["flow"] = {"A": float(A), "k": float(k)}
-        return out, no_update, direct_A, direct_k
+            src["meanTradeSize"] = float(mean_size)
+        return out, no_update, direct_A, direct_k, direct_mean_size
 
-    return out, no_update, direct_A, direct_k
+    return out, no_update, direct_A, direct_k, direct_mean_size
 
 
 @app.callback(
@@ -1845,6 +2242,7 @@ def solve_model(_clicks, *values):
             direct = {
                 "name": str(target_pair), "pair": str(target_pair),
                 "flow": deepcopy(ecn.get("flow", {})), "mapping": {"type": "identity"},
+                "meanTradeSize": float(ecn.get("meanTradeSize", 1.0)),
             }
             ecn["flowSources"] = [direct] + deepcopy(ecn_extras)
 
@@ -1897,8 +2295,8 @@ def render_tier_diagnostics(solution, cfg, tier_index, q_value):
         qv = float(q_value if q_value is not None else 0.0)
         return (
             exogenous_arrival_figure(tier),
-            flow_curve_figure(tier),
-            hit_ratio_figure(tier),
+            flow_curve_figure(tier, float(cfg["spreadPips"])),
+            hit_ratio_figure(tier, float(cfg["spreadPips"])),
             implied_hit_ratio_figure(solution, cfg, ti),
             markout_figure(tier),
             quote_inventory_figure(solution, cfg, ti),
@@ -1936,9 +2334,9 @@ def expected_internalization_times(solution: dict[str, Any] | None, cfg: dict[st
     """Expected first-passage time to q=0 under the solved fixed policy.
 
     This builds the inventory CTMC from exactly the same policy-dependent event
-    intensities used by the Monte Carlo engine, then solves -Q_T tau = 1 with
-    q=0 absorbing.  The production UI uses a uniform 1M inventory grid, so the
-    configured trade sizes must land back on that grid for this exact curve.
+    intensities used by the native model, then solves -Q_T tau = 1 with q=0
+    absorbing. Off-grid fills use the same linear inventory-state interpolation
+    as the C++ generator.
     """
     if not solution or not cfg:
         return {"qGrid": [], "minutes": []}
@@ -1949,9 +2347,7 @@ def expected_internalization_times(solution: dict[str, Any] | None, cfg: dict[st
     def state_index(x: float) -> int:
         j = int(np.argmin(np.abs(q_grid - x)))
         if abs(float(q_grid[j]) - float(x)) > 1e-8:
-            raise ValueError(
-                "Internalization-time curve requires fill sizes aligned with the 1M inventory grid"
-            )
+            raise ValueError(f"Inventory grid does not contain required state {x:g}")
         return j
 
     zero = state_index(0.0)
@@ -1960,26 +2356,91 @@ def expected_internalization_times(solution: dict[str, Any] | None, cfg: dict[st
 
     enabled_tiers = {t["name"]: t for t in cfg.get("tiers", []) if t.get("enabled", False)}
 
-    def logistic_rate(flow: dict[str, Any], delta: float, size: float) -> float:
-        scale = float(flow["A0"]) * size ** (-float(flow["theta"]) - float(flow["beta"]) * size)
-        center = float(flow["shift"]) - float(flow["volumeShift"]) * (size - 1.0)
-        y = float(flow["steepness"]) * (delta - center)
+    def source_won_rate(tier_cfg: dict[str, Any], source: dict[str, Any],
+                        delta: float, size: float, size_index: int) -> float:
+        flow = source["flow"]
+        mapping = source.get("mapping", {}) or {}
+        mapping_type = str(mapping.get("type", "identity"))
+        size_scale = _source_size_scale(source)
+        delta_scale = 1.0
+        if mapping_type == "crossed":
+            cross_mid = float(mapping.get("crossMid", 0.0))
+            source_spread = float(mapping.get("sourceSpreadPips", 0.0))
+            if cross_mid <= 0.0 or source_spread <= 0.0:
+                raise ValueError("Crossed RFQ source requires positive cross mid and source spread")
+            delta_scale = float(cfg["spreadPips"]) / (cross_mid * source_spread)
+        elif mapping_type == "affine":
+            delta_scale = float(mapping.get("deltaScale", 1.0))
+        elif mapping_type != "identity":
+            raise ValueError(f"Unsupported RFQ flow-source mapping {mapping_type}")
+
+        source_delta = 0.5 + delta_scale * (delta - 0.5)
+        source_size = size * size_scale
+        center = float(flow["shift"]) - float(flow["volumeShift"]) * (source_size - 1.0)
+        y = float(flow["steepness"]) * (source_delta - center)
         if y >= 0.0:
             e = math.exp(-y) if y < 745.0 else 0.0
             hit = 1.0 / (1.0 + e)
         else:
             e = math.exp(y) if y > -745.0 else 0.0
             hit = e / (1.0 + e)
-        return scale * hit
+
+        exogenous_rate = float(_source_rfq_rates_per_side(tier_cfg, source)[size_index])
+        return exogenous_rate * hit
 
     def add_transition(i: int, q2: float, rate: float) -> None:
         if rate <= 0.0:
             return
-        j = state_index(q2)
-        if j == i:
-            return
-        Q[i, j] += rate
+        q2 = float(np.clip(q2, q_grid[0], q_grid[-1]))
+        right = int(np.searchsorted(q_grid, q2, side="left"))
+        if right <= 0:
+            weights = [(0, 1.0)]
+        elif right >= n:
+            weights = [(n - 1, 1.0)]
+        elif abs(float(q_grid[right]) - q2) <= 1e-10:
+            weights = [(right, 1.0)]
+        else:
+            left = right - 1
+            width = float(q_grid[right] - q_grid[left])
+            wr = (q2 - float(q_grid[left])) / width
+            weights = [(left, 1.0 - wr), (right, wr)]
+        for j, weight in weights:
+            Q[i, j] += rate * weight
         Q[i, i] -= rate
+
+    def ecn_fill_components(source: dict[str, Any], i: int, direction: float, posted: float) -> list[tuple[float, float]]:
+        mean = float(source["meanTargetTradeSize"])
+        if mean <= 0.0 or posted <= 0.0:
+            return []
+        q = float(q_grid[i])
+        if direction > 0.0:
+            breaks = [float(x - q) for x in q_grid[i + 1:] if 1e-10 < float(x - q) < posted - 1e-10]
+        else:
+            breaks = [float(q - x) for x in q_grid[:i] if 1e-10 < float(q - x) < posted - 1e-10]
+        cuts = sorted(set(breaks)) + [posted]
+        out: list[tuple[float, float]] = []
+        a = 0.0
+        for b in cuts:
+            length = float(b - a)
+            if length <= 1e-10:
+                a = float(b)
+                continue
+            survival_a = math.exp(-a / mean)
+            mass = survival_a * (-math.expm1(-length / mean))
+            if mass > 0.0:
+                x = length / mean
+                if x < 1e-5:
+                    offset = length * (0.5 - x / 12.0 + x**3 / 720.0)
+                elif x > 700.0:
+                    offset = mean
+                else:
+                    offset = mean - length / math.expm1(x)
+                out.append((a + offset, mass))
+            a = float(b)
+        tail = math.exp(-posted / mean)
+        if tail > 0.0:
+            out.append((posted, tail))
+        return out
 
     # Customer tiers.
     for tier_policy in solution.get("tiers", []):
@@ -1987,7 +2448,7 @@ def expected_internalization_times(solution: dict[str, Any] | None, cfg: dict[st
         if not tier_cfg:
             continue
         sizes = [float(z) for z in tier_policy.get("sizes", [])]
-        flow = tier_cfg["flow"]
+        sources = _tier_flow_sources(tier_cfg)
         for i, q in enumerate(q_grid):
             for side, direction in (("bid", 1.0), ("ask", -1.0)):
                 row = tier_policy[side][i]
@@ -1996,7 +2457,8 @@ def expected_internalization_times(solution: dict[str, Any] | None, cfg: dict[st
                     if q2 < q_grid[0] - 1e-8 or q2 > q_grid[-1] + 1e-8:
                         continue
                     delta = float(row[j])
-                    add_transition(i, q2, logistic_rate(flow, delta, z))
+                    rate = sum(source_won_rate(tier_cfg, source, delta, z, j) for source in sources)
+                    add_transition(i, q2, rate)
 
     # Dark-pool fills.
     dark_policy = solution.get("darkPool")
@@ -2038,15 +2500,16 @@ def expected_internalization_times(solution: dict[str, Any] | None, cfg: dict[st
     ecn_cfg = cfg.get("passiveEcn", {})
     if ecn_policy and ecn_cfg.get("enabled", False):
         z = float(ecn_cfg["quoteSize"])
+        sources = _ecn_flow_sources(cfg)
         for i, q in enumerate(q_grid):
             for side, direction in (("bid", 1.0), ("ask", -1.0)):
                 if not bool(ecn_policy[f"{side}Active"][i]):
                     continue
                 delta = float(ecn_policy[f"{side}Delta"][i])
-                rate = float(_ecn_arrival_rate(cfg, delta))
-                q2 = float(q) + direction * z
-                if q_grid[0] - 1e-8 <= q2 <= q_grid[-1] + 1e-8:
-                    add_transition(i, q2, rate)
+                for source in sources:
+                    hit_rate = float(_ecn_source_arrival_rate(source, delta))
+                    for fill, probability in ecn_fill_components(source, i, direction, z):
+                        add_transition(i, float(q) + direction * fill, hit_rate * probability)
 
     transient = [i for i in range(n) if i != zero]
     minus_q = -Q[np.ix_(transient, transient)]
@@ -2105,22 +2568,201 @@ def update_path_quote_sizes(solution):
     return opts, (sizes[0] if sizes else None)
 
 
-@app.callback(
-    Output("mc-store", "data"), Output("stats-store", "data"), Output("status", "children", allow_duplicate=True), Output("status", "className", allow_duplicate=True),
-    Input("run-mc", "n_clicks"), State("config-store", "data"), State("solution-store", "data"), State("mc-paths", "value"), State("mc-q0", "value"), State("mc-seed", "value"), prevent_initial_call=True,
-)
-def run_mc(_clicks, cfg, solution, paths, q0, seed):
-    if not cfg:
-        return no_update, no_update, "Solve the model first", "status error"
+def _run_mc_job(job_id: str, cfg: dict[str, Any], solution: dict[str, Any] | None,
+                paths: int, q0: float, seed: int) -> None:
+    """Execute one Monte-Carlo request while publishing genuine native progress."""
     try:
         engine = ENGINES.get(cfg)
-        mc = engine.simulate(SESSION_HORIZON, int(paths), float(q0), int(seed), retained_paths=8, sample_points=381)
-        stats = engine.statistics(SESSION_HORIZON, float(q0))
+
+        def report_progress(completed: int, total: int) -> None:
+            # Reserve the last 5% for statistics / analytical diagnostics so the
+            # modal never claims 100% while post-processing is still running.
+            percent = int(round(95.0 * completed / max(1, total)))
+            with _MC_JOBS_LOCK:
+                job = _MC_JOBS.get(job_id)
+                if job is None:
+                    return
+                job.update(
+                    completed=int(completed),
+                    total=int(total),
+                    percent=max(1, min(95, percent)),
+                    message=f"Simulating path {completed:,} of {total:,}…",
+                )
+
+        mc = engine.simulate(
+            SESSION_HORIZON, paths, q0, seed,
+            retained_paths=8, sample_points=381,
+            progress_callback=report_progress,
+        )
+
+        with _MC_JOBS_LOCK:
+            job = _MC_JOBS.get(job_id)
+            if job is not None:
+                job.update(percent=97, completed=paths, total=paths, message="Finalizing analytics…")
+
+        stats = engine.statistics(SESSION_HORIZON, q0)
         if solution:
+            with _MC_JOBS_LOCK:
+                job = _MC_JOBS.get(job_id)
+                if job is not None:
+                    job.update(percent=99, message="Computing internalization diagnostics…")
             stats["internalizationTimes"] = expected_internalization_times(solution, cfg)
-        return mc, stats, "Monte Carlo complete", "status ready"
+
+        with _MC_JOBS_LOCK:
+            job = _MC_JOBS.get(job_id)
+            if job is not None:
+                job.update(
+                    state="done",
+                    percent=100,
+                    completed=paths,
+                    total=paths,
+                    message="Monte Carlo complete",
+                    mc=mc,
+                    stats=stats,
+                    finishedAt=time.time(),
+                )
     except Exception as exc:
-        return no_update, no_update, f"Monte Carlo failed · {exc}", "status error"
+        with _MC_JOBS_LOCK:
+            job = _MC_JOBS.get(job_id)
+            if job is not None:
+                job.update(
+                    state="error",
+                    message="Monte Carlo failed",
+                    error=str(exc),
+                    finishedAt=time.time(),
+                )
+
+
+@app.callback(
+    Output("mc-job-store", "data"),
+    Output("mc-progress-modal", "style"),
+    Output("mc-progress-poll", "disabled"),
+    Output("run-mc", "disabled"),
+    Output("mc-progress-bar", "value"),
+    Output("mc-progress-message", "children"),
+    Output("mc-progress-count", "children"),
+    Output("mc-progress-percent", "children"),
+    Output("status", "children", allow_duplicate=True),
+    Output("status", "className", allow_duplicate=True),
+    Input("run-mc", "n_clicks"),
+    State("config-store", "data"), State("solution-store", "data"),
+    State("mc-paths", "value"), State("mc-q0", "value"), State("mc-seed", "value"),
+    prevent_initial_call=True,
+)
+def start_mc(_clicks, cfg, solution, paths, q0, seed):
+    if not cfg:
+        return (
+            no_update, {"display": "none"}, True, False, "0",
+            "Simulation not started", "0 / 0 paths", "0%",
+            "Solve the model first", "status error",
+        )
+    try:
+        paths = int(paths)
+        q0 = float(q0)
+        seed = int(seed)
+        if paths <= 0:
+            raise ValueError("Paths must be positive")
+    except Exception as exc:
+        return (
+            no_update, {"display": "none"}, True, False, "0",
+            "Simulation not started", "0 / 0 paths", "0%",
+            f"Monte Carlo failed · {exc}", "status error",
+        )
+
+    job_id = uuid.uuid4().hex
+    # Copy JSON-like callback state before handing it to a worker thread.
+    cfg_copy = deepcopy(cfg)
+    solution_copy = deepcopy(solution) if solution else None
+    with _MC_JOBS_LOCK:
+        _prune_finished_mc_jobs_locked()
+        _MC_JOBS[job_id] = {
+            "state": "running",
+            "completed": 0,
+            "total": paths,
+            "percent": 0,
+            "message": "Starting native simulation…",
+            "error": None,
+        }
+
+    worker = threading.Thread(
+        target=_run_mc_job,
+        args=(job_id, cfg_copy, solution_copy, paths, q0, seed),
+        name=f"mc-{job_id[:8]}",
+        daemon=True,
+    )
+    worker.start()
+    return (
+        job_id, {"display": "flex"}, False, True, "0",
+        "Starting native simulation…", f"0 / {paths:,} paths", "0%",
+        "Monte Carlo running…", "status running",
+    )
+
+
+@app.callback(
+    Output("mc-job-store", "data", allow_duplicate=True),
+    Output("mc-store", "data"), Output("stats-store", "data"),
+    Output("mc-progress-modal", "style", allow_duplicate=True),
+    Output("mc-progress-poll", "disabled", allow_duplicate=True),
+    Output("run-mc", "disabled", allow_duplicate=True),
+    Output("mc-progress-bar", "value", allow_duplicate=True),
+    Output("mc-progress-message", "children", allow_duplicate=True),
+    Output("mc-progress-count", "children", allow_duplicate=True),
+    Output("mc-progress-percent", "children", allow_duplicate=True),
+    Output("status", "children", allow_duplicate=True),
+    Output("status", "className", allow_duplicate=True),
+    Input("mc-progress-poll", "n_intervals"),
+    State("mc-job-store", "data"),
+    prevent_initial_call=True,
+)
+def poll_mc_progress(_ticks, job_id):
+    if not job_id:
+        return (
+            no_update, no_update, no_update, {"display": "none"}, True, False,
+            "0", "Simulation idle", "0 / 0 paths", "0%", no_update, no_update,
+        )
+
+    with _MC_JOBS_LOCK:
+        job = _MC_JOBS.get(str(job_id))
+        if job is None:
+            return (
+                None, no_update, no_update, {"display": "none"}, True, False,
+                "0", "Simulation state unavailable", "0 / 0 paths", "0%",
+                "Monte Carlo state unavailable", "status error",
+            )
+
+        state = str(job.get("state", "running"))
+        completed = int(job.get("completed", 0))
+        total = int(job.get("total", 0))
+        percent = int(job.get("percent", 0))
+        message = str(job.get("message", "Running Monte Carlo…"))
+
+        if state == "done":
+            mc = job.get("mc")
+            stats = job.get("stats")
+            # Do not remove the job here.  Multiple interval requests can be
+            # in flight concurrently while the large result is serialized.
+            # Returning the same completed payload is intentionally idempotent.
+            return (
+                None, mc, stats, {"display": "none"}, True, False,
+                "100", "Monte Carlo complete", f"{total:,} / {total:,} paths", "100%",
+                "Monte Carlo complete", "status ready",
+            )
+
+        if state == "error":
+            error = str(job.get("error") or "Unknown error")
+            # Keep terminal errors during the same grace period for the same
+            # reason: late polls should see a stable terminal state.
+            return (
+                None, no_update, no_update, {"display": "none"}, True, False,
+                str(percent), "Monte Carlo failed", f"{completed:,} / {total:,} paths", f"{percent}%",
+                f"Monte Carlo failed · {error}", "status error",
+            )
+
+    return (
+        no_update, no_update, no_update, {"display": "flex"}, False, True,
+        str(percent), message, f"{completed:,} / {total:,} paths", f"{percent}%",
+        f"Monte Carlo running · {percent}%", "status running",
+    )
 
 
 @app.callback(
@@ -2181,14 +2823,47 @@ def render_mc(mc, stats):
 
 
 @app.callback(
-    Output("path-pnl-chart", "figure"), Output("path-chart", "figure"), Output("spot-path-chart", "figure"),
-    Output("fill-counts-chart", "figure"), Output("fill-tape", "children"),
-    Input("mc-store", "data"), Input("path-select", "value"), Input("path-size-select", "value"),
+    Output("mc-rfq-tier-select", "options"), Output("mc-rfq-tier-select", "value"),
     Input("solution-store", "data"), Input("config-store", "data"),
 )
-def render_path(mc, path_index, quote_size, solution, cfg):
+def update_mc_rfq_validation_tiers(solution, cfg):
+    if not solution or not cfg:
+        return [], None
+    options = [
+        {"label": str(tier.get("name", f"Tier {i + 1}")), "value": i}
+        for i, tier in enumerate(solution.get("tiers", []))
+    ]
+    return options, (0 if options else None)
+
+
+@app.callback(
+    Output("mc-rfq-arrival-validation-chart", "figure"),
+    Output("mc-rfq-win-validation-chart", "figure"),
+    Output("mc-rfq-inventory-validation-chart", "figure"),
+    Input("mc-store", "data"), Input("solution-store", "data"), Input("config-store", "data"),
+    Input("mc-rfq-tier-select", "value"),
+)
+def render_mc_rfq_validation(mc, solution, cfg, tier_index):
+    if not mc or not solution or not cfg or tier_index is None:
+        return go.Figure(), go.Figure(), go.Figure()
+    try:
+        return mc_rfq_validation_figures(mc, solution, cfg, int(tier_index))
+    except Exception as exc:
+        empty = go.Figure()
+        empty.add_annotation(text=f"RFQ validation unavailable · {exc}", showarrow=False)
+        empty.update_layout(template="trinity_dark")
+        return empty, empty, empty
+
+
+@app.callback(
+    Output("path-pnl-chart", "figure"), Output("path-chart", "figure"), Output("spot-path-chart", "figure"),
+    Output("fill-counts-chart", "figure"), Output("rfq-realized-hit-chart", "figure"), Output("fill-tape", "children"),
+    Input("mc-store", "data"), Input("path-select", "value"), Input("path-size-select", "value"),
+    Input("fill-tier-metric", "value"), Input("solution-store", "data"), Input("config-store", "data"),
+)
+def render_path(mc, path_index, quote_size, fill_tier_metric, solution, cfg):
     if not mc or path_index is None or not mc.get("samplePaths"):
-        return go.Figure(), go.Figure(), go.Figure(), go.Figure(), "No retained path"
+        return go.Figure(), go.Figure(), go.Figure(), go.Figure(), go.Figure(), "No retained path"
     path = mc["samplePaths"][int(path_index)]
 
     # Exact retained-path mark-to-market PnL. Cash is stored by the native
@@ -2327,12 +3002,16 @@ def render_path(mc, path_index, quote_size, solution, cfg):
                     float(e.get("quoteDepthPips", e.get("depthPips", np.nan))),
                     float(e.get("tradePrice", np.nan)),
                     bool(e.get("quoteActive", False)),
+                    float(e.get("sourceTradeSize", np.nan)),
+                    float(e.get("targetFillSize", 0.0)),
                 ] for e in chosen],
                 hovertemplate=(
                     "%{x|%H:%M:%S}<br>%{customdata[0]} ECN %{customdata[1]} trade · %{customdata[2]}"
                     "<br>plot px=%{y:.6f}<br>trade px=%{customdata[5]:.6f}"
                     "<br>target-equivalent trade distance=%{customdata[3]:.2f} pips"
                     "<br>master quote depth=%{customdata[4]:.2f} pips"
+                    "<br>source parent size=%{customdata[7]:.3f}M"
+                    "<br>target fill size=%{customdata[8]:.3f}M"
                     "<br>quote active=%{customdata[6]}<extra></extra>"
                 ),
             )
@@ -2369,16 +3048,94 @@ def render_path(mc, path_index, quote_size, solution, cfg):
     )
     apply_session_clock_axis(spot_fig)
 
-    counts: dict[tuple[str,str], int] = {}
-    tier_order=[]
-    for f in path.get("fills", []):
-        tier=str(f["tier"]); side=str(f["side"]).lower()
-        if tier not in tier_order: tier_order.append(tier)
-        counts[(tier,side)] = counts.get((tier,side),0)+1
+    # Long-run fill composition comes from compact population aggregates built
+    # over every Monte Carlo path.  Retained paths are only for the interactive
+    # time-series diagnostics above and must not drive model-validation shares.
+    fill_metric = "volume" if fill_tier_metric == "volume" else "count"
+    fill_aggregates = list(mc.get("fillAggregates", []))
+    fills_by_tier_side: dict[tuple[str, str], float] = {}
+    tier_order = []
+    for aggregate in fill_aggregates:
+        tier = str(aggregate.get("tier", ""))
+        side = str(aggregate.get("side", "")).lower()
+        if tier and tier not in tier_order:
+            tier_order.append(tier)
+        raw_value = (
+            float(aggregate.get("volume", 0.0))
+            if fill_metric == "volume"
+            else float(aggregate.get("tradeCount", 0.0))
+        )
+        fills_by_tier_side[(tier, side)] = raw_value
+
+    fill_total = sum(fills_by_tier_side.values())
+
     fill_counts = go.Figure()
-    for side in ("bid","ask"):
-        fill_counts.add_trace(go.Bar(x=tier_order,y=[counts.get((tier,side),0) for tier in tier_order],name=side.capitalize(), marker_color=BID_COLOR if side == "bid" else ASK_COLOR))
-    fill_counts.update_layout(title="Fills by tier and side",xaxis_title="Tier",yaxis_title="Fill count",barmode="group",template="trinity_dark")
+    for side in ("bid", "ask"):
+        raw_values = [fills_by_tier_side.get((tier, side), 0.0) for tier in tier_order]
+        shares = [value / fill_total if fill_total > 0.0 else 0.0 for value in raw_values]
+        fill_counts.add_trace(go.Bar(
+            x=tier_order,
+            y=shares,
+            name=side.capitalize(),
+            marker_color=BID_COLOR if side == "bid" else ASK_COLOR,
+            customdata=np.asarray(raw_values, dtype=float),
+            hovertemplate=(
+                "%{x}<br>Side=" + side.capitalize()
+                + "<br>Share=%{y:.1%}<br>Executed volume=%{customdata:,.3f}M<extra></extra>"
+                if fill_metric == "volume"
+                else "%{x}<br>Side=" + side.capitalize()
+                + "<br>Share=%{y:.1%}<br>Trades=%{customdata:,.0f}<extra></extra>"
+            ),
+        ))
+    fill_counts.update_layout(
+        title="Fills by tier and side · all simulated paths",
+        xaxis_title="Tier",
+        yaxis_title="Share of executed volume" if fill_metric == "volume" else "Share of trades",
+        barmode="group",
+        template="trinity_dark",
+    )
+    fill_counts.update_yaxes(tickformat=".0%", rangemode="tozero")
+    if not fill_aggregates:
+        fill_counts.add_annotation(
+            text="No population fill aggregates · rebuild the native extension",
+            showarrow=False,
+        )
+
+    # Realized customer RFQ hit ratio over the complete Monte Carlo population.
+    # Tier and side remain pooled, matching the business question: what fraction
+    # of all simulated RFQs of this size did we actually win?
+    rfq_aggregates = sorted(
+        list(mc.get("rfqAggregates", [])), key=lambda row: float(row.get("size", 0.0))
+    )
+    rfq_hit = go.Figure()
+    if rfq_aggregates:
+        rfq_sizes = [float(row.get("size", 0.0)) for row in rfq_aggregates]
+        wins = [int(row.get("wins", 0)) for row in rfq_aggregates]
+        requests = [int(row.get("requests", 0)) for row in rfq_aggregates]
+        hit_ratios = [w / n if n else 0.0 for w, n in zip(wins, requests)]
+        rfq_hit.add_trace(go.Bar(
+            x=rfq_sizes,
+            y=hit_ratios,
+            name="Realized hit ratio",
+            customdata=np.column_stack([wins, requests]),
+            hovertemplate=(
+                "RFQ size=%{x:g}M<br>Hit ratio=%{y:.1%}"
+                "<br>Won=%{customdata[0]:.0f} / %{customdata[1]:.0f}<extra></extra>"
+            ),
+        ))
+    else:
+        rfq_hit.add_annotation(
+            text="No population RFQ aggregates · rebuild the native extension",
+            showarrow=False,
+        )
+    rfq_hit.update_layout(
+        title="Realized RFQ hit ratio by size · all simulated paths",
+        xaxis_title="RFQ size [M]",
+        yaxis_title="Won RFQs / total RFQs",
+        yaxis_range=[0, 1],
+        template="trinity_dark",
+    )
+    rfq_hit.update_yaxes(tickformat=".0%")
 
     header = html.Thead(html.Tr([html.Th(x) for x in ["Time", "Tier", "Side", "Size", "Price", "q before", "q after"]]))
     rows = []
@@ -2388,7 +3145,7 @@ def render_path(mc, path_index, quote_size, solution, cfg):
             html.Td(f"{f['price']:.6f}"), html.Td(f"{f['inventoryBefore']:.2f}"), html.Td(f"{f['inventoryAfter']:.2f}"),
         ]))
     table = html.Table([header, html.Tbody(rows or [html.Tr(html.Td("No fills", colSpan=7))])], className="data-table")
-    return pnl_fig, fig, spot_fig, fill_counts, table
+    return pnl_fig, fig, spot_fig, fill_counts, rfq_hit, table
 
 
 @app.callback(

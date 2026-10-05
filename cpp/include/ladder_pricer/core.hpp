@@ -40,16 +40,17 @@ public:
     LogisticFlow(double a0, double theta, double beta, double shift,
                  double steepness, double volume_shift);
 
-    // Exogenous customer RFQ arrival intensity for this size [RFQs/min].
-    double scale(double size) const;
-    double rfq_arrival_rate(double size) const { return scale(size); }
+    // A0 is the scale of the calibrated exogenous RFQ-arrival intensity
+    // curve for one customer side.  For source-currency size z,
+    // lambda_RFQ(z) = A0 * z^(-theta-beta*z).  FlowSource uses this same curve
+    // both as the HJB size-specific exogenous intensity and, after
+    // normalization across configured RFQ rungs, as the Monte Carlo size PMF.
+    double size_weight(double size) const;
+    double rfq_arrival_rate(double size) const;
     double center(double size) const;
     // Probability that our quote wins a customer RFQ.
     double hit_ratio(double delta, double size) const;
     double win_probability(double delta, double size) const { return hit_ratio(delta, size); }
-    // Derived won-trade intensity = RFQ arrival intensity × win probability.
-    // Kept for the HJB / analytics code, which currently works directly with won fills.
-    double arrival_rate(double delta, double size) const;
     double optimal_delta(double size, double spread, double additive_value) const;
 
     double a0() const noexcept { return a0_; }
@@ -83,6 +84,11 @@ public:
 
     double implied_delta(double target_delta) const noexcept;
     double source_size(double target_size) const noexcept;
+    void configure_target_sizes(const std::vector<double>& target_sizes);
+    const std::vector<double>& target_sizes() const noexcept { return target_sizes_; }
+    const std::vector<double>& size_probabilities() const noexcept { return size_probabilities_; }
+    double total_rfq_rate() const noexcept { return total_rfq_rate_; }
+    std::size_t sample_target_size_index(std::mt19937_64& rng) const;
     double rfq_arrival_rate(double target_size) const;
     double win_probability(double target_delta, double target_size) const;
     double arrival_rate(double target_delta, double target_size) const;
@@ -94,6 +100,9 @@ private:
     LogisticFlow flow_;
     double delta_scale_;
     double source_size_per_target_;
+    std::vector<double> target_sizes_;
+    std::vector<double> size_probabilities_;
+    double total_rfq_rate_ = 0.0;
 };
 
 class AggregatedFlow {
@@ -102,6 +111,7 @@ public:
     explicit AggregatedFlow(std::vector<FlowSource> sources);
 
     const std::vector<FlowSource>& sources() const noexcept { return sources_; }
+    void configure_target_sizes(const std::vector<double>& target_sizes);
     double rfq_arrival_rate(double target_size) const;
     double win_probability(double target_delta, double target_size) const;
     double arrival_rate(double target_delta, double target_size) const;
@@ -162,13 +172,17 @@ class Tier {
 public:
     Tier(std::string name, std::vector<double> sizes, LogisticFlow flow,
          SaturatingMarkout markout, bool use_markout,
-         double delta_min, double delta_max, double fee = 0.0);
+         double delta_min, double delta_max, double fee = 0.0,
+         double rfq_size_step = 1.0);
     Tier(std::string name, std::vector<double> sizes, AggregatedFlow flow,
          SaturatingMarkout markout, bool use_markout,
-         double delta_min, double delta_max, double fee = 0.0);
+         double delta_min, double delta_max, double fee = 0.0,
+         double rfq_size_step = 1.0);
 
     const std::string& name() const noexcept { return name_; }
     const std::vector<double>& sizes() const noexcept { return sizes_; }
+    const std::vector<double>& rfq_sizes() const noexcept { return rfq_sizes_; }
+    double rfq_size_step() const noexcept { return rfq_size_step_; }
     const AggregatedFlow& flow() const noexcept { return flow_; }
     const SaturatingMarkout& markout() const noexcept { return markout_; }
     bool use_markout() const noexcept { return use_markout_; }
@@ -179,6 +193,8 @@ public:
 private:
     std::string name_;
     std::vector<double> sizes_;
+    std::vector<double> rfq_sizes_;
+    double rfq_size_step_ = 1.0;
     AggregatedFlow flow_;
     SaturatingMarkout markout_;
     bool use_markout_;
@@ -256,12 +272,20 @@ private:
 class ECNFlowSource {
 public:
     ECNFlowSource(std::string name, ExponentialFlow flow,
-                  double delta_scale = 1.0, double source_size_per_target = 1.0);
+                  double delta_scale = 1.0, double source_size_per_target = 1.0,
+                  double mean_trade_size = 1.0);
 
     const std::string& name() const noexcept { return name_; }
     const ExponentialFlow& flow() const noexcept { return flow_; }
     double delta_scale() const noexcept { return delta_scale_; }
     double source_size_per_target() const noexcept { return source_size_per_target_; }
+    // Mean of the exponential parent-trade size distribution, measured in
+    // millions of the source pair's base currency.
+    double mean_trade_size() const noexcept { return mean_trade_size_; }
+    // Same mean expressed in target-pair base-currency millions.
+    double mean_target_trade_size() const noexcept {
+        return mean_trade_size_ / source_size_per_target_;
+    }
 
     // Map the target-pair master delta into the source-pair quote.  The same
     // affine convention is used by customer Tier flow sources:
@@ -273,11 +297,24 @@ public:
     // into the equivalent target-pair reach X_target.
     double target_reach(double source_reach) const noexcept;
 
+    // Parent ECN trade size is exponential and independent of price reach.
+    // Our realized target-pair fill is min(X_target, target_posted_size).  The
+    // methods below expose the capped distribution. fill_components() returns
+    // probability-weighted representative sizes. If breakpoints are supplied,
+    // each continuous interval is represented by its exact conditional mean;
+    // this makes expectations exact for piecewise-linear value interpolation.
+    double full_fill_probability(double target_posted_size) const;
+    double expected_fill_size(double target_posted_size) const;
+    std::vector<std::pair<double, double>> fill_components(
+        double target_posted_size,
+        const std::vector<double>& target_breakpoints = {}) const;
+
 private:
     std::string name_;
     ExponentialFlow flow_;
     double delta_scale_;
     double source_size_per_target_;
+    double mean_trade_size_;
 };
 
 class AggregatedECNFlow {

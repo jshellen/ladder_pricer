@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from copy import deepcopy
 import threading
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from . import _native
 
 
-_EXPECTED_ECN_PARAMETERIZATION_VERSION = 3
+_EXPECTED_ECN_PARAMETERIZATION_VERSION = 8
 if getattr(_native, "ECN_PARAMETERIZATION_VERSION", None) != _EXPECTED_ECN_PARAMETERIZATION_VERSION:
     raise RuntimeError(
         "The compiled trinity._native extension is stale. Rebuild it with "
@@ -43,11 +43,12 @@ class Engine:
         seed: int = 12345,
         retained_paths: int = 6,
         sample_points: int = 191,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             return self._native.simulate(
                 float(horizon_minutes), int(paths), float(initial_inventory), int(seed),
-                int(retained_paths), int(sample_points),
+                int(retained_paths), int(sample_points), progress_callback,
             )
 
     def frontier(

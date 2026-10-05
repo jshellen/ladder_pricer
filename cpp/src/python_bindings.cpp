@@ -40,6 +40,11 @@ std::vector<double> numbers(const py::handle& value) {
     return py::cast<std::vector<double>>(value);
 }
 
+std::vector<double> optional_numbers(const py::dict& object, const char* key) {
+    const py::str k(key);
+    return object.contains(k) ? numbers(object[k]) : std::vector<double>{};
+}
+
 std::vector<double> build_grid(const py::dict& spec) {
     const std::string mode = text(spec, "mode");
     if (mode != "uniform") {
@@ -66,15 +71,72 @@ std::vector<double> build_grid(const py::dict& spec) {
 }
 
 
-LogisticFlow build_logistic_flow(const py::dict& flow) {
-    return LogisticFlow(number(flow, "A0"), number(flow, "theta"), number(flow, "beta"),
+
+std::vector<double> rfq_size_support(const std::vector<double>& pricing_sizes, double step) {
+    if (pricing_sizes.empty()) throw std::invalid_argument("tier sizes must not be empty");
+    if (!(step > 0.0) || !std::isfinite(step)) {
+        throw std::invalid_argument("RFQ size step must be positive");
+    }
+    const double lo = pricing_sizes.front();
+    const double hi = pricing_sizes.back();
+    std::vector<double> out;
+    for (std::size_t n = 0;; ++n) {
+        const double z = lo + static_cast<double>(n) * step;
+        if (z > hi + 1e-10) break;
+        out.push_back(std::min(z, hi));
+    }
+    if (out.empty() || std::abs(out.back() - hi) > 1e-10) out.push_back(hi);
+    out.insert(out.end(), pricing_sizes.begin(), pricing_sizes.end());
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end(), [](double a, double b) {
+        return std::abs(a - b) <= 1e-10;
+    }), out.end());
+    return out;
+}
+
+double a0_from_total_rfq_rate(const py::dict& flow,
+                                  const std::vector<double>& target_sizes,
+                                  double source_size_per_target) {
+    // Compatibility with the short-lived totalRfqRate config format.  The
+    // calibrated model uses lambda_side(z)=A0*z^(-theta-beta*z); therefore a
+    // pooled two-sided total rate Lambda implies
+    // A0 = Lambda / (2 * sum_j shape(z_j)).
+    const double total_rate = number(flow, "totalRfqRate");
+    const double theta = number(flow, "theta");
+    const double beta = number(flow, "beta");
+    double shape_mass = 0.0;
+    for (double target_size : target_sizes) {
+        const double source_size = target_size * source_size_per_target;
+        shape_mass += std::pow(source_size, -theta - beta * source_size);
+    }
+    if (!(shape_mass > 0.0)) {
+        throw std::invalid_argument("RFQ arrival-intensity shape must have positive mass");
+    }
+    return total_rate / (2.0 * shape_mass);
+}
+
+LogisticFlow build_logistic_flow(const py::dict& flow,
+                                 const std::vector<double>& target_sizes,
+                                 double source_size_per_target = 1.0) {
+    const py::str a0_key("A0");
+    const double a0 = flow.contains(a0_key)
+        ? py::cast<double>(flow[a0_key])
+        : a0_from_total_rfq_rate(flow, target_sizes, source_size_per_target);
+    return LogisticFlow(a0, number(flow, "theta"), number(flow, "beta"),
                         number(flow, "shift"), number(flow, "steepness"), number(flow, "volumeShift"));
 }
 
 AggregatedFlow build_tier_flow(const py::dict& tier, double target_spread_pips) {
+    const std::vector<double> pricing_sizes = numbers(tier[py::str("sizes")]);
+    const std::vector<double> target_sizes = rfq_size_support(
+        pricing_sizes, optional_number(tier, "rfqSizeStep", 1.0));
     const py::str sources_key("flowSources");
     if (!tier.contains(sources_key)) {
-        return AggregatedFlow(build_logistic_flow(py::cast<py::dict>(tier[py::str("flow")])));
+        const py::dict flow = py::cast<py::dict>(tier[py::str("flow")]);
+        std::vector<FlowSource> direct;
+        direct.emplace_back(
+            "direct", build_logistic_flow(flow, target_sizes), 1.0, 1.0);
+        return AggregatedFlow(std::move(direct));
     }
 
     std::vector<FlowSource> sources;
@@ -109,7 +171,9 @@ AggregatedFlow build_tier_flow(const py::dict& tier, double target_spread_pips) 
                 throw std::invalid_argument("flow source mapping type must be identity, crossed, or affine");
             }
         }
-        sources.emplace_back(name, build_logistic_flow(flow), delta_scale, source_size_per_target);
+        sources.emplace_back(
+            name, build_logistic_flow(flow, target_sizes, source_size_per_target),
+            delta_scale, source_size_per_target);
     }
     return AggregatedFlow(std::move(sources));
 }
@@ -129,7 +193,11 @@ AggregatedECNFlow build_ecn_flow(const py::dict& cfg, double target_spread_pips)
     const py::str sources_key("flowSources");
     if (!cfg.contains(sources_key)) {
         const py::dict flow = py::cast<py::dict>(cfg[py::str("flow")]);
-        return AggregatedECNFlow(ExponentialFlow(number(flow, "A"), number(flow, "k")));
+        std::vector<ECNFlowSource> direct;
+        direct.emplace_back(
+            "direct", ExponentialFlow(number(flow, "A"), number(flow, "k")),
+            1.0, 1.0, optional_number(cfg, "meanTradeSize", 1.0));
+        return AggregatedECNFlow(std::move(direct));
     }
 
     std::vector<ECNFlowSource> sources;
@@ -166,7 +234,8 @@ AggregatedECNFlow build_ecn_flow(const py::dict& cfg, double target_spread_pips)
         }
         sources.emplace_back(
             name, ExponentialFlow(number(flow, "A"), number(flow, "k")),
-            delta_scale, source_size_per_target);
+            delta_scale, source_size_per_target,
+            optional_number(source, "meanTradeSize", 1.0));
     }
     return AggregatedECNFlow(std::move(sources));
 }
@@ -192,7 +261,8 @@ PricingProblem build_problem(const py::dict& cfg, std::optional<double> gamma_ov
             SaturatingMarkout(number(markout, "impactScalePips") / 10000.0,
                               number(markout, "sizeExponent"), number(markout, "tauMinutes")),
             boolean(tier, "useMarkout"), number(tier, "deltaMin"), number(tier, "deltaMax"),
-            optional_number(tier, "feePips", 0.0) / 10000.0);
+            optional_number(tier, "feePips", 0.0) / 10000.0,
+            optional_number(tier, "rfqSizeStep", 1.0));
     }
     if (tiers.empty() && !boolean(py::cast<py::dict>(cfg[py::str("darkPool")]), "enabled")
         && !boolean(py::cast<py::dict>(cfg[py::str("passiveEcn")]), "enabled")) {
@@ -284,6 +354,10 @@ py::dict solution_value(const Solution& solution, const PricingProblem& problem)
             item["k"] = source.flow().k();
             item["deltaScale"] = source.delta_scale();
             item["sourceSizePerTarget"] = source.source_size_per_target();
+            item["meanTradeSize"] = source.mean_trade_size();
+            item["meanTargetTradeSize"] = source.mean_target_trade_size();
+            item["fullFillProbability"] = source.full_fill_probability(venue.quote_size());
+            item["expectedFillSize"] = source.expected_fill_size(venue.quote_size());
             std::vector<double> source_rates;
             source_rates.reserve(venue.deltas().size());
             for (double delta : venue.deltas()) source_rates.push_back(source.arrival_rate(delta));
@@ -323,6 +397,18 @@ py::dict fill_value(const FillEvent& fill) {
 }
 
 
+py::dict rfq_event_value(const RfqEvent& event) {
+    py::dict out;
+    out["time"] = event.time_minutes;
+    out["tier"] = event.tier;
+    out["side"] = event.side;
+    out["size"] = event.size;
+    out["delta"] = event.delta;
+    out["winProbability"] = event.win_probability;
+    out["won"] = event.won;
+    return out;
+}
+
 py::dict ecn_arrival_value(const EcnArrivalEvent& event) {
     py::dict out;
     out["time"] = event.time_minutes;
@@ -334,8 +420,60 @@ py::dict ecn_arrival_value(const EcnArrivalEvent& event) {
     out["quoteDepthPips"] = event.quote_depth_pips;
     // Backward-compatible alias used by older UI code.
     out["depthPips"] = event.quote_depth_pips;
+    out["sourceTradeSize"] = event.source_trade_size;
+    out["targetFillSize"] = event.target_fill_size;
     out["quoteActive"] = event.quote_active;
     out["won"] = event.won;
+    return out;
+}
+
+py::dict fill_aggregate_value(const FillAggregate& aggregate) {
+    py::dict out;
+    out["tier"] = aggregate.tier;
+    out["side"] = aggregate.side;
+    out["tradeCount"] = aggregate.trade_count;
+    out["volume"] = aggregate.volume;
+    return out;
+}
+
+py::dict rfq_aggregate_value(const RfqAggregate& aggregate) {
+    py::dict out;
+    out["size"] = aggregate.size;
+    out["wins"] = aggregate.wins;
+    out["requests"] = aggregate.requests;
+    return out;
+}
+
+py::dict rfq_tier_size_aggregate_value(const RfqTierSizeAggregate& aggregate) {
+    py::dict out;
+    out["tier"] = aggregate.tier;
+    out["size"] = aggregate.size;
+    out["wins"] = aggregate.wins;
+    out["requests"] = aggregate.requests;
+    return out;
+}
+
+py::dict rfq_delta_aggregate_value(const RfqDeltaAggregate& aggregate) {
+    py::dict out;
+    out["tier"] = aggregate.tier;
+    out["size"] = aggregate.size;
+    out["delta"] = aggregate.delta;
+    out["wins"] = aggregate.wins;
+    out["requests"] = aggregate.requests;
+    out["admissibleRequests"] = aggregate.admissible_requests;
+    out["expectedWins"] = aggregate.expected_wins;
+    return out;
+}
+
+py::dict rfq_inventory_aggregate_value(const RfqInventoryAggregate& aggregate) {
+    py::dict out;
+    out["tier"] = aggregate.tier;
+    out["side"] = aggregate.side;
+    out["size"] = aggregate.size;
+    out["inventory"] = aggregate.inventory;
+    out["wins"] = aggregate.wins;
+    out["requests"] = aggregate.requests;
+    out["expectedWins"] = aggregate.expected_wins;
     return out;
 }
 
@@ -348,6 +486,9 @@ py::dict path_value(const SamplePath& path) {
     py::list fills;
     for (const auto& fill : path.fills) fills.append(fill_value(fill));
     out["fills"] = std::move(fills);
+    py::list rfq_events;
+    for (const auto& event : path.rfq_events) rfq_events.append(rfq_event_value(event));
+    out["rfqEvents"] = std::move(rfq_events);
     py::list ecn_arrivals;
     for (const auto& event : path.ecn_arrivals) ecn_arrivals.append(ecn_arrival_value(event));
     out["ecnArrivals"] = std::move(ecn_arrivals);
@@ -365,6 +506,31 @@ py::dict monte_carlo_value(const MonteCarloResult& result) {
     out["inventoryLower"] = result.inventory_lower;
     out["inventoryMedian"] = result.inventory_median;
     out["inventoryUpper"] = result.inventory_upper;
+    py::list fill_aggregates;
+    for (const auto& aggregate : result.fill_aggregates) {
+        fill_aggregates.append(fill_aggregate_value(aggregate));
+    }
+    out["fillAggregates"] = std::move(fill_aggregates);
+    py::list rfq_aggregates;
+    for (const auto& aggregate : result.rfq_aggregates) {
+        rfq_aggregates.append(rfq_aggregate_value(aggregate));
+    }
+    out["rfqAggregates"] = std::move(rfq_aggregates);
+    py::list rfq_tier_size_aggregates;
+    for (const auto& aggregate : result.rfq_tier_size_aggregates) {
+        rfq_tier_size_aggregates.append(rfq_tier_size_aggregate_value(aggregate));
+    }
+    out["rfqTierSizeAggregates"] = std::move(rfq_tier_size_aggregates);
+    py::list rfq_delta_aggregates;
+    for (const auto& aggregate : result.rfq_delta_aggregates) {
+        rfq_delta_aggregates.append(rfq_delta_aggregate_value(aggregate));
+    }
+    out["rfqDeltaAggregates"] = std::move(rfq_delta_aggregates);
+    py::list rfq_inventory_aggregates;
+    for (const auto& aggregate : result.rfq_inventory_aggregates) {
+        rfq_inventory_aggregates.append(rfq_inventory_aggregate_value(aggregate));
+    }
+    out["rfqInventoryAggregates"] = std::move(rfq_inventory_aggregates);
     py::list paths;
     for (const auto& path : result.sample_paths) paths.append(path_value(path));
     out["samplePaths"] = std::move(paths);
@@ -401,15 +567,28 @@ public:
     }
 
     py::dict simulate(double horizon_minutes, int paths, double initial_inventory,
-                      std::uint64_t seed, int retained_paths = 6, int sample_points = 191) {
+                      std::uint64_t seed, int retained_paths = 6, int sample_points = 191,
+                      py::object progress_callback = py::none()) {
         ensure_solved();
         const double sigma = number(config_, "sigmaPips") / 10000.0;
         MonteCarloResult result;
+
+        std::function<void(int, int)> progress;
+        if (!progress_callback.is_none()) {
+            py::function callback = py::reinterpret_borrow<py::function>(progress_callback);
+            progress = [callback](int completed, int total) {
+                // The numerical loop runs without the GIL. Reacquire it only for
+                // the sparse progress notifications exposed to the Dash worker.
+                py::gil_scoped_acquire acquire;
+                callback(completed, total);
+            };
+        }
+
         {
             py::gil_scoped_release release;
             result = MonteCarloSimulator(problem_, *solution_, reference_spot_)
                          .run(horizon_minutes, paths, sigma, initial_inventory, seed,
-                              retained_paths, sample_points);
+                              retained_paths, sample_points, progress);
         }
         return monte_carlo_value(result);
     }
@@ -477,7 +656,7 @@ private:
 
 PYBIND11_MODULE(_native, module) {
     module.doc() = "C++ Howard pricing engine";
-    module.attr("ECN_PARAMETERIZATION_VERSION") = 3;
+    module.attr("ECN_PARAMETERIZATION_VERSION") = 8;
     py::class_<ladder_pricer::python::Engine>(module, "Engine")
         .def(py::init<py::dict>())
         .def("solve", &ladder_pricer::python::Engine::solve)
@@ -485,7 +664,8 @@ PYBIND11_MODULE(_native, module) {
              py::arg("horizon_minutes"), py::arg("initial_inventory") = 0.0)
         .def("simulate", &ladder_pricer::python::Engine::simulate,
              py::arg("horizon_minutes"), py::arg("paths"), py::arg("initial_inventory"),
-             py::arg("seed"), py::arg("retained_paths") = 6, py::arg("sample_points") = 191)
+             py::arg("seed"), py::arg("retained_paths") = 6, py::arg("sample_points") = 191,
+             py::arg("progress_callback") = py::none())
         .def("frontier", &ladder_pricer::python::Engine::frontier,
              py::arg("gamma_values"), py::arg("horizon_minutes"),
              py::arg("initial_inventory") = 0.0);

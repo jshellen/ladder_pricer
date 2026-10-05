@@ -50,7 +50,9 @@ config["tiers"][0]["flowSources"] = [
     {
         "name": "USDSEK",
         "flow": {
-            "A0": 0.010,
+            # One-sided exogenous RFQ intensity curve
+            # lambda_RFQ(z) = A0 * z^(-theta-beta*z).
+            "A0": 0.02,
             "theta": 0.20,
             "beta": 0.08,
             "steepness": 7.0,
@@ -73,10 +75,13 @@ source_delta = 0.5 + delta_scale * (target_delta - 0.5)
 delta_scale  = target_spread / (cross_mid * source_spread)
 ```
 
-and a target EUR-equivalent size `z` is evaluated on the source flow curve at
-`source_size = cross_mid * z`. The aggregate won-trade intensity is the sum of the
-pair-specific won-trade intensities. The Monte Carlo RFQ clock likewise sums source RFQ
-arrival rates and uses their RFQ-rate-weighted aggregate win probability.
+and a target EUR-equivalent size `z` is evaluated on the source hit-ratio curve at
+`source_size = cross_mid * z`. The calibrated exogenous intensity curve itself defines the
+RFQ-size distribution. Customer RFQ sizes are independent of the pricing-control knots:
+by default Monte Carlo evaluates the curve on a 1M grid from the smallest to the largest
+pricing size, normalizes those values into probabilities, and samples the requested size
+from that full support.  Quotes for customer sizes between pricing knots are obtained by
+linear interpolation of the neighboring prices.
 
 Because several transformed logistic curves no longer have the single-curve Lambert-W
 optimum, aggregated tiers use a bounded one-dimensional numerical quote optimization.
@@ -121,9 +126,10 @@ the same-side touch and `d=0.5` is mid. If `S` is the full spread, the quote dep
 is `S * (0.5-d)`.
 
 The ECN can now aggregate several streamed FX pairs into one target-risk quote control. The
-direct target pair and every crossed ECN source have their own exponential curve
-`lambda_s(d_s)=A_s exp(-k_s(0.5-d_s))`. The optimizer still chooses only one master target-pair
-delta `d`. For a crossed source,
+direct target pair and every crossed ECN source have their own exponential price-reach curve
+`lambda_s(d_s)=A_s exp(-k_s(0.5-d_s))` and their own exponential parent-trade size distribution.
+`meanTradeSize` is the mean parent size in millions of the source pair's base currency. The
+optimizer still chooses only one master target-pair delta `d`. For a crossed source,
 
 ```text
 d_source   = 0.5 + alpha * (d_target - 0.5)
@@ -132,21 +138,29 @@ sourceSize = cross_mid * targetSize
 ```
 
 so EURSEK can be the master quote while USDSEK and GBPSEK inherit economically equivalent
-quotes derived through EURUSD and EURGBP. The HJB fill intensity is the sum of the mapped
-source-specific intensities. Because the target-equivalent execution edge and inventory jump
-are common across sources, this is exactly the sum of their source Hamiltonians when the ECN
-maker fee is shared. Monte Carlo keeps the source clocks separate: source `s` has parent
-trade intensity `A_s`, source reach `X_s ~ Exp(k_s)`, and a fill occurs when
-`X_s >= alpha_s * (0.5-d_target)`. Retained paths record which ECN source generated each
-arrival and fill.
+quotes derived through EURUSD and EURGBP. If `V_s` is the source-pair parent trade size and
+`c_s = sourceSizePerTarget`, the target-equivalent executed size is
+
+```text
+V_s ~ Exp(mean = meanTradeSize_s)
+fill_target = min(V_s, c_s * quoteSize_target) / c_s
+```
+
+so a posted 1M target quote may fill by any smaller positive amount but can never fill above
+1M. The HJB integrates each source's capped size distribution when evaluating continuation
+value, spread capture and fees. Monte Carlo samples the same distribution directly. Source
+`s` still has parent trade intensity `A_s`, independent price reach `X_s ~ Exp(k_s)`, and the
+quote is hit when `X_s >= alpha_s * (0.5-d_target)`. Retained paths record the source parent
+trade size and realized target fill size for ECN arrivals.
 
 The optimizer evaluates `NONE` plus a 0.01 grid between configurable `minDelta` and `maxDelta`,
 defaulting to 0.00 and 0.50. One 0.01 step is one percentage point of spread. At every
 inventory state the Howard improvement compares `NONE` with every allowed delta. ECN quotes
 are hedge-only: positive inventory may only post an ask, negative inventory may only post a
-bid, flat inventory posts nothing, and a fill is never allowed to cross through zero and
-create risk on the opposite side. A passive ECN fill at target delta `d` earns
-`size * (spread * (0.5-d) - maker fee)` before continuation-value effects.
+bid, flat inventory posts nothing, and the posted size itself must be risk reducing so no
+realized partial or full fill can cross through zero and create opposite-side risk. A realized
+passive ECN fill of size `v` at target delta `d` earns
+`v * (spread * (0.5-d) - maker fee)` before continuation-value effects.
 
 ### Monte Carlo
 
@@ -157,6 +171,11 @@ create risk on the opposite side. A passive ECN fill at target delta `d` earns
 - retained path inventory and spot/fill plots;
 - retained spot paths evolve on an internal one-second market clock even between fills;
 - separate event/spot RNG streams keep fills and PnL invariant to UI sampling density;
+- a modal progress bar reports genuinely completed native paths during long runs;
+- fill composition is aggregated over every simulated path and shown as percentage
+  shares of all trades or all executed volume by tier/venue and side;
+- realized RFQ hit ratios pool wins and RFQ requests over every simulated path for
+  each RFQ size, rather than relying on the small retained-path sample;
 - fill tape.
 
 ## Monte Carlo market clock
@@ -355,14 +374,73 @@ mechanism. The previous geometric fill-size model has been removed.
 
 ## Customer RFQs in Monte Carlo
 
-Customer tiers are simulated as a two-stage RFQ process.  For each tier, side,
-and requested size `z`, RFQs arrive exogenously at
-`lambda_RFQ(z) = A0 * z^(-theta - beta*z)`.  Once an RFQ arrives, the current
-quote determines the conditional win probability through the logistic curve.
-Only a won RFQ changes inventory and cash.  The RFQ markout shock is applied on
-every RFQ, including lost RFQs; for a won RFQ, inventory/cash are updated before
-the markout is applied.  The product `lambda_RFQ(z) * p_win(delta,z)` remains
-the won-trade intensity used by the current HJB/closed-form policy machinery.
+The **exogenous RFQ-arrival intensity curve itself defines the RFQ-size density**. For each
+customer flow source `s`, the calibrated one-sided curve is
+
+```text
+lambda_RFQ,s(z) = A0_s * z^(-theta_s - beta_s*z).
+```
+
+Pricing sizes and customer RFQ sizes are deliberately separate.  A tier can, for example,
+optimize prices only at
+
+```text
+pricing knots = {1, 2, 3, 5, 10, 20} M
+```
+
+while customer RFQs are sampled on the full grid
+
+```text
+RFQ support = {1, 2, 3, 4, ..., 20} M
+```
+
+when `rfqSizeStep = 1.0`.  The support runs from the smallest to the largest pricing knot;
+pricing knots are always included exactly.  `rfqSizeStep` is configurable per tier.
+
+For each source, evaluate the exogenous curve on that full RFQ support. The Monte Carlo
+size PMF is
+
+```text
+p_s,j = lambda_RFQ,s(z_j) / sum_k lambda_RFQ,s(z_k),
+```
+
+and the pooled two-sided source clock is
+
+```text
+Lambda_s = 2 * sum_j lambda_RFQ,s(z_j).
+```
+
+There is therefore **no independent RFQ-size probability calibration**. Each customer RFQ
+is generated as
+
+```text
+source RFQ clock:          Lambda_s
+customer side:             Bid / Ask with probability 1/2 each
+requested size:            z_j with probability p_s,j
+quoted price:              linear interpolation between neighboring pricing knots
+conditional trade win:     Bernoulli(p_win,s(interpolated_price, z_j))
+```
+
+For example, if 3M and 5M are pricing knots and a 4M RFQ arrives, the 4M bid or ask price is
+exactly halfway between the current 3M and 5M prices. In the code the equivalent `delta` is
+interpolated; because execution price is affine in `delta` for a fixed side and reference
+spot, this is mathematically identical to interpolating the price itself.
+
+The sampled **actual RFQ size** drives win probability, cash, inventory, markout, retained
+RFQ events, and the population hit-ratio aggregates.  Hence the realized hit-ratio chart can
+show 4M, 6M, 7M, etc. even though those sizes are not explicit pricing knots.
+
+The HJB continues to store the control policy at the pricing knots. Its existing pricing-knot
+optimization is unchanged; Monte Carlo applies the resulting ladder to intermediate customer
+sizes via the same linear price interpolation used in production-style quoting.
+
+Crossed sources evaluate the exogenous curve and hit-ratio model at their mapped source-currency
+size before normalization / win sampling. For compatibility, configs produced by the short-lived
+`totalRfqRate` version are converted back to an equivalent `A0` using the full RFQ support.
+
+Once an RFQ arrives, only a won RFQ changes inventory and cash. The RFQ markout shock is
+applied on every RFQ, including lost RFQs; for a won RFQ, inventory/cash are updated before
+the markout is applied.
 
 
 ### Temporary FX reference mids

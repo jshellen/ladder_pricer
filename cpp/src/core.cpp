@@ -41,6 +41,26 @@ void require_centered_grid(const std::vector<double>& grid) {
     }
 }
 
+std::vector<double> fill_breakpoints(const std::vector<double>& grid, std::size_t i,
+                                     double dir, double posted_size) {
+    std::vector<double> out;
+    const double q = grid[i];
+    if (dir > 0.0) {
+        for (std::size_t j = i + 1; j < grid.size(); ++j) {
+            const double x = grid[j] - q;
+            if (x >= posted_size - kTolerance) break;
+            if (x > kTolerance) out.push_back(x);
+        }
+    } else {
+        for (std::size_t j = i; j-- > 0;) {
+            const double x = q - grid[j];
+            if (x >= posted_size - kTolerance) break;
+            if (x > kTolerance) out.push_back(x);
+        }
+    }
+    return out;
+}
+
 std::size_t exact_index(const std::vector<double>& grid, double value) {
     auto it = std::lower_bound(grid.begin(), grid.end(), value - kTolerance);
     if (it != grid.end() && std::abs(*it - value) <= kTolerance) {
@@ -154,13 +174,17 @@ LogisticFlow::LogisticFlow(double a0, double theta, double beta, double shift,
                            double steepness, double volume_shift)
     : a0_(a0), theta_(theta), beta_(beta), shift_(shift),
       steepness_(steepness), volume_shift_(volume_shift) {
-    require(a0_ >= 0.0, "A0 must be nonnegative");
+    require(a0_ >= 0.0, "RFQ arrival-intensity scale must be nonnegative");
     require(steepness_ > 0.0, "logistic steepness must be positive");
 }
 
-double LogisticFlow::scale(double size) const {
+double LogisticFlow::size_weight(double size) const {
     require(size > 0.0, "trade size must be positive");
-    return a0_ * std::pow(size, -theta_ - beta_ * size);
+    return std::pow(size, -theta_ - beta_ * size);
+}
+
+double LogisticFlow::rfq_arrival_rate(double size) const {
+    return a0_ * size_weight(size);
 }
 
 double LogisticFlow::center(double size) const {
@@ -175,10 +199,6 @@ double LogisticFlow::hit_ratio(double delta, double size) const {
     }
     const double e = y > -745.0 ? std::exp(y) : 0.0;
     return e / (1.0 + e);
-}
-
-double LogisticFlow::arrival_rate(double delta, double size) const {
-    return scale(size) * hit_ratio(delta, size);
 }
 
 double LogisticFlow::lambert_w_exp(double x) {
@@ -232,13 +252,16 @@ double ExponentialFlow::arrival_rate(double delta) const {
 
 
 ECNFlowSource::ECNFlowSource(std::string name, ExponentialFlow flow,
-                             double delta_scale, double source_size_per_target)
+                             double delta_scale, double source_size_per_target,
+                             double mean_trade_size)
     : name_(std::move(name)), flow_(std::move(flow)), delta_scale_(delta_scale),
-      source_size_per_target_(source_size_per_target) {
+      source_size_per_target_(source_size_per_target), mean_trade_size_(mean_trade_size) {
     require(!name_.empty(), "ECN flow source name must not be empty");
     require(delta_scale_ > 0.0, "ECN flow source delta scale must be positive");
     require(source_size_per_target_ > 0.0,
             "ECN flow source size scale must be positive");
+    require(mean_trade_size_ > 0.0,
+            "ECN flow source mean trade size must be positive");
 }
 
 double ECNFlowSource::implied_delta(double target_delta) const noexcept {
@@ -253,8 +276,70 @@ double ECNFlowSource::target_reach(double source_reach) const noexcept {
     return source_reach / delta_scale_;
 }
 
+double ECNFlowSource::full_fill_probability(double target_posted_size) const {
+    require(target_posted_size > 0.0, "ECN target posted size must be positive");
+    const double mean = mean_target_trade_size();
+    return std::exp(-target_posted_size / mean);
+}
+
+double ECNFlowSource::expected_fill_size(double target_posted_size) const {
+    require(target_posted_size > 0.0, "ECN target posted size must be positive");
+    const double mean = mean_target_trade_size();
+    return mean * (-std::expm1(-target_posted_size / mean));
+}
+
+std::vector<std::pair<double, double>> ECNFlowSource::fill_components(
+        double target_posted_size,
+        const std::vector<double>& target_breakpoints) const {
+    require(target_posted_size > 0.0, "ECN target posted size must be positive");
+    const double mean = mean_target_trade_size();
+
+    std::vector<double> cuts;
+    cuts.reserve(target_breakpoints.size() + 1);
+    for (double x : target_breakpoints) {
+        if (x > kTolerance && x < target_posted_size - kTolerance) cuts.push_back(x);
+    }
+    std::sort(cuts.begin(), cuts.end());
+    cuts.erase(std::unique(cuts.begin(), cuts.end(), [](double a, double b) {
+        return std::abs(a - b) <= kTolerance;
+    }), cuts.end());
+    cuts.push_back(target_posted_size);
+
+    std::vector<std::pair<double, double>> out;
+    out.reserve(cuts.size() + 1);
+    double a = 0.0;
+    for (double b : cuts) {
+        const double length = b - a;
+        if (length <= kTolerance) {
+            a = b;
+            continue;
+        }
+        const double survival_a = std::exp(-a / mean);
+        const double interval_mass = survival_a * (-std::expm1(-length / mean));
+        if (interval_mass > 0.0) {
+            const double x = length / mean;
+            double conditional_offset = 0.0;
+            if (x < 1e-5) {
+                // mu - L/(exp(L/mu)-1), evaluated with a cancellation-safe series.
+                conditional_offset = length * (0.5 - x / 12.0 + x * x * x / 720.0);
+            } else if (x > 700.0) {
+                conditional_offset = mean;
+            } else {
+                conditional_offset = mean - length / std::expm1(x);
+            }
+            out.emplace_back(a + conditional_offset, interval_mass);
+        }
+        a = b;
+    }
+
+    // X >= posted size is an atom at the posted size after capping.
+    const double full_mass = full_fill_probability(target_posted_size);
+    if (full_mass > 0.0) out.emplace_back(target_posted_size, full_mass);
+    return out;
+}
+
 AggregatedECNFlow::AggregatedECNFlow(ExponentialFlow direct_flow)
-    : sources_{ECNFlowSource("direct", std::move(direct_flow), 1.0, 1.0)} {}
+    : sources_{ECNFlowSource("direct", std::move(direct_flow), 1.0, 1.0, 1.0)} {}
 
 AggregatedECNFlow::AggregatedECNFlow(std::vector<ECNFlowSource> sources)
     : sources_(std::move(sources)) {
@@ -286,8 +371,48 @@ double FlowSource::source_size(double target_size) const noexcept {
     return target_size * source_size_per_target_;
 }
 
+void FlowSource::configure_target_sizes(const std::vector<double>& target_sizes) {
+    require(!target_sizes.empty(), "RFQ size distribution requires at least one target size");
+    target_sizes_ = target_sizes;
+    size_probabilities_.assign(target_sizes_.size(), 0.0);
+
+    // The calibrated exogenous arrival-intensity curve itself defines the RFQ
+    // size distribution.  For the current discrete rung model, normalize the
+    // curve values across the configured target sizes.  The full two-sided
+    // Monte Carlo clock is twice the sum of the one-sided rung intensities.
+    double one_side_total = 0.0;
+    for (std::size_t i = 0; i < target_sizes_.size(); ++i) {
+        const double z = target_sizes_[i];
+        require(z > 0.0, "RFQ target sizes must be positive");
+        const double intensity = flow_.rfq_arrival_rate(source_size(z));
+        require(std::isfinite(intensity) && intensity >= 0.0,
+                "RFQ arrival intensities must be finite and nonnegative");
+        size_probabilities_[i] = intensity;
+        one_side_total += intensity;
+    }
+    require(one_side_total > 0.0, "RFQ arrival-intensity curve must have positive mass");
+    for (double& probability : size_probabilities_) probability /= one_side_total;
+    total_rfq_rate_ = 2.0 * one_side_total;
+}
+
+std::size_t FlowSource::sample_target_size_index(std::mt19937_64& rng) const {
+    require(!size_probabilities_.empty(), "RFQ size distribution has not been configured");
+    std::discrete_distribution<std::size_t> distribution(
+        size_probabilities_.begin(), size_probabilities_.end());
+    return distribution(rng);
+}
+
 double FlowSource::rfq_arrival_rate(double target_size) const {
-    return flow_.rfq_arrival_rate(source_size(target_size));
+    require(!target_sizes_.empty(), "RFQ size distribution has not been configured");
+    for (double z : target_sizes_) {
+        if (std::abs(z - target_size) <= kTolerance) {
+            // This is the original calibrated one-sided exogenous intensity at
+            // the requested source-currency size.  Equivalently it is
+            // 0.5 * total_rfq_rate() * p(size).
+            return flow_.rfq_arrival_rate(source_size(target_size));
+        }
+    }
+    throw std::invalid_argument("target RFQ size is not one of the configured tier sizes");
 }
 
 double FlowSource::win_probability(double target_delta, double target_size) const {
@@ -295,7 +420,7 @@ double FlowSource::win_probability(double target_delta, double target_size) cons
 }
 
 double FlowSource::arrival_rate(double target_delta, double target_size) const {
-    return flow_.arrival_rate(implied_delta(target_delta), source_size(target_size));
+    return rfq_arrival_rate(target_size) * win_probability(target_delta, target_size);
 }
 
 double FlowSource::target_center(double target_size) const {
@@ -312,6 +437,10 @@ AggregatedFlow::AggregatedFlow(LogisticFlow direct_flow)
 AggregatedFlow::AggregatedFlow(std::vector<FlowSource> sources)
     : sources_(std::move(sources)) {
     require(!sources_.empty(), "aggregated flow requires at least one source");
+}
+
+void AggregatedFlow::configure_target_sizes(const std::vector<double>& target_sizes) {
+    for (auto& source : sources_) source.configure_target_sizes(target_sizes);
 }
 
 double AggregatedFlow::rfq_arrival_rate(double target_size) const {
@@ -433,20 +562,50 @@ double QuadraticPenalty::value(double inventory) const noexcept {
     return risk_aversion_ * sigma_ * sigma_ * inventory * inventory;
 }
 
+namespace {
+
+std::vector<double> build_rfq_size_support(const std::vector<double>& pricing_sizes,
+                                           double step) {
+    require(!pricing_sizes.empty(), "tier sizes must not be empty");
+    require(step > 0.0 && std::isfinite(step), "RFQ size step must be positive");
+
+    const double lo = pricing_sizes.front();
+    const double hi = pricing_sizes.back();
+    std::vector<double> out;
+    out.reserve(static_cast<std::size_t>(std::ceil((hi - lo) / step))
+                + pricing_sizes.size() + 2);
+    for (std::size_t n = 0;; ++n) {
+        const double z = lo + static_cast<double>(n) * step;
+        if (z > hi + kTolerance) break;
+        out.push_back(std::min(z, hi));
+    }
+    if (out.empty() || std::abs(out.back() - hi) > kTolerance) out.push_back(hi);
+    out.insert(out.end(), pricing_sizes.begin(), pricing_sizes.end());
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end(), [](double a, double b) {
+        return std::abs(a - b) <= kTolerance;
+    }), out.end());
+    return out;
+}
+
+} // namespace
+
 Tier::Tier(std::string name, std::vector<double> sizes, LogisticFlow flow,
            SaturatingMarkout markout, bool use_markout,
-           double delta_min, double delta_max, double fee)
+           double delta_min, double delta_max, double fee, double rfq_size_step)
     : Tier(std::move(name), std::move(sizes), AggregatedFlow(std::move(flow)),
-           std::move(markout), use_markout, delta_min, delta_max, fee) {}
+           std::move(markout), use_markout, delta_min, delta_max, fee, rfq_size_step) {}
 
 Tier::Tier(std::string name, std::vector<double> sizes, AggregatedFlow flow,
            SaturatingMarkout markout, bool use_markout,
-           double delta_min, double delta_max, double fee)
-    : name_(std::move(name)), sizes_(std::move(sizes)), flow_(std::move(flow)),
-      markout_(std::move(markout)), use_markout_(use_markout),
+           double delta_min, double delta_max, double fee, double rfq_size_step)
+    : name_(std::move(name)), sizes_(std::move(sizes)), rfq_size_step_(rfq_size_step),
+      flow_(std::move(flow)), markout_(std::move(markout)), use_markout_(use_markout),
       delta_min_(delta_min), delta_max_(delta_max), fee_(fee) {
     require(!name_.empty(), "tier name must not be empty");
     require_positive_increasing(sizes_, "tier sizes");
+    rfq_sizes_ = build_rfq_size_support(sizes_, rfq_size_step_);
+    flow_.configure_target_sizes(rfq_sizes_);
     require(delta_min_ <= delta_max_, "delta_min must not exceed delta_max");
     require(fee_ >= 0.0, "tier fee must be nonnegative");
 }
@@ -896,14 +1055,23 @@ PassiveECNPolicy PolicyBuilder::improve_passive_ecn(const std::vector<double>& v
             const double q = q_grid[i];
             if (!venue.risk_reducing(q, side, z) || !problem_.grid().admissible(q, dir * z)) continue;
             const double hq = problem_.grid().interpolate(value, q);
+            const auto breaks = fill_breakpoints(q_grid, i, dir, z);
             double best_value = 0.0;  // OFF is always available.
             double best_delta = 0.0;
             bool active = false;
             for (std::size_t j = 0; j < venue.deltas().size(); ++j) {
                 const double delta = venue.deltas()[j];
-                const double rate = venue.flow().arrival_rate(delta);
-                const double edge = z * (problem_.spread() * (0.5 - delta) - venue.maker_fee());
-                const double candidate = rate * (edge + problem_.grid().interpolate(value, q + dir * z) - hq);
+                double candidate = 0.0;
+                for (const auto& source : venue.flow().sources()) {
+                    const double hit_rate = source.arrival_rate(delta);
+                    if (hit_rate <= 0.0) continue;
+                    for (const auto& [fill, probability] : source.fill_components(z, breaks)) {
+                        if (probability <= 0.0) continue;
+                        const double edge = fill * (problem_.spread() * (0.5 - delta) - venue.maker_fee());
+                        candidate += hit_rate * probability *
+                            (edge + problem_.grid().interpolate(value, q + dir * fill) - hq);
+                    }
+                }
                 if (candidate > best_value + kTolerance) {
                     best_value = candidate;
                     best_delta = delta;
@@ -1099,10 +1267,20 @@ std::vector<double> BellmanModel::rhs(const std::vector<double>& value, const Po
                 const bool active = side == Side::Bid ? p.bid_active[i] : p.ask_active[i];
                 const double delta = side == Side::Bid ? p.bid_delta[i] : p.ask_delta[i];
                 if (!active) continue;
-                const double rate = venue.flow().arrival_rate(delta);
                 const double dir = direction(side);
-                const double edge = z * (problem_.spread() * (0.5 - delta) - venue.maker_fee());
-                total += rate * (edge + grid.interpolate(value, q + dir * z) - hq);
+                const auto breaks = fill_breakpoints(q_grid, i, dir, z);
+                for (const auto& source : venue.flow().sources()) {
+                    const double hit_rate = source.arrival_rate(delta);
+                    if (hit_rate <= 0.0) continue;
+                    for (const auto& [fill, probability] : source.fill_components(z, breaks)) {
+                        const double rate = hit_rate * probability;
+                        if (rate <= 0.0) continue;
+                        const double edge = fill *
+                            (problem_.spread() * (0.5 - delta) - venue.maker_fee());
+                        total += rate *
+                            (edge + grid.interpolate(value, q + dir * fill) - hq);
+                    }
+                }
             }
         }
         out[i] = total;

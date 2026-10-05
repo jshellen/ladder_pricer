@@ -47,6 +47,26 @@ void add_transition(DenseMatrix& L, const std::vector<double>& grid, std::size_t
     L(from, from) -= rate;
 }
 
+std::vector<double> fill_breakpoints(const std::vector<double>& grid, std::size_t i,
+                                     double dir, double posted_size) {
+    std::vector<double> out;
+    const double q = grid[i];
+    if (dir > 0.0) {
+        for (std::size_t j = i + 1; j < grid.size(); ++j) {
+            const double x = grid[j] - q;
+            if (x >= posted_size - kTolerance) break;
+            if (x > kTolerance) out.push_back(x);
+        }
+    } else {
+        for (std::size_t j = i; j-- > 0;) {
+            const double x = q - grid[j];
+            if (x >= posted_size - kTolerance) break;
+            if (x > kTolerance) out.push_back(x);
+        }
+    }
+    return out;
+}
+
 double max_abs(const std::vector<double>& x) {
     double out = 0.0;
     for (double v : x) out = std::max(out, std::abs(v));
@@ -179,10 +199,19 @@ HowardSolver::AffineOperator HowardSolver::fixed_policy_operator(const Policy& p
                 const bool active = side == Side::Bid ? p.bid_active[i] : p.ask_active[i];
                 const double delta = side == Side::Bid ? p.bid_delta[i] : p.ask_delta[i];
                 if (!active) continue;
-                const double rate = venue.flow().arrival_rate(delta);
                 const double dir = direction(side);
-                op.reward[i] += rate * z * (problem_.spread() * (0.5 - delta) - venue.maker_fee());
-                add_transition(op.generator, states, i, q + dir * z, rate);
+                const auto breaks = fill_breakpoints(states, i, dir, z);
+                for (const auto& source : venue.flow().sources()) {
+                    const double hit_rate = source.arrival_rate(delta);
+                    if (hit_rate <= 0.0) continue;
+                    for (const auto& [fill, probability] : source.fill_components(z, breaks)) {
+                        const double rate = hit_rate * probability;
+                        if (rate <= 0.0) continue;
+                        op.reward[i] += rate * fill *
+                            (problem_.spread() * (0.5 - delta) - venue.maker_fee());
+                        add_transition(op.generator, states, i, q + dir * fill, rate);
+                    }
+                }
             }
         }
     }
