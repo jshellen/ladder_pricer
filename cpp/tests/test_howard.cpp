@@ -44,8 +44,10 @@ int main() {
         const double target_spread = 20.0;
         const double source_spread = 25.0;
         const double alpha = target_spread / (cross_mid * source_spread);
-        ECNFlowSource direct("EURSEK", ExponentialFlow(0.15, 2.4), 1.0, 1.0, 0.80);
-        ECNFlowSource crossed("USDSEK", ExponentialFlow(0.20, 3.0), alpha, cross_mid, 1.80);
+        const std::vector<double> direct_probs{0.40, 0.20, 0.15, 0.10, 0.15};
+        const std::vector<double> crossed_probs{0.20, 0.20, 0.20, 0.20, 0.20};
+        ECNFlowSource direct("EURSEK", ExponentialFlow(0.15, 2.4), 1.0, 1.0, direct_probs);
+        ECNFlowSource crossed("USDSEK", ExponentialFlow(0.20, 3.0), alpha, cross_mid, crossed_probs);
         assert(std::abs(crossed.implied_delta(0.30) -
                         (0.5 + alpha * (0.30 - 0.5))) < 1e-15);
         assert(std::abs(crossed.target_reach(alpha * 0.25) - 0.25) < 1e-15);
@@ -54,13 +56,34 @@ int main() {
         assert(std::abs(combined.arrival_rate(0.30) - expected) < 1e-15);
         assert(crossed.arrival_rate(0.30) > 0.0);
 
-        // Trade sizes are exponential in source-base millions and map back to
-        // target-base inventory before being capped by our posted target size.
-        assert(std::abs(direct.mean_target_trade_size() - 0.80) < 1e-15);
-        assert(std::abs(crossed.mean_target_trade_size() - 1.50) < 1e-15);
+        // Trade sizes are discrete source-base pillars and map back to target-base
+        // inventory before being capped by our posted target size.
+        const double direct_mean = 1.0*0.40 + 0.75*0.20 + 0.50*0.15 + 0.25*0.10 + 0.10*0.15;
+        const double crossed_mean = 1.0*0.20 + 0.75*0.20 + 0.50*0.20 + 0.25*0.20 + 0.10*0.20;
+        assert(std::abs(direct.mean_target_trade_size() - direct_mean) < 1e-15);
+        assert(std::abs(crossed.mean_target_trade_size() - crossed_mean / cross_mid) < 1e-15);
         const double posted = 1.0;
-        assert(std::abs(direct.full_fill_probability(posted) - std::exp(-posted / 0.80)) < 1e-15);
-        assert(std::abs(direct.expected_fill_size(posted) - 0.80 * (1.0 - std::exp(-posted / 0.80))) < 1e-15);
+        assert(std::abs(direct.full_fill_probability(posted) - 0.40) < 1e-15);
+        assert(std::abs(direct.expected_fill_size(posted) - direct_mean) < 1e-15);
+
+        // The same discrete distribution is used by Monte Carlo sampling.
+        std::mt19937_64 rng(123456);
+        std::vector<int> sampled_counts(5, 0);
+        constexpr int n_samples = 50000;
+        const auto& pillars = direct.trade_sizes();
+        for (int draw = 0; draw < n_samples; ++draw) {
+            const double sampled = direct.sample_trade_size(rng);
+            const auto it = std::find_if(pillars.begin(), pillars.end(), [&](double x) {
+                return std::abs(x - sampled) < 1e-12;
+            });
+            assert(it != pillars.end());
+            ++sampled_counts[static_cast<std::size_t>(std::distance(pillars.begin(), it))];
+        }
+        for (std::size_t j = 0; j < direct_probs.size(); ++j) {
+            const double frequency = static_cast<double>(sampled_counts[j]) / n_samples;
+            assert(std::abs(frequency - direct_probs[j]) < 0.01);
+        }
+
         const auto components = direct.fill_components(posted, {0.25, 0.50, 0.75});
         double probability = 0.0;
         double expected_fill = 0.0;

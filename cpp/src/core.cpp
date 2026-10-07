@@ -252,16 +252,78 @@ double ExponentialFlow::arrival_rate(double delta) const {
 
 
 ECNFlowSource::ECNFlowSource(std::string name, ExponentialFlow flow,
+                             double delta_scale, double source_size_per_target)
+    : ECNFlowSource(std::move(name), std::move(flow), delta_scale,
+                    source_size_per_target, 1.0) {}
+
+ECNFlowSource::ECNFlowSource(std::string name, ExponentialFlow flow,
                              double delta_scale, double source_size_per_target,
-                             double mean_trade_size)
+                             std::vector<double> trade_size_probabilities)
     : name_(std::move(name)), flow_(std::move(flow)), delta_scale_(delta_scale),
-      source_size_per_target_(source_size_per_target), mean_trade_size_(mean_trade_size) {
+      source_size_per_target_(source_size_per_target),
+      trade_sizes_{1.0, 0.75, 0.50, 0.25, 0.10},
+      trade_size_probabilities_(std::move(trade_size_probabilities)) {
     require(!name_.empty(), "ECN flow source name must not be empty");
     require(delta_scale_ > 0.0, "ECN flow source delta scale must be positive");
     require(source_size_per_target_ > 0.0,
             "ECN flow source size scale must be positive");
-    require(mean_trade_size_ > 0.0,
-            "ECN flow source mean trade size must be positive");
+    require(trade_size_probabilities_.size() == trade_sizes_.size(),
+            "ECN trade-size probabilities must have five entries");
+    double total = 0.0;
+    for (double p : trade_size_probabilities_) {
+        require(std::isfinite(p) && p >= 0.0,
+                "ECN trade-size probabilities must be finite and nonnegative");
+        total += p;
+    }
+    require(std::abs(total - 1.0) <= 1e-9,
+            "ECN trade-size probabilities must sum to one");
+    if (total != 1.0) {
+        for (double& p : trade_size_probabilities_) p /= total;
+    }
+}
+
+ECNFlowSource::ECNFlowSource(std::string name, ExponentialFlow flow,
+                             double delta_scale, double source_size_per_target,
+                             double legacy_mean_trade_size)
+    : name_(std::move(name)), flow_(std::move(flow)), delta_scale_(delta_scale),
+      source_size_per_target_(source_size_per_target),
+      trade_sizes_{1.0, 0.75, 0.50, 0.25, 0.10} {
+    require(!name_.empty(), "ECN flow source name must not be empty");
+    require(delta_scale_ > 0.0, "ECN flow source delta scale must be positive");
+    require(source_size_per_target_ > 0.0,
+            "ECN flow source size scale must be positive");
+    require(legacy_mean_trade_size > 0.0,
+            "ECN legacy mean trade size must be positive");
+
+    // Nearest-pillar discretization of Exp(mean). The 1M pillar is the top
+    // bucket, so all legacy parent trades >= 0.875M map to 1M. This keeps the
+    // old expected capped fill at a 1M quote very close to the continuous model.
+    const double mu = legacy_mean_trade_size;
+    const double s0175 = std::exp(-0.175 / mu);
+    const double s0375 = std::exp(-0.375 / mu);
+    const double s0625 = std::exp(-0.625 / mu);
+    const double s0875 = std::exp(-0.875 / mu);
+    trade_size_probabilities_ = {
+        s0875,
+        s0625 - s0875,
+        s0375 - s0625,
+        s0175 - s0375,
+        1.0 - s0175,
+    };
+}
+
+double ECNFlowSource::mean_trade_size() const noexcept {
+    double out = 0.0;
+    for (std::size_t i = 0; i < trade_sizes_.size(); ++i) {
+        out += trade_sizes_[i] * trade_size_probabilities_[i];
+    }
+    return out;
+}
+
+double ECNFlowSource::sample_trade_size(std::mt19937_64& rng) const {
+    std::discrete_distribution<std::size_t> distribution(
+        trade_size_probabilities_.begin(), trade_size_probabilities_.end());
+    return trade_sizes_.at(distribution(rng));
 }
 
 double ECNFlowSource::implied_delta(double target_delta) const noexcept {
@@ -278,63 +340,51 @@ double ECNFlowSource::target_reach(double source_reach) const noexcept {
 
 double ECNFlowSource::full_fill_probability(double target_posted_size) const {
     require(target_posted_size > 0.0, "ECN target posted size must be positive");
-    const double mean = mean_target_trade_size();
-    return std::exp(-target_posted_size / mean);
+    const double source_posted_size = target_posted_size * source_size_per_target_;
+    double probability = 0.0;
+    for (std::size_t i = 0; i < trade_sizes_.size(); ++i) {
+        if (trade_sizes_[i] + kTolerance >= source_posted_size) {
+            probability += trade_size_probabilities_[i];
+        }
+    }
+    return probability;
 }
 
 double ECNFlowSource::expected_fill_size(double target_posted_size) const {
     require(target_posted_size > 0.0, "ECN target posted size must be positive");
-    const double mean = mean_target_trade_size();
-    return mean * (-std::expm1(-target_posted_size / mean));
+    const double source_posted_size = target_posted_size * source_size_per_target_;
+    double expected_source_fill = 0.0;
+    for (std::size_t i = 0; i < trade_sizes_.size(); ++i) {
+        expected_source_fill += trade_size_probabilities_[i] *
+            std::min(trade_sizes_[i], source_posted_size);
+    }
+    return expected_source_fill / source_size_per_target_;
 }
 
 std::vector<std::pair<double, double>> ECNFlowSource::fill_components(
         double target_posted_size,
-        const std::vector<double>& target_breakpoints) const {
+        const std::vector<double>& /*target_breakpoints*/) const {
     require(target_posted_size > 0.0, "ECN target posted size must be positive");
-    const double mean = mean_target_trade_size();
+    const double source_posted_size = target_posted_size * source_size_per_target_;
 
-    std::vector<double> cuts;
-    cuts.reserve(target_breakpoints.size() + 1);
-    for (double x : target_breakpoints) {
-        if (x > kTolerance && x < target_posted_size - kTolerance) cuts.push_back(x);
-    }
-    std::sort(cuts.begin(), cuts.end());
-    cuts.erase(std::unique(cuts.begin(), cuts.end(), [](double a, double b) {
-        return std::abs(a - b) <= kTolerance;
-    }), cuts.end());
-    cuts.push_back(target_posted_size);
-
+    // Exact finite support: cap each incoming source-size pillar by the posted
+    // source-equivalent quantity, map back to target inventory and merge atoms
+    // that become identical after capping / FX conversion.
     std::vector<std::pair<double, double>> out;
-    out.reserve(cuts.size() + 1);
-    double a = 0.0;
-    for (double b : cuts) {
-        const double length = b - a;
-        if (length <= kTolerance) {
-            a = b;
-            continue;
-        }
-        const double survival_a = std::exp(-a / mean);
-        const double interval_mass = survival_a * (-std::expm1(-length / mean));
-        if (interval_mass > 0.0) {
-            const double x = length / mean;
-            double conditional_offset = 0.0;
-            if (x < 1e-5) {
-                // mu - L/(exp(L/mu)-1), evaluated with a cancellation-safe series.
-                conditional_offset = length * (0.5 - x / 12.0 + x * x * x / 720.0);
-            } else if (x > 700.0) {
-                conditional_offset = mean;
-            } else {
-                conditional_offset = mean - length / std::expm1(x);
-            }
-            out.emplace_back(a + conditional_offset, interval_mass);
-        }
-        a = b;
+    for (std::size_t i = 0; i < trade_sizes_.size(); ++i) {
+        const double p = trade_size_probabilities_[i];
+        if (p <= 0.0) continue;
+        const double fill = std::min(trade_sizes_[i], source_posted_size) /
+            source_size_per_target_;
+        auto it = std::find_if(out.begin(), out.end(), [&](const auto& item) {
+            return std::abs(item.first - fill) <= kTolerance;
+        });
+        if (it == out.end()) out.emplace_back(fill, p);
+        else it->second += p;
     }
-
-    // X >= posted size is an atom at the posted size after capping.
-    const double full_mass = full_fill_probability(target_posted_size);
-    if (full_mass > 0.0) out.emplace_back(target_posted_size, full_mass);
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+        return a.first < b.first;
+    });
     return out;
 }
 

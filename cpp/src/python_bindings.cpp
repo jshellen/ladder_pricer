@@ -194,9 +194,15 @@ AggregatedECNFlow build_ecn_flow(const py::dict& cfg, double target_spread_pips)
     if (!cfg.contains(sources_key)) {
         const py::dict flow = py::cast<py::dict>(cfg[py::str("flow")]);
         std::vector<ECNFlowSource> direct;
-        direct.emplace_back(
-            "direct", ExponentialFlow(number(flow, "A"), number(flow, "k")),
-            1.0, 1.0, optional_number(cfg, "meanTradeSize", 1.0));
+        if (cfg.contains(py::str("tradeSizeProbabilities"))) {
+            direct.emplace_back(
+                "direct", ExponentialFlow(number(flow, "A"), number(flow, "k")),
+                1.0, 1.0, numbers(cfg[py::str("tradeSizeProbabilities")]));
+        } else {
+            direct.emplace_back(
+                "direct", ExponentialFlow(number(flow, "A"), number(flow, "k")),
+                1.0, 1.0, optional_number(cfg, "meanTradeSize", 1.0));
+        }
         return AggregatedECNFlow(std::move(direct));
     }
 
@@ -232,10 +238,17 @@ AggregatedECNFlow build_ecn_flow(const py::dict& cfg, double target_spread_pips)
                 throw std::invalid_argument("ECN flow source mapping type must be identity, crossed, or affine");
             }
         }
-        sources.emplace_back(
-            name, ExponentialFlow(number(flow, "A"), number(flow, "k")),
-            delta_scale, source_size_per_target,
-            optional_number(source, "meanTradeSize", 1.0));
+        if (source.contains(py::str("tradeSizeProbabilities"))) {
+            sources.emplace_back(
+                name, ExponentialFlow(number(flow, "A"), number(flow, "k")),
+                delta_scale, source_size_per_target,
+                numbers(source[py::str("tradeSizeProbabilities")]));
+        } else {
+            sources.emplace_back(
+                name, ExponentialFlow(number(flow, "A"), number(flow, "k")),
+                delta_scale, source_size_per_target,
+                optional_number(source, "meanTradeSize", 1.0));
+        }
     }
     return AggregatedECNFlow(std::move(sources));
 }
@@ -354,6 +367,8 @@ py::dict solution_value(const Solution& solution, const PricingProblem& problem)
             item["k"] = source.flow().k();
             item["deltaScale"] = source.delta_scale();
             item["sourceSizePerTarget"] = source.source_size_per_target();
+            item["tradeSizes"] = source.trade_sizes();
+            item["tradeSizeProbabilities"] = source.trade_size_probabilities();
             item["meanTradeSize"] = source.mean_trade_size();
             item["meanTargetTradeSize"] = source.mean_target_trade_size();
             item["fullFillProbability"] = source.full_fill_probability(venue.quote_size());
@@ -495,13 +510,17 @@ py::dict path_value(const SamplePath& path) {
     return out;
 }
 
-py::dict monte_carlo_value(const MonteCarloResult& result) {
+py::dict monte_carlo_value(const MonteCarloResult& result, bool compact_result = false) {
     py::dict out;
-    out["pnlQuote"] = result.pnl_quote_ccy;
+    // Dashboard compact mode avoids materializing unused O(number_of_paths)
+    // arrays as Python lists. The full API remains the default.
+    if (!compact_result) out["pnlQuote"] = result.pnl_quote_ccy;
     out["pnlBase"] = result.pnl_base_ccy;
-    out["finalInventory"] = result.final_inventory;
-    out["finalSpot"] = result.final_spot;
-    out["tradeCount"] = result.trade_count;
+    if (!compact_result) {
+        out["finalInventory"] = result.final_inventory;
+        out["finalSpot"] = result.final_spot;
+        out["tradeCount"] = result.trade_count;
+    }
     out["times"] = result.sample_times;
     out["inventoryLower"] = result.inventory_lower;
     out["inventoryMedian"] = result.inventory_median;
@@ -568,7 +587,7 @@ public:
 
     py::dict simulate(double horizon_minutes, int paths, double initial_inventory,
                       std::uint64_t seed, int retained_paths = 6, int sample_points = 191,
-                      py::object progress_callback = py::none()) {
+                      py::object progress_callback = py::none(), bool compact_result = false) {
         ensure_solved();
         const double sigma = number(config_, "sigmaPips") / 10000.0;
         MonteCarloResult result;
@@ -590,7 +609,7 @@ public:
                          .run(horizon_minutes, paths, sigma, initial_inventory, seed,
                               retained_paths, sample_points, progress);
         }
-        return monte_carlo_value(result);
+        return monte_carlo_value(result, compact_result);
     }
 
     py::list frontier(const std::vector<double>& gamma_values, double horizon_minutes,
@@ -656,7 +675,7 @@ private:
 
 PYBIND11_MODULE(_native, module) {
     module.doc() = "C++ Howard pricing engine";
-    module.attr("ECN_PARAMETERIZATION_VERSION") = 8;
+    module.attr("ECN_PARAMETERIZATION_VERSION") = 10;
     py::class_<ladder_pricer::python::Engine>(module, "Engine")
         .def(py::init<py::dict>())
         .def("solve", &ladder_pricer::python::Engine::solve)
@@ -665,7 +684,7 @@ PYBIND11_MODULE(_native, module) {
         .def("simulate", &ladder_pricer::python::Engine::simulate,
              py::arg("horizon_minutes"), py::arg("paths"), py::arg("initial_inventory"),
              py::arg("seed"), py::arg("retained_paths") = 6, py::arg("sample_points") = 191,
-             py::arg("progress_callback") = py::none())
+             py::arg("progress_callback") = py::none(), py::arg("compact_result") = false)
         .def("frontier", &ladder_pricer::python::Engine::frontier,
              py::arg("gamma_values"), py::arg("horizon_minutes"),
              py::arg("initial_inventory") = 0.0);

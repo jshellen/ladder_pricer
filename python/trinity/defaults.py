@@ -59,6 +59,42 @@ def default_fx_mid(pair: str | None) -> float | None:
         return None
     return 1.0 / float(value)
 
+
+ECN_TRADE_SIZES = [1.0, 0.75, 0.50, 0.25, 0.10]
+
+# Generic fallback retained for ECN source pairs without a pair-specific
+# empirical size distribution.  This is the nearest-pillar discretization of
+# the former Exp(mean=1M) parent-size model.
+ECN_TRADE_SIZE_PROBABILITIES_FALLBACK = [
+    0.4168620196785084,   # 1.00M
+    0.11839940884048189,  # 0.75M
+    0.15202785027198196,  # 0.50M
+    0.15216774197823513,  # 0.25M
+    0.16054297923079264,  # 0.10M residual
+]
+
+# Empirical source-pair defaults.  The 100k probability is the residual
+# 1 - [P(1M) + P(750k) + P(500k) + P(250k)].
+ECN_TRADE_SIZE_PROBABILITIES_BY_PAIR: dict[str, list[float]] = {
+    "EURSEK": [0.35, 0.08, 0.22, 0.16, 0.19],
+    "USDSEK": [0.34, 0.135, 0.216, 0.13, 0.179],
+}
+
+
+def default_ecn_trade_size_probabilities(pair: str | None) -> list[float]:
+    """Return pair-specific ECN parent-size probabilities when available."""
+    key = str(pair or "").upper().strip()
+    probs = ECN_TRADE_SIZE_PROBABILITIES_BY_PAIR.get(
+        key, ECN_TRADE_SIZE_PROBABILITIES_FALLBACK
+    )
+    return list(probs)
+
+
+# Backwards-compatible module-level default.  The dashboard's default target
+# pair is EURSEK, so this now intentionally resolves to the EURSEK empirical
+# size distribution.
+ECN_TRADE_SIZE_PROBABILITIES = default_ecn_trade_size_probabilities("EURSEK")
+
 ECN_DELTA_STEP = 0.01
 
 def ecn_delta_grid(min_delta: float, max_delta: float) -> list[float]:
@@ -164,10 +200,11 @@ _DEFAULT_CONFIG = {
         # x=0.5-d spread fractions reduces intensity exponentially:
         # lambda(d) = A * exp(-k * (0.5 - d)).
         "flow": {"A": 4.0, "k": 8.4},
-        # Mean parent ECN trade size in millions of the direct source pair's
-        # base currency. Crossed sources configure their own meanTradeSize.
-        # Realized fill = min(parent trade size, posted size).
-        "meanTradeSize": 1.0,
+        # Discrete parent ECN trade-size probabilities for fixed source-base
+        # currency pillars [1M, 750k, 500k, 250k, 100k].  The UI edits the
+        # first four probabilities and defines the 100k probability as the
+        # residual 1 - sum(other probabilities).
+        "tradeSizeProbabilities": list(ECN_TRADE_SIZE_PROBABILITIES),
         "quoteSize": 1.0,
         "makerFeePips": 3.0,
     },

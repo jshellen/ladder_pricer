@@ -127,8 +127,9 @@ is `S * (0.5-d)`.
 
 The ECN can now aggregate several streamed FX pairs into one target-risk quote control. The
 direct target pair and every crossed ECN source have their own exponential price-reach curve
-`lambda_s(d_s)=A_s exp(-k_s(0.5-d_s))` and their own exponential parent-trade size distribution.
-`meanTradeSize` is the mean parent size in millions of the source pair's base currency. The
+`lambda_s(d_s)=A_s exp(-k_s(0.5-d_s))` and their own discrete parent-trade size distribution.
+The size pillars are fixed at `1.00M, 0.75M, 0.50M, 0.25M, 0.10M` in the source pair's base currency.
+The first four probabilities are configured explicitly and the 100k probability is the residual `1 - sum(other probabilities)`. The
 optimizer still chooses only one master target-pair delta `d`. For a crossed source,
 
 ```text
@@ -142,12 +143,13 @@ quotes derived through EURUSD and EURGBP. If `V_s` is the source-pair parent tra
 `c_s = sourceSizePerTarget`, the target-equivalent executed size is
 
 ```text
-V_s ~ Exp(mean = meanTradeSize_s)
+V_s in {1.00, 0.75, 0.50, 0.25, 0.10} source-base millions
+P(V_s = 0.10) = 1 - P(1.00) - P(0.75) - P(0.50) - P(0.25)
 fill_target = min(V_s, c_s * quoteSize_target) / c_s
 ```
 
-so a posted 1M target quote may fill by any smaller positive amount but can never fill above
-1M. The HJB integrates each source's capped size distribution when evaluating continuation
+so a posted 1M target quote can fill only at the mapped/capped discrete pillar sizes and can never fill above
+1M. The HJB sums each source's capped discrete size distribution when evaluating continuation
 value, spread capture and fees. Monte Carlo samples the same distribution directly. Source
 `s` still has parent trade intensity `A_s`, independent price reach `X_s ~ Exp(k_s)`, and the
 quote is hit when `X_s >= alpha_s * (0.5-d_target)`. Retained paths record the source parent

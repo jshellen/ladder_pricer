@@ -201,14 +201,9 @@ PnlStatistics PnlAnalytics::statistics(double horizon, double sigma, double q0) 
                 if(!active) continue;
                 const double dir=direction(side);
                 auto breaks=fill_breakpoints(qgrid,i,dir,z);
-                // PnL variance depends on higher fill-size moments. Add a fine
-                // integration mesh on top of inventory-grid knots so the
-                // continuous exponential size distribution is represented
-                // accurately in the second-moment calculation.
-                constexpr int kSizeMomentSlices=32;
-                for(int m=1;m<kSizeMomentSlices;++m){
-                    breaks.push_back(z*static_cast<double>(m)/kSizeMomentSlices);
-                }
+                // ECN parent sizes are discrete; fill_components() returns the
+                // exact finite fill distribution (breaks are retained only for
+                // API compatibility with the shared continuation logic).
                 for(const auto& source:venue.flow().sources()){
                     const double hit_rate=source.arrival_rate(delta);
                     if(hit_rate<=0.0) continue;

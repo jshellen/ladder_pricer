@@ -1,10 +1,12 @@
 #include "ladder_pricer/simulation.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <map>
 #include <random>
 #include <stdexcept>
+#include <thread>
 #include <tuple>
 
 namespace ladder_pricer {
@@ -194,14 +196,26 @@ double advance_spot(double spot, double dt, double sigma, double base_drift,
     return spot + deterministic + brownian;
 }
 
-double percentile(std::vector<double> values, double p) {
+double percentile_select(std::vector<double>& values, double p) {
+    // We only need six order statistics (lo/hi for 2.5%, 50%, 97.5%), not a
+    // fully sorted cross-section. nth_element keeps the exact percentile
+    // definition while reducing the tail from O(N log N) to expected O(N).
     if (values.empty()) return 0.0;
-    std::sort(values.begin(), values.end());
-    const double x = p * (values.size() - 1);
+    const double x = p * static_cast<double>(values.size() - 1);
     const std::size_t lo = static_cast<std::size_t>(std::floor(x));
     const std::size_t hi = static_cast<std::size_t>(std::ceil(x));
-    const double w = x - lo;
-    return (1.0 - w) * values[lo] + w * values[hi];
+    const double w = x - static_cast<double>(lo);
+
+    std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(lo), values.end());
+    const double lower = values[lo];
+    if (hi == lo) return lower;
+
+    // After selecting lo, every element to its right is >= values[lo], so the
+    // global hi-th order statistic can be selected entirely from that suffix.
+    std::nth_element(values.begin() + static_cast<std::ptrdiff_t>(lo + 1),
+                     values.begin() + static_cast<std::ptrdiff_t>(hi), values.end());
+    const double upper = values[hi];
+    return (1.0 - w) * lower + w * upper;
 }
 
 }  // namespace
@@ -468,9 +482,8 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                     // wins exactly when source_reach >= alpha*(0.5-d_target).
                     const auto& source = venue.flow().sources().at(chosen->ecn_source);
                     std::exponential_distribution<double> reach_distribution(source.flow().k());
-                    std::exponential_distribution<double> size_distribution(1.0 / source.mean_trade_size());
                     const double source_reach = reach_distribution(event_rng);
-                    const double source_trade_size = size_distribution(event_rng);
+                    const double source_trade_size = source.sample_trade_size(event_rng);
                     const double target_trade_reach = source.target_reach(source_reach);
                     const double target_quote_reach = 0.5 - chosen->delta;
                     const double signed_distance = problem_.spread() * target_trade_reach;
@@ -578,10 +591,42 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
     result.inventory_lower.resize(sample_points);
     result.inventory_median.resize(sample_points);
     result.inventory_upper.resize(sample_points);
-    for (int s = 0; s < sample_points; ++s) {
-        result.inventory_lower[s] = percentile(inventories[s], 0.025);
-        result.inventory_median[s] = percentile(inventories[s], 0.50);
-        result.inventory_upper[s] = percentile(inventories[s], 0.975);
+
+    // Confidence-band construction used to dominate the apparent "94-97%"
+    // stall for large runs: 381 independent cross-path vectors were fully
+    // sorted after the final simulated path.  Exact quantiles do not require a
+    // full sort, and the sample-time cross-sections are independent, so select
+    // the required order statistics in parallel.  This preserves the exact
+    // percentile values while making the end-of-run work close to linear in
+    // the number of paths.
+    auto compute_inventory_quantiles = [&](int s) {
+        auto& snapshot = inventories[static_cast<std::size_t>(s)];
+        result.inventory_lower[static_cast<std::size_t>(s)] = percentile_select(snapshot, 0.025);
+        result.inventory_median[static_cast<std::size_t>(s)] = percentile_select(snapshot, 0.50);
+        result.inventory_upper[static_cast<std::size_t>(s)] = percentile_select(snapshot, 0.975);
+    };
+
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned worker_count = (paths >= 2'000 && sample_points >= 32)
+        ? std::min<unsigned>(8u, std::min<unsigned>(hw, static_cast<unsigned>(sample_points)))
+        : 1u;
+
+    if (worker_count == 1u) {
+        for (int s = 0; s < sample_points; ++s) compute_inventory_quantiles(s);
+    } else {
+        std::atomic<int> next_snapshot{0};
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count);
+        for (unsigned worker = 0; worker < worker_count; ++worker) {
+            workers.emplace_back([&]() {
+                for (;;) {
+                    const int s = next_snapshot.fetch_add(1, std::memory_order_relaxed);
+                    if (s >= sample_points) break;
+                    compute_inventory_quantiles(s);
+                }
+            });
+        }
+        for (auto& worker : workers) worker.join();
     }
 
     // Emit fill summaries in stable business order rather than stochastic

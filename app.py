@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import concurrent.futures
+import json
 import math
 import threading
 import time
@@ -13,7 +15,12 @@ import plotly.graph_objects as go
 import plotly.io as pio
 from dash import ALL, Dash, Input, Output, State, ctx, dcc, html, no_update
 
-from trinity.defaults import default_config, default_fx_mid
+from trinity.defaults import (
+    ECN_TRADE_SIZE_PROBABILITIES,
+    default_config,
+    default_ecn_trade_size_probabilities,
+    default_fx_mid,
+)
 from trinity.service import ENGINES
 from trinity.ui_config import build_config, checked, parse_numbers
 
@@ -172,6 +179,42 @@ _MC_JOBS: dict[str, dict[str, Any]] = {}
 _MC_JOBS_LOCK = threading.RLock()
 _MC_JOB_RETENTION_SECONDS = 300.0
 
+# Large Monte Carlo payloads (especially 1-second retained paths) stay on the
+# server. Sending them through dcc.Store forces expensive JSON serialization
+# and can block progress polling while Python holds the GIL.
+_MC_RESULTS: dict[str, dict[str, Any]] = {}
+_MC_RESULTS_LOCK = threading.RLock()
+_MC_RESULTS_MAX_ENTRIES = 6
+
+
+def _store_mc_result(result_id: str, mc: dict[str, Any]) -> None:
+    with _MC_RESULTS_LOCK:
+        if result_id not in _MC_RESULTS and len(_MC_RESULTS) >= _MC_RESULTS_MAX_ENTRIES:
+            oldest = next(iter(_MC_RESULTS))
+            _MC_RESULTS.pop(oldest, None)
+        _MC_RESULTS[result_id] = mc
+
+
+def _resolve_mc_store(payload: Any) -> dict[str, Any] | None:
+    """Resolve a legacy inline MC dict or the new lightweight result token."""
+    if not payload:
+        return None
+    if isinstance(payload, dict) and "pnlBase" in payload:
+        return payload
+    if isinstance(payload, dict) and payload.get("resultId"):
+        result_id = str(payload["resultId"])
+        with _MC_RESULTS_LOCK:
+            return _MC_RESULTS.get(result_id)
+    return None
+
+# Closed-form PnL statistics and internalization times are deterministic for a
+# solved economic configuration / initial inventory.  Cache them separately
+# from stochastic MC output so repeated runs with a different seed/path count
+# do not pay the analytical cost again.
+_MC_ANALYTICS_CACHE: dict[str, dict[str, Any]] = {}
+_MC_ANALYTICS_CACHE_LOCK = threading.RLock()
+_MC_ANALYTICS_CACHE_MAX_ENTRIES = 16
+
 
 def _prune_finished_mc_jobs_locked(now: float | None = None) -> None:
     """Drop only old completed jobs.
@@ -280,6 +323,46 @@ def _direct_flow_source(flow: dict[str, Any], target_pair: str) -> dict[str, Any
     }
 
 
+def _legacy_ecn_size_probabilities(mean_trade_size: float = 1.0) -> list[float]:
+    """Map the former exponential size model onto the five fixed pillars."""
+    mu = float(mean_trade_size)
+    if mu <= 0.0:
+        raise ValueError("ECN legacy mean trade size must be positive")
+    s0175 = math.exp(-0.175 / mu)
+    s0375 = math.exp(-0.375 / mu)
+    s0625 = math.exp(-0.625 / mu)
+    s0875 = math.exp(-0.875 / mu)
+    return [s0875, s0625 - s0875, s0375 - s0625, s0175 - s0375, 1.0 - s0175]
+
+
+def _ecn_size_probabilities(source: dict[str, Any] | None) -> list[float]:
+    source = source or {}
+    raw = source.get("tradeSizeProbabilities")
+    if raw is None:
+        return _legacy_ecn_size_probabilities(float(source.get("meanTradeSize", 1.0)))
+    probs = [float(x) for x in raw]
+    if len(probs) != 5:
+        raise ValueError("ECN trade-size probabilities must contain five entries")
+    if any((not math.isfinite(x) or x < 0.0 or x > 1.0) for x in probs):
+        raise ValueError("ECN trade-size probabilities must lie between 0 and 1")
+    if abs(sum(probs) - 1.0) > 1e-9:
+        raise ValueError("ECN trade-size probabilities must sum to 1")
+    return probs
+
+
+def _ecn_size_probabilities_from_four(p1m, p750k, p500k, p250k) -> list[float]:
+    values = [p1m, p750k, p500k, p250k]
+    if any(x is None for x in values):
+        raise ValueError("Enter probabilities for 1M, 750k, 500k and 250k")
+    probs4 = [float(x) for x in values]
+    if any((not math.isfinite(x) or x < 0.0 or x > 1.0) for x in probs4):
+        raise ValueError("ECN trade-size probabilities must lie between 0 and 1")
+    residual = 1.0 - sum(probs4)
+    if residual < -1e-12:
+        raise ValueError("ECN 1M + 750k + 500k + 250k probabilities may not exceed 1")
+    return probs4 + [max(0.0, residual)]
+
+
 def _default_cross_ecn_flow_source(index: int = 0, target_pair: str | None = None) -> dict[str, Any]:
     return {
         "name": "Select FX pair",
@@ -287,17 +370,18 @@ def _default_cross_ecn_flow_source(index: int = 0, target_pair: str | None = Non
         "crossPair": None,
         "mapping": {"type": "crossed", "crossMid": None, "sourceSpreadPips": 20.0},
         "flow": {"A": 0.10, "k": 8.4},
-        "meanTradeSize": 1.0,
+        "tradeSizeProbabilities": list(ECN_TRADE_SIZE_PROBABILITIES),
     }
 
 
-def _direct_ecn_flow_source(flow: dict[str, Any], target_pair: str, mean_trade_size: float = 1.0) -> dict[str, Any]:
+def _direct_ecn_flow_source(flow: dict[str, Any], target_pair: str, trade_size_probabilities=None) -> dict[str, Any]:
+    probs = list(default_ecn_trade_size_probabilities(target_pair) if trade_size_probabilities is None else trade_size_probabilities)
     return {
         "name": str(target_pair),
         "pair": str(target_pair),
         "mapping": {"type": "identity"},
         "flow": deepcopy(flow),
-        "meanTradeSize": float(mean_trade_size),
+        "tradeSizeProbabilities": probs,
     }
 
 
@@ -445,8 +529,15 @@ def ecn_flow_source_settings_editor(source_key: str, source: dict[str, Any], tar
         html.Div([
             number_input("A at mid / side [trades/min]", "ecn-flow-edit-A", float(flow.get("A", 0.10)), "any"),
             number_input("k", "ecn-flow-edit-k", float(flow.get("k", 8.4)), "any"),
-            number_input("Mean trade size [source CCY M]", "ecn-flow-edit-mean-size", float(source.get("meanTradeSize", 1.0)), "any"),
         ], className="grid-2 flow-calibration-grid"),
+        html.Div("Discrete ECN parent trade sizes · probabilities in source base currency", className="subhead"),
+        html.Div([
+            number_input("P(1M)", "ecn-flow-edit-p1m", _ecn_size_probabilities(source)[0], "any"),
+            number_input("P(750k)", "ecn-flow-edit-p750k", _ecn_size_probabilities(source)[1], "any"),
+            number_input("P(500k)", "ecn-flow-edit-p500k", _ecn_size_probabilities(source)[2], "any"),
+            number_input("P(250k)", "ecn-flow-edit-p250k", _ecn_size_probabilities(source)[3], "any"),
+        ], className="grid-2 flow-calibration-grid"),
+        html.Div(id="ecn-flow-edit-p100k-note", className="muted-note"),
     ], className="flow-source-settings")
 
 
@@ -1115,7 +1206,7 @@ def _ecn_flow_sources(cfg: dict[str, Any]) -> list[dict[str, Any]]:
         configured = [{
             "name": str(cfg.get("targetPair", "direct")),
             "flow": e.get("flow", {}),
-            "meanTradeSize": e.get("meanTradeSize", 1.0),
+            "tradeSizeProbabilities": e.get("tradeSizeProbabilities", ECN_TRADE_SIZE_PROBABILITIES),
             "mapping": {"type": "identity"},
         }]
 
@@ -1139,17 +1230,51 @@ def _ecn_flow_sources(cfg: dict[str, Any]) -> list[dict[str, Any]]:
             size_scale = float(mapping.get("sourceSizePerTarget", 1.0))
         elif mapping_type != "identity":
             raise ValueError(f"Unsupported ECN flow-source mapping {mapping_type}")
+        probs = _ecn_size_probabilities(raw)
+        source_sizes = [1.0, 0.75, 0.50, 0.25, 0.10]
+        mean_trade_size = sum(z * p for z, p in zip(source_sizes, probs))
         out.append({
             "name": str(raw.get("name") or raw.get("pair") or "source"),
             "A": float(flow.get("A", 0.0)),
             "k": float(flow.get("k", 1.0)),
-            "meanTradeSize": float(raw.get("meanTradeSize", 1.0)),
-            "meanTargetTradeSize": float(raw.get("meanTradeSize", 1.0)) / size_scale,
+            "tradeSizeProbabilities": probs,
+            "meanTradeSize": mean_trade_size,
+            "meanTargetTradeSize": mean_trade_size / size_scale,
             "alpha": alpha,
             "sourceSizePerTarget": size_scale,
             "mapping": mapping,
         })
     return out
+
+
+def _ecn_source_fill_distribution(source: dict[str, Any], target_posted_size: float) -> list[tuple[float, float]]:
+    """Exact target-inventory fill atoms for one discrete ECN source."""
+    posted = float(target_posted_size)
+    if posted <= 0.0:
+        return []
+    scale = float(source.get("sourceSizePerTarget", 1.0))
+    if scale <= 0.0:
+        return []
+    probs = _ecn_size_probabilities(source)
+    source_sizes = [1.0, 0.75, 0.50, 0.25, 0.10]
+    source_posted = posted * scale
+    merged: dict[float, float] = {}
+    for size, probability in zip(source_sizes, probs):
+        fill = min(size, source_posted) / scale
+        # Stable key because the support is tiny and deterministic.
+        key = round(float(fill), 12)
+        merged[key] = merged.get(key, 0.0) + float(probability)
+    return sorted((fill, probability) for fill, probability in merged.items() if probability > 0.0)
+
+
+def _ecn_source_full_fill_probability(source: dict[str, Any], target_posted_size: float) -> float:
+    posted = float(target_posted_size)
+    return sum(p for fill, p in _ecn_source_fill_distribution(source, posted)
+               if abs(fill - posted) <= 1e-10)
+
+
+def _ecn_source_expected_fill(source: dict[str, Any], target_posted_size: float) -> float:
+    return sum(fill * p for fill, p in _ecn_source_fill_distribution(source, target_posted_size))
 
 
 def _ecn_source_arrival_rate(source: dict[str, Any], delta):
@@ -1239,12 +1364,15 @@ def passive_ecn_parameter_table(cfg: dict[str, Any]) -> html.Table:
         else:
             mapping_text = "direct"
         mean_target = float(source["meanTargetTradeSize"])
-        p_full = float(np.exp(-z / mean_target)) if mean_target > 0.0 else 0.0
-        expected_fill = mean_target * (1.0 - p_full) if mean_target > 0.0 else 0.0
+        p_full = _ecn_source_full_fill_probability(source, z)
+        expected_fill = _ecn_source_expected_fill(source, z)
+        probs = source["tradeSizeProbabilities"]
+        prob_text = " / ".join(f"{100.0 * float(p):.1f}%" for p in probs)
         rows.append([
             str(source["name"]),
             f"{float(source['A']):.6g}",
             f"{float(source['k']):.4g}",
+            prob_text,
             f"{float(source['meanTradeSize']):.4g}",
             f"{mean_target:.4g}",
             f"{expected_fill:.4g}",
@@ -1255,7 +1383,8 @@ def passive_ecn_parameter_table(cfg: dict[str, Any]) -> html.Table:
             f"{fee:.4f}",
         ])
     return _simple_table(
-        ["ECN source", "A = mid intensity/side", "k", "Mean trade [source M]",
+        ["ECN source", "A = mid intensity/side", "k",
+         "Size probs 1M / 750k / 500k / 250k / 100k", "Mean trade [source M]",
          "Mean trade [target M]", "E[fill] [target M]", "P(full fill)", "Mapping",
          "Source size / target size", "Target-equivalent quote [M]", "Maker fee [pips]"],
         rows,
@@ -1434,11 +1563,10 @@ sidebar = html.Aside([
             html.Button("Configure flow sources", id="open-ecn-flow-sources", className="secondary-button compact-button", n_clicks=0),
         ], className="flow-source-config-line"),
         # Direct ECN calibration remains mounted for config building.
-        # The modal editor synchronizes these values for the target-pair source.
+        # The modal editor synchronizes A/k and the direct size-probability Store.
         html.Div([
             number_input("A at mid / side [trades/min]", "ecn-A", DEFAULT["passiveEcn"]["flow"]["A"], "any"),
             number_input("k", "ecn-k", DEFAULT["passiveEcn"]["flow"]["k"], "any"),
-            number_input("Mean trade size [source CCY M]", "ecn-mean-size", DEFAULT["passiveEcn"]["meanTradeSize"], "any"),
         ], style={"display": "none"}),
         html.Div([
             number_input("Min delta", "ecn-dmin", DEFAULT["passiveEcn"]["minDelta"], 0.01),
@@ -1615,6 +1743,7 @@ app.layout = html.Div([
     dcc.Store(id="flow-source-selected-store", data="direct"),
     dcc.Store(id="flow-source-modal-open-store", data=False),
     dcc.Store(id="ecn-extra-flow-sources-store", data=[]),
+    dcc.Store(id="ecn-direct-size-probs-store", data=list(DEFAULT["passiveEcn"]["tradeSizeProbabilities"])),
     dcc.Store(id="ecn-flow-source-selected-store", data="direct"),
     dcc.Store(id="ecn-flow-source-modal-open-store", data=False),
     html.Div([
@@ -1651,7 +1780,7 @@ app.layout = html.Div([
             html.Div([
                 html.Div([
                     html.H2("Configure ECN flow sources", className="modal-title"),
-                    html.Div("The ECN optimizer chooses one master delta on the target pair. Crossed ECN pairs inherit that quote through the same FX transformation used by Tier flow sources, while keeping their own A, k and exponential trade-size calibration.", className="muted-note modal-note"),
+                    html.Div("The ECN optimizer chooses one master delta on the target pair. Crossed ECN pairs inherit that quote through the same FX transformation used by Tier flow sources, while keeping their own A, k and discrete 1M/750k/500k/250k/100k trade-size probabilities.", className="muted-note modal-note"),
                 ]),
                 html.Button("×", id="ecn-flow-source-close", className="modal-close", n_clicks=0),
             ], className="modal-head"),
@@ -1725,9 +1854,10 @@ for component_id in (
 ):
     CONFIG_FIELDS.append((component_id, State(component_id, "value")))
 for component_id in (
-    "ecn-enabled", "ecn-A", "ecn-k", "ecn-mean-size", "ecn-dmin", "ecn-dmax", "ecn-size", "ecn-fee",
+    "ecn-enabled", "ecn-A", "ecn-k", "ecn-dmin", "ecn-dmax", "ecn-size", "ecn-fee",
 ):
     CONFIG_FIELDS.append((component_id, State(component_id, "value")))
+CONFIG_FIELDS.append(("ecn-size-probs", State("ecn-direct-size-probs-store", "data")))
 
 CONFIG_KEYS = [key for key, _ in CONFIG_FIELDS]
 CONFIG_STATES = [state for _, state in CONFIG_FIELDS]
@@ -2062,9 +2192,9 @@ def render_ecn_flow_source_cards(target_pair, selected, data):
     Input("flow-target-pair", "value"),
     Input("ecn-flow-source-selected-store", "data"),
     State("ecn-extra-flow-sources-store", "data"),
-    State("ecn-A", "value"), State("ecn-k", "value"), State("ecn-mean-size", "value"),
+    State("ecn-A", "value"), State("ecn-k", "value"), State("ecn-direct-size-probs-store", "data"),
 )
-def render_ecn_flow_source_settings(target_pair, selected, data, direct_A, direct_k, direct_mean_size):
+def render_ecn_flow_source_settings(target_pair, selected, data, direct_A, direct_k, direct_size_probs):
     if not target_pair:
         return html.Div(
             "Select the target / priced FX pair in a Tier flow-source dialog first.",
@@ -2073,15 +2203,37 @@ def render_ecn_flow_source_settings(target_pair, selected, data, direct_A, direc
     extras = data or []
     selected = selected or "direct"
     if selected == "direct":
-        source = _direct_ecn_flow_source({"A": direct_A, "k": direct_k}, str(target_pair), direct_mean_size)
+        source = _direct_ecn_flow_source({"A": direct_A, "k": direct_k}, str(target_pair), direct_size_probs)
     else:
         try:
             idx = int(str(selected).split("-", 1)[1])
             source = extras[idx]
         except (ValueError, IndexError):
-            source = _direct_ecn_flow_source({"A": direct_A, "k": direct_k}, str(target_pair), direct_mean_size)
+            source = _direct_ecn_flow_source({"A": direct_A, "k": direct_k}, str(target_pair), direct_size_probs)
             selected = "direct"
     return ecn_flow_source_settings_editor(selected, source, str(target_pair))
+
+
+@app.callback(
+    Output("ecn-flow-edit-p1m", "value"),
+    Output("ecn-flow-edit-p750k", "value"),
+    Output("ecn-flow-edit-p500k", "value"),
+    Output("ecn-flow-edit-p250k", "value"),
+    Input("ecn-flow-edit-pair", "value"),
+    State("ecn-flow-source-selected-store", "data"),
+    prevent_initial_call=True,
+)
+def populate_ecn_trade_size_defaults(source_pair, selected):
+    # Only crossed sources have a user-editable source-pair dropdown.  When a
+    # calibrated pair is selected, seed its empirical size distribution.
+    # Unknown pairs preserve the values already shown in the editor.
+    if not source_pair or str(selected or "direct") == "direct":
+        return no_update, no_update, no_update, no_update
+    key = str(source_pair).upper().strip()
+    if key not in {"EURSEK", "USDSEK"}:
+        return no_update, no_update, no_update, no_update
+    probs = default_ecn_trade_size_probabilities(key)
+    return probs[0], probs[1], probs[2], probs[3]
 
 
 @app.callback(
@@ -2107,20 +2259,37 @@ def populate_ecn_flow_source_cross_mid(cross_pair):
 
 
 @app.callback(
+    Output("ecn-flow-edit-p100k-note", "children"),
+    Input("ecn-flow-edit-p1m", "value"), Input("ecn-flow-edit-p750k", "value"),
+    Input("ecn-flow-edit-p500k", "value"), Input("ecn-flow-edit-p250k", "value"),
+)
+def render_ecn_100k_residual(p1m, p750k, p500k, p250k):
+    try:
+        residual = _ecn_size_probabilities_from_four(p1m, p750k, p500k, p250k)[4]
+        return f"P(100k) = 1 − others = {residual:.6f}"
+    except Exception as exc:
+        return f"Invalid size probabilities · {exc}"
+
+
+@app.callback(
     Output("ecn-extra-flow-sources-store", "data"),
     Output("ecn-flow-source-selected-store", "data", allow_duplicate=True),
-    Output("ecn-A", "value"), Output("ecn-k", "value"), Output("ecn-mean-size", "value"),
+    Output("ecn-A", "value"), Output("ecn-k", "value"), Output("ecn-direct-size-probs-store", "data"),
     Input("ecn-flow-source-add", "n_clicks"),
     Input("ecn-flow-source-remove-selected", "n_clicks"),
     Input("ecn-flow-edit-pair", "value"), Input("ecn-flow-edit-cross-pair", "value"),
     Input("ecn-flow-edit-cross-mid", "value"), Input("ecn-flow-edit-spread", "value"),
-    Input("ecn-flow-edit-A", "value"), Input("ecn-flow-edit-k", "value"), Input("ecn-flow-edit-mean-size", "value"),
+    Input("ecn-flow-edit-A", "value"), Input("ecn-flow-edit-k", "value"),
+    Input("ecn-flow-edit-p1m", "value"), Input("ecn-flow-edit-p750k", "value"),
+    Input("ecn-flow-edit-p500k", "value"), Input("ecn-flow-edit-p250k", "value"),
     State("flow-target-pair", "value"), State("ecn-flow-source-selected-store", "data"),
-    State("ecn-extra-flow-sources-store", "data"), State("ecn-A", "value"), State("ecn-k", "value"), State("ecn-mean-size", "value"),
+    State("ecn-extra-flow-sources-store", "data"), State("ecn-A", "value"), State("ecn-k", "value"),
+    State("ecn-direct-size-probs-store", "data"),
     prevent_initial_call=True,
 )
-def update_ecn_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, spread, A, k, mean_size,
-                                  target_pair, selected, data, direct_A, direct_k, direct_mean_size):
+def update_ecn_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, spread, A, k,
+                                  p1m, p750k, p500k, p250k, target_pair, selected, data,
+                                  direct_A, direct_k, direct_size_probs):
     out = deepcopy(data or [])
     selected = selected or "direct"
     trigger = ctx.triggered_id
@@ -2129,9 +2298,9 @@ def update_ecn_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, sp
         if not _add:
             return (no_update,) * 5
         if not target_pair:
-            return out, selected, direct_A, direct_k, direct_mean_size
+            return out, selected, direct_A, direct_k, direct_size_probs
         out.append(_default_cross_ecn_flow_source(len(out), target_pair))
-        return out, f"extra-{len(out) - 1}", direct_A, direct_k, direct_mean_size
+        return out, f"extra-{len(out) - 1}", direct_A, direct_k, direct_size_probs
 
     if trigger == "ecn-flow-source-remove-selected":
         if not _remove:
@@ -2140,22 +2309,22 @@ def update_ecn_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, sp
             idx = int(selected.split("-", 1)[1])
             if 0 <= idx < len(out):
                 out.pop(idx)
-        return out, "direct", direct_A, direct_k, direct_mean_size
+        return out, "direct", direct_A, direct_k, direct_size_probs
+
+    probs = _ecn_size_probabilities_from_four(p1m, p750k, p500k, p250k)
 
     if selected == "direct":
-        if A is not None and k is not None and mean_size is not None:
+        if A is not None and k is not None:
             if float(A) < 0.0:
                 raise ValueError("ECN A must be nonnegative")
             if float(k) <= 0.0:
                 raise ValueError("ECN k must be positive")
-            if float(mean_size) <= 0.0:
-                raise ValueError("ECN mean trade size must be positive")
-            return out, no_update, float(A), float(k), float(mean_size)
-        return out, no_update, direct_A, direct_k, direct_mean_size
+            return out, no_update, float(A), float(k), probs
+        return out, no_update, direct_A, direct_k, direct_size_probs
 
     if selected.startswith("extra-"):
         idx = int(selected.split("-", 1)[1])
-        if 0 <= idx < len(out) and all(x is not None for x in (spread, A, k, mean_size)):
+        if 0 <= idx < len(out) and all(x is not None for x in (spread, A, k)):
             src = out[idx]
             chosen_pair = str(pair) if pair else None
             derived_cross = _derive_cross_pair(target_pair, chosen_pair)
@@ -2176,16 +2345,15 @@ def update_ecn_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, sp
                 raise ValueError("ECN A must be nonnegative")
             if float(k) <= 0.0:
                 raise ValueError("ECN k must be positive")
-            if float(mean_size) <= 0.0:
-                raise ValueError("ECN mean trade size must be positive")
 
             src.update({"name": chosen_pair or "Select FX pair", "pair": chosen_pair, "crossPair": chosen_cross})
             src["mapping"] = {"type": "crossed", "crossMid": chosen_mid, "sourceSpreadPips": float(spread)}
             src["flow"] = {"A": float(A), "k": float(k)}
-            src["meanTradeSize"] = float(mean_size)
-        return out, no_update, direct_A, direct_k, direct_mean_size
+            src["tradeSizeProbabilities"] = probs
+            src.pop("meanTradeSize", None)
+        return out, no_update, direct_A, direct_k, direct_size_probs
 
-    return out, no_update, direct_A, direct_k, direct_mean_size
+    return out, no_update, direct_A, direct_k, direct_size_probs
 
 
 @app.callback(
@@ -2242,7 +2410,7 @@ def solve_model(_clicks, *values):
             direct = {
                 "name": str(target_pair), "pair": str(target_pair),
                 "flow": deepcopy(ecn.get("flow", {})), "mapping": {"type": "identity"},
-                "meanTradeSize": float(ecn.get("meanTradeSize", 1.0)),
+                "tradeSizeProbabilities": list(ecn.get("tradeSizeProbabilities", ECN_TRADE_SIZE_PROBABILITIES)),
             }
             ecn["flowSources"] = [direct] + deepcopy(ecn_extras)
 
@@ -2409,38 +2577,11 @@ def expected_internalization_times(solution: dict[str, Any] | None, cfg: dict[st
         Q[i, i] -= rate
 
     def ecn_fill_components(source: dict[str, Any], i: int, direction: float, posted: float) -> list[tuple[float, float]]:
-        mean = float(source["meanTargetTradeSize"])
-        if mean <= 0.0 or posted <= 0.0:
-            return []
-        q = float(q_grid[i])
-        if direction > 0.0:
-            breaks = [float(x - q) for x in q_grid[i + 1:] if 1e-10 < float(x - q) < posted - 1e-10]
-        else:
-            breaks = [float(q - x) for x in q_grid[:i] if 1e-10 < float(q - x) < posted - 1e-10]
-        cuts = sorted(set(breaks)) + [posted]
-        out: list[tuple[float, float]] = []
-        a = 0.0
-        for b in cuts:
-            length = float(b - a)
-            if length <= 1e-10:
-                a = float(b)
-                continue
-            survival_a = math.exp(-a / mean)
-            mass = survival_a * (-math.expm1(-length / mean))
-            if mass > 0.0:
-                x = length / mean
-                if x < 1e-5:
-                    offset = length * (0.5 - x / 12.0 + x**3 / 720.0)
-                elif x > 700.0:
-                    offset = mean
-                else:
-                    offset = mean - length / math.expm1(x)
-                out.append((a + offset, mass))
-            a = float(b)
-        tail = math.exp(-posted / mean)
-        if tail > 0.0:
-            out.append((posted, tail))
-        return out
+        # The native HJB now uses the exact five-point ECN size distribution.
+        # No continuous interval approximation / breakpoint integration is needed.
+        del i, direction
+        return _ecn_source_fill_distribution(source, posted)
+
 
     # Customer tiers.
     for tier_policy in solution.get("tiers", []):
@@ -2568,16 +2709,54 @@ def update_path_quote_sizes(solution):
     return opts, (sizes[0] if sizes else None)
 
 
+def _mc_analytics_cache_key(cfg: dict[str, Any], q0: float) -> str:
+    return json.dumps(
+        {"cfg": cfg, "horizon": SESSION_HORIZON, "q0": float(q0)},
+        sort_keys=True, separators=(",", ":"), allow_nan=False,
+    )
+
+
+def _compute_mc_analytics(engine, cfg: dict[str, Any], solution: dict[str, Any] | None,
+                          q0: float) -> dict[str, Any]:
+    """Return deterministic analytical benchmarks, reusing them across MC runs."""
+    key = _mc_analytics_cache_key(cfg, q0)
+    with _MC_ANALYTICS_CACHE_LOCK:
+        cached = _MC_ANALYTICS_CACHE.get(key)
+        if cached is not None:
+            return deepcopy(cached)
+
+    stats = engine.statistics(SESSION_HORIZON, q0)
+    if solution:
+        stats["internalizationTimes"] = expected_internalization_times(solution, cfg)
+
+    with _MC_ANALYTICS_CACHE_LOCK:
+        # Dict insertion order is sufficient for this tiny FIFO cache.  The
+        # config-keyed Engine cache already has similar bounded semantics.
+        if key not in _MC_ANALYTICS_CACHE and len(_MC_ANALYTICS_CACHE) >= _MC_ANALYTICS_CACHE_MAX_ENTRIES:
+            oldest = next(iter(_MC_ANALYTICS_CACHE))
+            _MC_ANALYTICS_CACHE.pop(oldest, None)
+        _MC_ANALYTICS_CACHE[key] = deepcopy(stats)
+    return stats
+
+
 def _run_mc_job(job_id: str, cfg: dict[str, Any], solution: dict[str, Any] | None,
                 paths: int, q0: float, seed: int) -> None:
-    """Execute one Monte-Carlo request while publishing genuine native progress."""
+    """Execute MC and deterministic analytics concurrently, publishing progress."""
     try:
         engine = ENGINES.get(cfg)
 
         def report_progress(completed: int, total: int) -> None:
-            # Reserve the last 5% for statistics / analytical diagnostics so the
-            # modal never claims 100% while post-processing is still running.
-            percent = int(round(95.0 * completed / max(1, total)))
+            # The callback fires immediately after each reported path batch and
+            # once more on the final path, before native cross-path statistics
+            # are finalized.  Expose that final phase explicitly instead of
+            # leaving the modal apparently frozen at its last path percentage.
+            finished_paths = completed >= total and total > 0
+            percent = 98 if finished_paths else int(round(97.0 * completed / max(1, total)))
+            message = (
+                "Finalizing Monte Carlo statistics…"
+                if finished_paths
+                else f"Simulating path {completed:,} of {total:,}…"
+            )
             with _MC_JOBS_LOCK:
                 job = _MC_JOBS.get(job_id)
                 if job is None:
@@ -2585,29 +2764,41 @@ def _run_mc_job(job_id: str, cfg: dict[str, Any], solution: dict[str, Any] | Non
                 job.update(
                     completed=int(completed),
                     total=int(total),
-                    percent=max(1, min(95, percent)),
-                    message=f"Simulating path {completed:,} of {total:,}…",
+                    percent=max(1, min(98, percent)),
+                    message=message,
                 )
 
-        mc = engine.simulate(
-            SESSION_HORIZON, paths, q0, seed,
-            retained_paths=8, sample_points=381,
-            progress_callback=report_progress,
-        )
+        # statistics() and simulate() are read-only once the policy is solved.
+        # Run the deterministic benchmark on another core instead of starting
+        # it only after the last MC path has finished.  For normal production
+        # path counts it is therefore already ready by the time MC completes.
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"mc-analytics-{job_id[:8]}"
+        ) as analytics_pool:
+            analytics_future = analytics_pool.submit(
+                _compute_mc_analytics, engine, cfg, solution, q0
+            )
 
-        with _MC_JOBS_LOCK:
-            job = _MC_JOBS.get(job_id)
-            if job is not None:
-                job.update(percent=97, completed=paths, total=paths, message="Finalizing analytics…")
+            mc = engine.simulate(
+                SESSION_HORIZON, paths, q0, seed,
+                retained_paths=8, sample_points=381,
+                progress_callback=report_progress,
+                compact_result=True,
+            )
 
-        stats = engine.statistics(SESSION_HORIZON, q0)
-        if solution:
             with _MC_JOBS_LOCK:
                 job = _MC_JOBS.get(job_id)
                 if job is not None:
-                    job.update(percent=99, message="Computing internalization diagnostics…")
-            stats["internalizationTimes"] = expected_internalization_times(solution, cfg)
+                    if analytics_future.done():
+                        job.update(percent=99, completed=paths, total=paths,
+                                   message="Finalizing Monte Carlo output…")
+                    else:
+                        job.update(percent=98, completed=paths, total=paths,
+                                   message="Waiting for analytical benchmark…")
 
+            stats = analytics_future.result()
+
+        _store_mc_result(job_id, mc)
         with _MC_JOBS_LOCK:
             job = _MC_JOBS.get(job_id)
             if job is not None:
@@ -2617,7 +2808,7 @@ def _run_mc_job(job_id: str, cfg: dict[str, Any], solution: dict[str, Any] | Non
                     completed=paths,
                     total=paths,
                     message="Monte Carlo complete",
-                    mc=mc,
+                    resultId=job_id,
                     stats=stats,
                     finishedAt=time.time(),
                 )
@@ -2737,13 +2928,13 @@ def poll_mc_progress(_ticks, job_id):
         message = str(job.get("message", "Running Monte Carlo…"))
 
         if state == "done":
-            mc = job.get("mc")
+            result_id = str(job.get("resultId") or job_id)
             stats = job.get("stats")
-            # Do not remove the job here.  Multiple interval requests can be
-            # in flight concurrently while the large result is serialized.
+            # Return only a lightweight browser token; callbacks resolve the
+            # large Monte Carlo payload from the in-process result cache.
             # Returning the same completed payload is intentionally idempotent.
             return (
-                None, mc, stats, {"display": "none"}, True, False,
+                None, {"resultId": result_id}, stats, {"display": "none"}, True, False,
                 "100", "Monte Carlo complete", f"{total:,} / {total:,} paths", "100%",
                 "Monte Carlo complete", "status ready",
             )
@@ -2772,6 +2963,7 @@ def poll_mc_progress(_ticks, job_id):
     Input("mc-store", "data"), Input("stats-store", "data"),
 )
 def render_mc(mc, stats):
+    mc = _resolve_mc_store(mc)
     if not mc or not stats:
         return "—", "—", "—", "—", "—", "—", go.Figure(), go.Figure(), go.Figure(), [], None
     pnl = np.asarray(mc["pnlBase"], dtype=float)
@@ -2844,6 +3036,7 @@ def update_mc_rfq_validation_tiers(solution, cfg):
     Input("mc-rfq-tier-select", "value"),
 )
 def render_mc_rfq_validation(mc, solution, cfg, tier_index):
+    mc = _resolve_mc_store(mc)
     if not mc or not solution or not cfg or tier_index is None:
         return go.Figure(), go.Figure(), go.Figure()
     try:
@@ -2862,6 +3055,7 @@ def render_mc_rfq_validation(mc, solution, cfg, tier_index):
     Input("fill-tier-metric", "value"), Input("solution-store", "data"), Input("config-store", "data"),
 )
 def render_path(mc, path_index, quote_size, fill_tier_metric, solution, cfg):
+    mc = _resolve_mc_store(mc)
     if not mc or path_index is None or not mc.get("samplePaths"):
         return go.Figure(), go.Figure(), go.Figure(), go.Figure(), go.Figure(), "No retained path"
     path = mc["samplePaths"][int(path_index)]

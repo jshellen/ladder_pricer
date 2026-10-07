@@ -245,8 +245,8 @@ int main() {
     assert(a.rfq_events.size() >= a.fills.size());
     assert(won_rfq_events == a.fills.size());
 
-    // Passive ECN parent trades have an exponential size distribution. A hit
-    // partially fills our posted quote when the incoming parent trade is
+    // Passive ECN parent trades use the fixed discrete source-size pillars. A
+    // hit partially fills our posted quote when the incoming parent trade is
     // smaller, and can never execute above the posted target-equivalent size.
     PricingProblem ecn_problem(
         grid(), .002, 0,
@@ -255,7 +255,8 @@ int main() {
         PassiveECN(
             {0.5},
             AggregatedECNFlow(std::vector<ECNFlowSource>{
-                ECNFlowSource("EURSEK", ExponentialFlow(100.0, 1.0), 1.0, 1.0, 0.20),
+                ECNFlowSource("EURSEK", ExponentialFlow(100.0, 1.0), 1.0, 1.0,
+                              std::vector<double>{0.20, 0.20, 0.20, 0.20, 0.20}),
             }),
             1.0, 0.0));
     auto ecn_solution = HowardSolver(ecn_problem).solve();
@@ -275,7 +276,10 @@ int main() {
     assert(ecn_fills > 0);
     assert(saw_partial);
     for (const auto& event : ecn_mc.sample_paths.front().ecn_arrivals) {
-        assert(event.source_trade_size >= 0.0);
+        const std::vector<double> pillars{1.0, 0.75, 0.50, 0.25, 0.10};
+        assert(std::any_of(pillars.begin(), pillars.end(), [&](double x) {
+            return std::abs(event.source_trade_size - x) < 1e-12;
+        }));
         assert(event.target_fill_size >= 0.0);
         assert(event.target_fill_size <= 1.0 + 1e-12);
     }

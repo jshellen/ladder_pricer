@@ -271,21 +271,30 @@ private:
 
 class ECNFlowSource {
 public:
+    // ECN parent trade sizes are discrete source-base currency pillars:
+    // 1.00M, 0.75M, 0.50M, 0.25M and 0.10M.
     ECNFlowSource(std::string name, ExponentialFlow flow,
-                  double delta_scale = 1.0, double source_size_per_target = 1.0,
-                  double mean_trade_size = 1.0);
+                  double delta_scale = 1.0, double source_size_per_target = 1.0);
+    ECNFlowSource(std::string name, ExponentialFlow flow,
+                  double delta_scale, double source_size_per_target,
+                  std::vector<double> trade_size_probabilities);
+    // Backward-compatible constructor: discretize an exponential parent-size
+    // model onto the fixed pillars using midpoint bins.
+    ECNFlowSource(std::string name, ExponentialFlow flow,
+                  double delta_scale, double source_size_per_target,
+                  double legacy_mean_trade_size);
 
     const std::string& name() const noexcept { return name_; }
     const ExponentialFlow& flow() const noexcept { return flow_; }
     double delta_scale() const noexcept { return delta_scale_; }
     double source_size_per_target() const noexcept { return source_size_per_target_; }
-    // Mean of the exponential parent-trade size distribution, measured in
-    // millions of the source pair's base currency.
-    double mean_trade_size() const noexcept { return mean_trade_size_; }
-    // Same mean expressed in target-pair base-currency millions.
+    const std::vector<double>& trade_sizes() const noexcept { return trade_sizes_; }
+    const std::vector<double>& trade_size_probabilities() const noexcept { return trade_size_probabilities_; }
+    double mean_trade_size() const noexcept;
     double mean_target_trade_size() const noexcept {
-        return mean_trade_size_ / source_size_per_target_;
+        return mean_trade_size() / source_size_per_target_;
     }
+    double sample_trade_size(std::mt19937_64& rng) const;
 
     // Map the target-pair master delta into the source-pair quote.  The same
     // affine convention is used by customer Tier flow sources:
@@ -297,12 +306,10 @@ public:
     // into the equivalent target-pair reach X_target.
     double target_reach(double source_reach) const noexcept;
 
-    // Parent ECN trade size is exponential and independent of price reach.
-    // Our realized target-pair fill is min(X_target, target_posted_size).  The
-    // methods below expose the capped distribution. fill_components() returns
-    // probability-weighted representative sizes. If breakpoints are supplied,
-    // each continuous interval is represented by its exact conditional mean;
-    // this makes expectations exact for piecewise-linear value interpolation.
+    // Parent ECN trade size is discrete and independent of price reach. Our
+    // realized target-pair fill is the incoming source-size pillar capped by
+    // the posted source-equivalent quantity and mapped back to target inventory.
+    // fill_components() exposes the exact finite distribution used by the HJB.
     double full_fill_probability(double target_posted_size) const;
     double expected_fill_size(double target_posted_size) const;
     std::vector<std::pair<double, double>> fill_components(
@@ -314,7 +321,8 @@ private:
     ExponentialFlow flow_;
     double delta_scale_;
     double source_size_per_target_;
-    double mean_trade_size_;
+    std::vector<double> trade_sizes_;
+    std::vector<double> trade_size_probabilities_;
 };
 
 class AggregatedECNFlow {

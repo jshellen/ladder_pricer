@@ -28,6 +28,21 @@ def _number(values: Mapping[str, Any], key: str) -> float:
         raise ValueError(f"{key} must be numeric, got {value!r}") from exc
 
 
+def _ecn_trade_size_probabilities(values: Mapping[str, Any], fallback: list[float]) -> list[float]:
+    raw = values.get("ecn-size-probs")
+    if raw is None:
+        probs = [float(x) for x in fallback]
+    else:
+        if not isinstance(raw, (list, tuple)) or len(raw) != 5:
+            raise ValueError("ECN trade-size probabilities must contain five entries")
+        probs = [float(x) for x in raw]
+    if any((not 0.0 <= p <= 1.0) for p in probs):
+        raise ValueError("ECN trade-size probabilities must lie between 0 and 1")
+    if abs(sum(probs) - 1.0) > 1e-9:
+        raise ValueError("ECN trade-size probabilities must sum to 1")
+    return probs
+
+
 def build_config(values: Mapping[str, Any]) -> dict[str, Any]:
     """Build the native model config from named Dash component values.
 
@@ -102,7 +117,9 @@ def build_config(values: Mapping[str, Any]) -> dict[str, Any]:
             "A": _number(values, "ecn-A") if values.get("ecn-A") is not None else ecn_default["flow"]["A"],
             "k": _number(values, "ecn-k") if values.get("ecn-k") is not None else ecn_default["flow"]["k"],
         },
-        "meanTradeSize": _number(values, "ecn-mean-size") if values.get("ecn-mean-size") is not None else ecn_default["meanTradeSize"],
+        "tradeSizeProbabilities": _ecn_trade_size_probabilities(
+            values, ecn_default["tradeSizeProbabilities"]
+        ),
         "quoteSize": _number(values, "ecn-size") if values.get("ecn-size") is not None else ecn_default["quoteSize"],
         "makerFeePips": _number(values, "ecn-fee") if values.get("ecn-fee") is not None else ecn_default["makerFeePips"],
     }

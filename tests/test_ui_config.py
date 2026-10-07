@@ -36,7 +36,7 @@ def ui_values_from_default():
     values.update({
         "ecn-enabled": ["on"] if ecn["enabled"] else [],
         "ecn-A": ecn["flow"]["A"], "ecn-k": ecn["flow"]["k"],
-        "ecn-mean-size": ecn["meanTradeSize"],
+        "ecn-size-probs": list(ecn["tradeSizeProbabilities"]),
         "ecn-dmin": ecn["minDelta"], "ecn-dmax": ecn["maxDelta"],
         "ecn-size": ecn["quoteSize"], "ecn-fee": ecn["makerFeePips"],
     })
@@ -174,7 +174,7 @@ def test_continuous_parameters_accept_extra_decimal_precision():
         "dp-fee": 0.3125,
         "ecn-A": 0.15125,
         "ecn-k": 0.24125,
-        "ecn-mean-size": 0.8125,
+        "ecn-size-probs": [0.30, 0.20, 0.15, 0.10, 0.25],
         "ecn-size": 1.125,
         "ecn-fee": 3.125,
     })
@@ -190,7 +190,7 @@ def test_continuous_parameters_accept_extra_decimal_precision():
     assert cfg["darkPool"]["p0"] == 0.1125
     assert cfg["darkPool"]["feePips"] == 0.3125
     assert cfg["passiveEcn"]["flow"]["A"] == 0.15125
-    assert cfg["passiveEcn"]["meanTradeSize"] == 0.8125
+    assert cfg["passiveEcn"]["tradeSizeProbabilities"] == [0.30, 0.20, 0.15, 0.10, 0.25]
     assert cfg["passiveEcn"]["quoteSize"] == 1.125
 
 
@@ -335,3 +335,50 @@ def test_native_rfq_sampling_is_independent_of_pricing_knots():
     assert 'linear interpolation of delta is exactly linear interpolation of price' in simulation
     assert 'build_rfq_size_support' in core
     assert 'optional_number(tier, "rfqSizeStep", 1.0)' in bindings
+
+
+def test_passive_ecn_trade_size_distribution_is_discrete_and_normalized():
+    cfg = build_config(ui_values_from_default())
+    probs = cfg["passiveEcn"]["tradeSizeProbabilities"]
+    assert len(probs) == 5
+    assert sum(probs) == pytest.approx(1.0)
+    assert all(0.0 <= p <= 1.0 for p in probs)
+
+
+def test_passive_ecn_trade_size_probabilities_must_sum_to_one():
+    values = ui_values_from_default()
+    values["ecn-size-probs"] = [0.4, 0.3, 0.2, 0.2, -0.1]
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        build_config(values)
+
+
+
+def test_pair_specific_ecn_trade_size_defaults():
+    from trinity.defaults import default_ecn_trade_size_probabilities
+
+    assert default_ecn_trade_size_probabilities("EURSEK") == [0.35, 0.08, 0.22, 0.16, 0.19]
+    assert default_ecn_trade_size_probabilities("USDSEK") == [0.34, 0.135, 0.216, 0.13, 0.179]
+    assert abs(sum(default_ecn_trade_size_probabilities("EURSEK")) - 1.0) < 1e-15
+    assert abs(sum(default_ecn_trade_size_probabilities("USDSEK")) - 1.0) < 1e-15
+
+
+def test_mc_large_result_stays_server_side():
+    """Completed MC payloads should not be serialized wholesale through dcc.Store."""
+    from pathlib import Path
+
+    app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
+    assert '_MC_RESULTS:' in app_source
+    assert '_resolve_mc_store' in app_source
+    assert '{"resultId": result_id}' in app_source
+    assert 'compact_result=True' in app_source
+
+
+def test_mc_inventory_quantiles_use_parallel_selection_not_full_sort():
+    """Large runs must avoid the old O(sample_points * paths log paths) tail."""
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "cpp" / "src" / "simulation.cpp").read_text()
+    assert 'percentile_select' in source
+    assert 'std::nth_element' in source
+    assert 'std::atomic<int> next_snapshot' in source
+    assert 'std::sort(snapshot.begin(), snapshot.end())' not in source
