@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 from pybind11.setup_helpers import Pybind11Extension, build_ext
 from setuptools import find_packages, setup
 
@@ -12,6 +14,12 @@ sources = [
     "cpp/src/simulation.cpp",
 ]
 
+link_kwargs = (
+    {"extra_link_args": ["-framework", "Accelerate"]}
+    if sys.platform == "darwin"
+    else {"libraries": ["lapack", "blas"]}
+)
+
 ext_modules = [
     Pybind11Extension(
         "trinity._native",
@@ -19,6 +27,7 @@ ext_modules = [
         include_dirs=["cpp/include"],
         cxx_std=17,
         extra_compile_args=["-O3", "-Wall", "-Wextra", "-Wpedantic"],
+        **link_kwargs,
     )
 ]
 

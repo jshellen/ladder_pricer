@@ -5,6 +5,11 @@
 #include <limits>
 #include <stdexcept>
 
+extern "C" {
+void dgesv_(const int* n, const int* nrhs, double* a, const int* lda,
+            int* ipiv, double* b, const int* ldb, int* info);
+}
+
 namespace ladder_pricer {
 
 DenseMatrix::DenseMatrix(std::size_t rows, std::size_t cols, double value)
@@ -107,45 +112,41 @@ std::vector<double> DenseMatrix::solve(const std::vector<double>& rhs) const {
 
 DenseMatrix DenseMatrix::solve(const DenseMatrix& rhs) const {
     if (rows_ != cols_ || rhs.rows_ != rows_) throw std::invalid_argument("linear solve shape mismatch");
-    const std::size_t n = rows_;
-    const std::size_t m = rhs.cols_;
-    DenseMatrix a = *this;
-    DenseMatrix b = rhs;
+    if (rows_ > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        rhs.cols_ > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::invalid_argument("linear system too large for LAPACK integer interface");
+    }
 
-    for (std::size_t k = 0; k < n; ++k) {
-        std::size_t pivot = k;
-        double pivot_abs = std::abs(a(k, k));
-        for (std::size_t i = k + 1; i < n; ++i) {
-            const double candidate = std::abs(a(i, k));
-            if (candidate > pivot_abs) {
-                pivot = i;
-                pivot_abs = candidate;
-            }
-        }
-        const double scale = std::max(1.0, a.norm_one());
-        if (pivot_abs <= 64.0 * std::numeric_limits<double>::epsilon() * scale) {
-            throw std::runtime_error("singular or numerically singular linear system");
-        }
-        if (pivot != k) {
-            for (std::size_t j = 0; j < n; ++j) std::swap(a(k, j), a(pivot, j));
-            for (std::size_t j = 0; j < m; ++j) std::swap(b(k, j), b(pivot, j));
-        }
+    const int n = static_cast<int>(rows_);
+    const int nrhs = static_cast<int>(rhs.cols_);
+    const int lda = n;
+    const int ldb = n;
 
-        const double diag = a(k, k);
-        for (std::size_t i = k + 1; i < n; ++i) {
-            const double factor = a(i, k) / diag;
-            a(i, k) = 0.0;
-            for (std::size_t j = k + 1; j < n; ++j) a(i, j) -= factor * a(k, j);
-            for (std::size_t j = 0; j < m; ++j) b(i, j) -= factor * b(k, j);
+    // LAPACK uses column-major storage; DenseMatrix is row-major.
+    std::vector<double> a_col(static_cast<std::size_t>(n) * static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j) {
+            a_col[static_cast<std::size_t>(j) * n + i] = (*this)(static_cast<std::size_t>(i), static_cast<std::size_t>(j));
+        }
+    }
+    std::vector<double> b_col(static_cast<std::size_t>(n) * static_cast<std::size_t>(nrhs));
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < nrhs; ++j) {
+            b_col[static_cast<std::size_t>(j) * n + i] = rhs(static_cast<std::size_t>(i), static_cast<std::size_t>(j));
         }
     }
 
-    DenseMatrix x(n, m);
-    for (std::size_t j = 0; j < m; ++j) {
-        for (std::size_t ii = n; ii-- > 0;) {
-            double sum = b(ii, j);
-            for (std::size_t k = ii + 1; k < n; ++k) sum -= a(ii, k) * x(k, j);
-            x(ii, j) = sum / a(ii, ii);
+    std::vector<int> piv(static_cast<std::size_t>(n));
+    int info = 0;
+    dgesv_(&n, &nrhs, a_col.data(), &lda, piv.data(), b_col.data(), &ldb, &info);
+    if (info < 0) throw std::runtime_error("LAPACK dgesv received an invalid argument");
+    if (info > 0) throw std::runtime_error("singular or numerically singular linear system");
+
+    DenseMatrix x(rows_, rhs.cols_);
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < nrhs; ++j) {
+            x(static_cast<std::size_t>(i), static_cast<std::size_t>(j)) =
+                b_col[static_cast<std::size_t>(j) * n + i];
         }
     }
     return x;

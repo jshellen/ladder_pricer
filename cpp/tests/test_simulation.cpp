@@ -288,6 +288,36 @@ int main() {
         assert(event.target_fill_size <= 1.0 + 1e-12);
     }
 
+    {
+        // Stochastic-volatility Monte Carlo: the retained path must actually
+        // visit more than one calibrated volatility state when Q has active
+        // transitions, and the path vectors must remain aligned.
+        std::vector<Tier> vol_tiers;
+        vol_tiers.emplace_back("Vol MC tier", std::vector<double>{1.0},
+            LogisticFlow(0.02,0.1,0.01,0.50,6.0,0.0),
+            SaturatingMarkout(0.0,0.5), false,-10.0,100.0);
+        const std::vector<double> sigmas{0.0005,0.0015};
+        const std::vector<std::vector<double>> qvol{{-2.0,2.0},{2.0,-2.0}};
+        PricingProblem vol_problem(
+            grid(),0.002,0.0,QuadraticPenalty(0.75,sigmas[0]),
+            VolatilityModel(sigmas,qvol,0),InternalizationTime(4,.07,.0084),
+            std::move(vol_tiers));
+        auto vol_solution=HowardSolver(vol_problem).solve();
+        assert(vol_solution.diagnostics.converged);
+        auto vol_mc=MonteCarloSimulator(vol_problem,vol_solution,11.5)
+            .run(5.0,1,0.0,0.0,20261009,1,11);
+        assert(vol_mc.sample_paths.size()==1);
+        const auto& vp=vol_mc.sample_paths.front();
+        assert(vp.volatility_states.size()==vp.times.size());
+        assert(!vp.volatility_states.empty());
+        bool saw_other=false;
+        for(int state:vp.volatility_states){
+            assert(state==0 || state==1);
+            if(state!=0) saw_other=true;
+        }
+        assert(saw_other);
+    }
+
     std::cout << "market_points=" << a.spots.size()
               << " trades=" << coarse.trade_count.front() << "\n";
     return 0;

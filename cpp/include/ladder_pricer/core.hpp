@@ -155,11 +155,31 @@ private:
     double tau2_;
 };
 
+class VolatilityModel {
+public:
+    VolatilityModel(std::vector<double> sigma_states,
+                    std::vector<std::vector<double>> generator_per_minute,
+                    std::size_t initial_state = 0);
+
+    const std::vector<double>& sigma_states() const noexcept { return sigma_states_; }
+    const std::vector<std::vector<double>>& generator() const noexcept { return generator_; }
+    std::size_t initial_state() const noexcept { return initial_state_; }
+    std::size_t state_count() const noexcept { return sigma_states_.size(); }
+    double sigma(std::size_t state) const { return sigma_states_.at(state); }
+    bool stochastic() const noexcept { return sigma_states_.size() > 1; }
+
+private:
+    std::vector<double> sigma_states_;
+    std::vector<std::vector<double>> generator_;
+    std::size_t initial_state_ = 0;
+};
+
 class QuadraticPenalty {
 public:
     QuadraticPenalty(double risk_aversion, double sigma);
 
     double value(double inventory) const noexcept;
+    double value(double inventory, double sigma) const noexcept;
     double risk_aversion() const noexcept { return risk_aversion_; }
     double sigma() const noexcept { return sigma_; }
 
@@ -397,11 +417,21 @@ public:
                    std::vector<Tier> tiers,
                    std::optional<DarkPool> dark_pool = std::nullopt,
                    std::optional<PassiveECN> passive_ecn = std::nullopt);
+    PricingProblem(std::vector<double> operational_inventory_grid,
+                   double spread,
+                   double spot_drift,
+                   QuadraticPenalty penalty,
+                   VolatilityModel volatility,
+                   InternalizationTime internalization_time,
+                   std::vector<Tier> tiers,
+                   std::optional<DarkPool> dark_pool = std::nullopt,
+                   std::optional<PassiveECN> passive_ecn = std::nullopt);
 
     const InventoryGrid& grid() const noexcept { return grid_; }
     double spread() const noexcept { return spread_; }
     double spot_drift() const noexcept { return spot_drift_; }
     const QuadraticPenalty& penalty() const noexcept { return penalty_; }
+    const VolatilityModel& volatility() const noexcept { return volatility_; }
     const InternalizationTime& internalization_time() const noexcept { return internalization_time_; }
     const std::vector<Tier>& tiers() const noexcept { return tiers_; }
     const std::optional<DarkPool>& dark_pool() const noexcept { return dark_pool_; }
@@ -417,6 +447,7 @@ private:
     double spread_;
     double spot_drift_;
     QuadraticPenalty penalty_;
+    VolatilityModel volatility_;
     InternalizationTime internalization_time_;
     std::vector<Tier> tiers_;
     std::optional<DarkPool> dark_pool_;
@@ -450,24 +481,36 @@ struct SolverDiagnostics {
 
 struct Solution {
     std::vector<double> q_grid;
+    // Legacy/default volatility slice (initial volatility state).
     std::vector<double> value;
+    // Full operational value surface: [volatility_state][inventory_index].
+    std::vector<double> volatility_states;
+    std::vector<std::vector<double>> value_by_volatility;
     std::vector<double> solve_q_grid;
     std::vector<double> value_solve;
     // Operational policies are convenient for pricing/UI use.
     std::vector<LadderPolicy> tier_policies;
+    std::vector<std::vector<LadderPolicy>> tier_policies_by_volatility;
     std::optional<DarkPoolPolicy> dark_pool_policy;
+    std::vector<std::optional<DarkPoolPolicy>> dark_pool_policies_by_volatility;
     std::optional<PassiveECNPolicy> passive_ecn_policy;
+    std::vector<std::optional<PassiveECNPolicy>> passive_ecn_policies_by_volatility;
 
     // Full hidden-grid policies are retained for simulation and diagnostics.
     std::vector<LadderPolicy> solve_tier_policies;
+    std::vector<std::vector<LadderPolicy>> solve_tier_policies_by_volatility;
     std::optional<DarkPoolPolicy> solve_dark_pool_policy;
+    std::vector<std::optional<DarkPoolPolicy>> solve_dark_pool_policies_by_volatility;
     std::optional<PassiveECNPolicy> solve_passive_ecn_policy;
+    std::vector<std::optional<PassiveECNPolicy>> solve_passive_ecn_policies_by_volatility;
     double average_reward = 0.0;
     double hard_inventory_limit = 0.0;
     SolverDiagnostics diagnostics;
     // Final self-consistent policy-implied markout exposure curves, sliced to
     // q_grid for diagnostics/UI.
     std::vector<MarkoutExposureCurve> markout_exposure;
+    // Full operational exposure surfaces flattened as [vol][q] inside each curve.
+    std::vector<MarkoutExposureCurve> markout_exposure_joint;
 };
 
 class BellmanModel {

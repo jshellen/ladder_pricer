@@ -1006,9 +1006,21 @@ def mc_rfq_validation_figures(
     return arrival_fig, win_fig, inventory_fig
 
 
-def quote_inventory_figure(solution: dict[str, Any], cfg: dict[str, Any], tier_index: int) -> go.Figure:
-    tier_sol = solution["tiers"][int(tier_index)]
-    tier = _tier_cfg(cfg, int(tier_index))
+def quote_inventory_figure(
+    solution: dict[str, Any],
+    cfg: dict[str, Any],
+    tier_index: int,
+    volatility_index: int | None = None,
+) -> go.Figure:
+    ti = int(tier_index)
+    tiers_by_vol = solution.get("tiersByVolatility", [])
+    sigmas = solution.get("volatilityStatesPips", [])
+    vi = int(volatility_index) if volatility_index is not None else int(solution.get("initialVolatilityState", 0))
+    if tiers_by_vol and 0 <= vi < len(tiers_by_vol):
+        tier_sol = tiers_by_vol[vi][ti]
+    else:
+        tier_sol = solution["tiers"][ti]
+    tier = _tier_cfg(cfg, ti)
     spread_pips = float(cfg["spreadPips"])
     q = np.asarray(solution["qGrid"], dtype=float)
     fig = go.Figure()
@@ -1025,7 +1037,8 @@ def quote_inventory_figure(solution: dict[str, Any], cfg: dict[str, Any], tier_i
             line=dict(color=ASK_COLOR, dash=dash), legendgroup=f"size-{j}",
         ))
     fig.add_hline(y=0, line_dash="dot")
-    fig.update_layout(title=f"Quotes vs inventory · {tier['name']}", xaxis_title="Inventory q [EUR M]", yaxis_title="Quote relative to mid [pips]", template="trinity_dark")
+    sigma_suffix = f" · σ={float(sigmas[vi]):.2f} pips/√min" if sigmas and 0 <= vi < len(sigmas) else ""
+    fig.update_layout(title=f"Quotes vs inventory · {tier['name']}{sigma_suffix}", xaxis_title="Inventory q [EUR M]", yaxis_title="Quote relative to mid [pips]", template="trinity_dark")
     return fig
 
 
@@ -1106,6 +1119,101 @@ def ladder_table(solution: dict[str, Any], cfg: dict[str, Any], tier_index: int,
             f"{float(_volume_premium_pips(a0,ad,spread_pips)):.3f}",
         ])
     return _simple_table(["Size [M]","Bid δ","Ask δ","Bid vs mid [pips]","Ask vs mid [pips]","Bid vol prem [pips]","Ask vol prem [pips]"],rows)
+
+
+def value_volatility_heatmap(solution: dict[str, Any]) -> go.Figure:
+    fig = go.Figure()
+    q = np.asarray(solution.get("qGrid", []), dtype=float) if solution else np.asarray([])
+    sigmas = np.asarray(solution.get("volatilityStatesPips", []), dtype=float) if solution else np.asarray([])
+    values = np.asarray(solution.get("valueByVolatility", []), dtype=float) if solution else np.asarray([])
+    if q.size and sigmas.size and values.shape == (sigmas.size, q.size):
+        fig.add_trace(go.Heatmap(
+            x=q, y=sigmas, z=values,
+            colorbar={"title": "h(q, σ)"},
+            hovertemplate="q=%{x:.2f}M<br>σ=%{y:.2f} pips/√min<br>h=%{z:.6g}<extra></extra>",
+        ))
+    else:
+        fig.add_annotation(text="Stochastic volatility solution unavailable", showarrow=False)
+    fig.update_layout(
+        title="Continuation value across inventory and volatility",
+        xaxis_title="Inventory q [EUR M]",
+        yaxis_title="Volatility σ [pips / √min]",
+        template="trinity_dark",
+    )
+    return fig
+
+
+def tier_volatility_heatmap(solution: dict[str, Any], cfg: dict[str, Any], tier_index: int, side: str) -> go.Figure:
+    fig = go.Figure()
+    q = np.asarray(solution.get("qGrid", []), dtype=float) if solution else np.asarray([])
+    sigmas = np.asarray(solution.get("volatilityStatesPips", []), dtype=float) if solution else np.asarray([])
+    tiers_by_vol = solution.get("tiersByVolatility", []) if solution else []
+    ti = int(tier_index)
+    if q.size and sigmas.size and len(tiers_by_vol) == sigmas.size:
+        try:
+            first = tiers_by_vol[0][ti]
+            size = float(first["sizes"][0])
+            rows = []
+            for one_vol in tiers_by_vol:
+                tier = one_vol[ti]
+                matrix = tier[side]
+                rows.append([100.0 * float(row[0]) for row in matrix])
+            z = np.asarray(rows, dtype=float)
+            if z.shape != (sigmas.size, q.size):
+                raise ValueError("unexpected volatility-policy surface shape")
+            fig.add_trace(go.Heatmap(
+                x=q, y=sigmas, z=z,
+                colorbar={"title": "δ [%]"},
+                hovertemplate="q=%{x:.2f}M<br>σ=%{y:.2f} pips/√min<br>δ=%{z:.2f}%<extra></extra>",
+            ))
+            tier_name = str(first.get("name", f"Tier {ti + 1}"))
+            fig.update_layout(title=f"{side.capitalize()} delta by volatility · {tier_name} · {size:g}M")
+        except (IndexError, KeyError, TypeError, ValueError) as exc:
+            fig.add_annotation(text=f"Volatility policy surface unavailable: {exc}", showarrow=False)
+    else:
+        fig.add_annotation(text="Stochastic volatility policy unavailable", showarrow=False)
+    fig.update_layout(
+        xaxis_title="Inventory q [EUR M]",
+        yaxis_title="Volatility σ [pips / √min]",
+        template="trinity_dark",
+    )
+    return fig
+
+
+def passive_ecn_volatility_heatmap(solution: dict[str, Any], side: str) -> go.Figure:
+    fig = go.Figure()
+    sigmas = np.asarray(solution.get("volatilityStatesPips", []), dtype=float) if solution else np.asarray([])
+    by_vol = solution.get("passiveEcnByVolatility", []) if solution else []
+    if sigmas.size and len(by_vol) == sigmas.size and all(item is not None for item in by_vol):
+        q = np.asarray(by_vol[0].get("qGrid", []), dtype=float)
+        delta_key = f"{side}Delta"
+        active_key = f"{side}Active"
+        rows = []
+        for item in by_vol:
+            delta = np.asarray(item.get(delta_key, []), dtype=float)
+            active = np.asarray(item.get(active_key, []), dtype=bool)
+            if delta.size != q.size or active.size != q.size:
+                rows = []
+                break
+            rows.append(np.where(active, 100.0 * delta, np.nan))
+        if rows:
+            z = np.asarray(rows, dtype=float)
+            fig.add_trace(go.Heatmap(
+                x=q, y=sigmas, z=z,
+                colorbar={"title": "δ [%]"},
+                hovertemplate="q=%{x:.2f}M<br>σ=%{y:.2f} pips/√min<br>δ=%{z:.2f}%<extra></extra>",
+            ))
+            fig.update_layout(title=f"Passive ECN {side} delta by volatility")
+        else:
+            fig.add_annotation(text="ECN volatility-policy surface unavailable", showarrow=False)
+    else:
+        fig.add_annotation(text="Passive ECN disabled or stochastic-volatility policy unavailable", showarrow=False)
+    fig.update_layout(
+        xaxis_title="Inventory q [EUR M]",
+        yaxis_title="Volatility σ [pips / √min]",
+        template="trinity_dark",
+    )
+    return fig
 
 
 def internalization_figure(cfg: dict[str, Any]) -> go.Figure:
@@ -1497,8 +1605,18 @@ def passive_ecn_implied_hit_ratio_figure(solution: dict[str, Any], cfg: dict[str
     return fig
 
 
-def passive_ecn_quote_inventory_figure(solution: dict[str, Any], cfg: dict[str, Any]) -> go.Figure:
-    e = solution.get("passiveEcn") if solution else None
+def passive_ecn_quote_inventory_figure(
+    solution: dict[str, Any],
+    cfg: dict[str, Any],
+    volatility_index: int | None = None,
+) -> go.Figure:
+    sigmas = solution.get("volatilityStatesPips", []) if solution else []
+    by_vol = solution.get("passiveEcnByVolatility", []) if solution else []
+    vi = int(volatility_index) if volatility_index is not None else int(solution.get("initialVolatilityState", 0) if solution else 0)
+    if by_vol and 0 <= vi < len(by_vol):
+        e = by_vol[vi]
+    else:
+        e = solution.get("passiveEcn") if solution else None
     fig = go.Figure()
     if not e:
         fig.add_annotation(text="Passive ECN disabled", showarrow=False)
@@ -1514,7 +1632,8 @@ def passive_ecn_quote_inventory_figure(solution: dict[str, Any], cfg: dict[str, 
         _add_ecn_inventory_trace(fig, q, bid_px, bid_active, "Bid hedge", BID_COLOR, "bid")
         _add_ecn_inventory_trace(fig, q, ask_px, ask_active, "Ask hedge", ASK_COLOR, "ask")
         fig.add_hline(y=0, line_dash="dot")
-    fig.update_layout(title="Quotes vs inventory · Passive ECN", xaxis_title="Inventory q [EUR M]", yaxis_title="Quote relative to mid [pips]", template="trinity_dark")
+    sigma_suffix = f" · σ={float(sigmas[vi]):.2f} pips/√min" if sigmas and 0 <= vi < len(sigmas) else ""
+    fig.update_layout(title=f"Quotes vs inventory · Passive ECN{sigma_suffix}", xaxis_title="Inventory q [EUR M]", yaxis_title="Quote relative to mid [pips]", template="trinity_dark")
     return fig
 
 
@@ -1561,9 +1680,35 @@ sidebar = html.Aside([
             number_input("EURSEK spot", "spot", DEFAULT["spot"], "any"),
             number_input("Spread [pips]", "spread", DEFAULT["spreadPips"], "any"),
             number_input("Drift / min", "drift", DEFAULT["spotDrift"], "any"),
-            number_input("Vol [pips / √min]", "sigma", DEFAULT["sigmaPips"], "any"),
             number_input("Gamma / φ", "gamma", DEFAULT["gamma"], "any"),
         ], className="grid-2"),
+    ], True),
+    panel("Volatility", [
+        checkbox("Stochastic intraday volatility", "vol-enabled", DEFAULT["volatilityModel"]["enabled"]),
+        select(
+            "Initial volatility state",
+            "vol-initial-state",
+            [
+                {"label": f"State {i + 1} · {float(sigma):.2f} pips / √min", "value": i}
+                for i, sigma in enumerate(DEFAULT["volatilityModel"]["sigmaStatesPips"])
+            ],
+            DEFAULT["volatilityModel"]["initialState"],
+        ),
+        html.Div(
+            "Calibrated EURSEK intraday CTMC. Qσ is in transitions per minute; volatility affects inventory risk only in this first version.",
+            className="muted-note",
+        ),
+        _simple_table(
+            ["State", "σ [pips/√min]", "Mean dwell [min]"],
+            [
+                [
+                    str(i + 1),
+                    f"{float(sigma):.3f}",
+                    f"{(-1.0 / float(DEFAULT['volatilityModel']['generatorPerMinute'][i][i])):.2f}",
+                ]
+                for i, sigma in enumerate(DEFAULT["volatilityModel"]["sigmaStatesPips"])
+            ],
+        ),
     ], True),
     # Legacy tau(q) parameters are no longer user controls.  Keep the Dash
     # components mounted invisibly because the config/callback plumbing still
@@ -1620,6 +1765,7 @@ policy_tab = html.Div([
     dcc.Tabs(id="policy-subtabs", value="overview", children=[
         dcc.Tab(label="Overview", value="overview", children=html.Div([
             diagnostic_expander("Continuation value h(q)", graph("value-chart"), open_=True),
+            diagnostic_expander("Value surface by volatility", graph("value-volatility-heatmap")),
             diagnostic_expander("Policy-implied markout exposure (resolvent)", graph("internalization-chart")),
             diagnostic_expander("Bellman residual", graph("residual-chart")),
             diagnostic_expander("Value-function change", graph("value-change-chart")),
@@ -1637,7 +1783,12 @@ policy_tab = html.Div([
             diagnostic_expander("Win probabilities", graph("hit-ratio-chart")),
             diagnostic_expander("Implied hit ratios vs inventory", graph("implied-hit-chart")),
             diagnostic_expander("Markouts", graph("markout-chart")),
-            diagnostic_expander("Quotes vs inventory", graph("quote-inventory-chart")),
+            diagnostic_expander("Quotes vs inventory", [
+                html.Div([select("Volatility state", "tier-quote-vol-select", [], None)], className="toolbar"),
+                graph("quote-inventory-chart"),
+            ]),
+            diagnostic_expander("Bid delta by volatility (smallest rung)", graph("tier-bid-volatility-heatmap")),
+            diagnostic_expander("Ask delta by volatility (smallest rung)", graph("tier-ask-volatility-heatmap")),
             diagnostic_expander("Bid quote surface (3D)", graph("bid-surface-chart", height=500)),
             diagnostic_expander("Ask quote surface (3D)", graph("ask-surface-chart", height=500)),
             diagnostic_expander("Volume premium", [
@@ -1663,7 +1814,12 @@ policy_tab = html.Div([
             diagnostic_expander("Flow curves", graph("ecn-fill-chart")),
             diagnostic_expander("Relative intensity", graph("ecn-hit-ratio-chart")),
             diagnostic_expander("Fill intensity vs inventory", graph("ecn-implied-hit-chart")),
-            diagnostic_expander("Quotes vs inventory", graph("ecn-quote-inventory-chart")),
+            diagnostic_expander("Quotes vs inventory", [
+                html.Div([select("Volatility state", "ecn-quote-vol-select", [], None)], className="toolbar"),
+                graph("ecn-quote-inventory-chart"),
+            ]),
+            diagnostic_expander("Bid delta by volatility", graph("ecn-bid-volatility-heatmap")),
+            diagnostic_expander("Ask delta by volatility", graph("ecn-ask-volatility-heatmap")),
             diagnostic_expander("Optimal quote delta", [
                 graph("ecn-policy-chart"),
                 html.Div("Passive ECN policy", className="card-title table-section-title"),
@@ -1870,7 +2026,8 @@ app.layout = html.Div([
 CONFIG_FIELDS = [
     ("qmax", State("qmax", "value")),
     ("spot", State("spot", "value")), ("spread", State("spread", "value")), ("drift", State("drift", "value")),
-    ("sigma", State("sigma", "value")), ("gamma", State("gamma", "value")), ("tau0", State("tau0", "value")),
+    ("vol-enabled", State("vol-enabled", "value")), ("vol-initial-state", State("vol-initial-state", "value")),
+    ("gamma", State("gamma", "value")), ("tau0", State("tau0", "value")),
     ("tau1", State("tau1", "value")), ("tau2", State("tau2", "value")),
 ]
 for i in range(3):
@@ -2452,16 +2609,28 @@ def solve_model(_clicks, *values):
 
 @app.callback(
     Output("m-converged", "children"), Output("m-iterations", "children"), Output("m-rho", "children"), Output("m-residual", "children"),
-    Output("value-chart", "figure"), Output("residual-chart", "figure"), Output("value-change-chart", "figure"), Output("markout-resolvent-change-chart", "figure"), Output("internalization-chart", "figure"),
+    Output("value-chart", "figure"), Output("value-volatility-heatmap", "figure"), Output("residual-chart", "figure"), Output("value-change-chart", "figure"), Output("markout-resolvent-change-chart", "figure"), Output("internalization-chart", "figure"),
     Output("tier-select", "options"), Output("tier-select", "value"), Output("ladder-q", "options"), Output("ladder-q", "value"),
     Input("solution-store", "data"), Input("config-store", "data"),
 )
 def render_solution(solution, cfg):
     if not solution or not cfg:
-        return "—", "—", "—", "—", go.Figure(), go.Figure(), go.Figure(), go.Figure(), go.Figure(), [], None, [], None
-    fig = go.Figure(go.Scatter(x=solution["qGrid"], y=solution["value"], mode="lines+markers", name="h(q)"))
-    fig.update_layout(title="Continuation value h(q)", xaxis_title="Inventory q [EUR M]", yaxis_title="h(q)", template="trinity_dark")
-    residual_fig = convergence_figure(solution.get("bellmanResidual", []), "Bellman residual", "max |R(q) - ρ|")
+        return "—", "—", "—", "—", go.Figure(), go.Figure(), go.Figure(), go.Figure(), go.Figure(), go.Figure(), [], None, [], None
+    fig = go.Figure()
+    vol_states = solution.get("volatilityStatesPips", [])
+    value_surface = solution.get("valueByVolatility", [])
+    if vol_states and value_surface:
+        for sigma, values in zip(vol_states, value_surface):
+            fig.add_trace(go.Scatter(
+                x=solution["qGrid"], y=values, mode="lines",
+                name=f"σ={float(sigma):.2f}",
+            ))
+        fig.update_layout(title="Continuation value h(q, σ)", xaxis_title="Inventory q [EUR M]", yaxis_title="h(q, σ)", template="trinity_dark")
+    else:
+        fig.add_trace(go.Scatter(x=solution["qGrid"], y=solution["value"], mode="lines+markers", name="h(q)"))
+        fig.update_layout(title="Continuation value h(q)", xaxis_title="Inventory q [EUR M]", yaxis_title="h(q)", template="trinity_dark")
+    value_heatmap = value_volatility_heatmap(solution)
+    residual_fig = convergence_figure(solution.get("bellmanResidual", []), "Bellman residual", "max |R(q, σ) - ρ|")
     value_change_fig = convergence_figure(solution.get("valueChange", []), "Value-function change", "max |Δh|")
     markout_change_fig = convergence_figure(solution.get("markoutResolventChange", []), "Markout resolvent change", "max |Δr_tau(q)|")
     internal_fig = markout_exposure_figure(solution)
@@ -2470,20 +2639,42 @@ def render_solution(solution, cfg):
     q0 = min((float(q) for q in solution["qGrid"]), key=abs) if qopts else None
     return (
         "Yes" if solution["converged"] else "No", str(solution["iterations"]),
-        f"{solution['averageReward']:.6g}", f"{solution['residual']:.3g}", fig, residual_fig, value_change_fig, markout_change_fig, internal_fig,
+        f"{solution['averageReward']:.6g}", f"{solution['residual']:.3g}", fig, value_heatmap, residual_fig, value_change_fig, markout_change_fig, internal_fig,
         opts, (0 if opts else None), qopts, q0,
     )
 
 
 @app.callback(
+    Output("tier-quote-vol-select", "options"), Output("tier-quote-vol-select", "value"),
+    Output("ecn-quote-vol-select", "options"), Output("ecn-quote-vol-select", "value"),
+    Input("solution-store", "data"),
+)
+def update_quote_volatility_dropdowns(solution):
+    if not solution:
+        return [], None, [], None
+    sigmas = [float(x) for x in solution.get("volatilityStatesPips", [])]
+    if not sigmas:
+        return [], None, [], None
+    options = [
+        {"label": f"σ = {sigma:.2f} pips / √min", "value": i}
+        for i, sigma in enumerate(sigmas)
+    ]
+    initial = int(solution.get("initialVolatilityState", len(sigmas) // 2))
+    initial = min(max(initial, 0), len(sigmas) - 1)
+    return options, initial, options, initial
+
+
+@app.callback(
     Output("rfq-arrival-chart", "figure"), Output("flow-chart", "figure"), Output("hit-ratio-chart", "figure"), Output("implied-hit-chart", "figure"),
     Output("markout-chart", "figure"), Output("quote-inventory-chart", "figure"),
+    Output("tier-bid-volatility-heatmap", "figure"), Output("tier-ask-volatility-heatmap", "figure"),
     Output("bid-surface-chart", "figure"), Output("ask-surface-chart", "figure"), Output("ladder-chart", "figure"),
     Output("flow-parameter-table", "children"), Output("ladder-table", "children"),
     Input("solution-store", "data"), Input("config-store", "data"), Input("tier-select", "value"), Input("ladder-q", "value"),
+    Input("tier-quote-vol-select", "value"),
 )
-def render_tier_diagnostics(solution, cfg, tier_index, q_value):
-    empty = (go.Figure(),) * 9 + (html.Div("Solve the model first"), html.Div("Solve the model first"))
+def render_tier_diagnostics(solution, cfg, tier_index, q_value, quote_volatility_index):
+    empty = (go.Figure(),) * 11 + (html.Div("Solve the model first"), html.Div("Solve the model first"))
     if not solution or not cfg or tier_index is None:
         return empty
     try:
@@ -2496,7 +2687,9 @@ def render_tier_diagnostics(solution, cfg, tier_index, q_value):
             hit_ratio_figure(tier, float(cfg["spreadPips"])),
             implied_hit_ratio_figure(solution, cfg, ti),
             markout_figure(tier),
-            quote_inventory_figure(solution, cfg, ti),
+            quote_inventory_figure(solution, cfg, ti, quote_volatility_index),
+            tier_volatility_heatmap(solution, cfg, ti, "bid"),
+            tier_volatility_heatmap(solution, cfg, ti, "ask"),
             quote_surface_figure(solution, cfg, ti, "bid"),
             quote_surface_figure(solution, cfg, ti, "ask"),
             ladder_figure(solution, cfg, ti, qv),
@@ -2505,7 +2698,7 @@ def render_tier_diagnostics(solution, cfg, tier_index, q_value):
         )
     except Exception as exc:
         err = html.Div(f"Tier diagnostic failed: {exc}", className="error-note")
-        return (go.Figure(),) * 9 + (err, err)
+        return (go.Figure(),) * 11 + (err, err)
 
 
 @app.callback(
@@ -2701,24 +2894,28 @@ def expected_internalization_times(solution: dict[str, Any] | None, cfg: dict[st
 @app.callback(
     Output("ecn-fill-chart", "figure"), Output("ecn-hit-ratio-chart", "figure"),
     Output("ecn-implied-hit-chart", "figure"), Output("ecn-quote-inventory-chart", "figure"),
+    Output("ecn-bid-volatility-heatmap", "figure"), Output("ecn-ask-volatility-heatmap", "figure"),
     Output("ecn-policy-chart", "figure"), Output("ecn-parameter-table", "children"),
     Output("ecn-policy-table", "children"),
     Input("solution-store", "data"), Input("config-store", "data"),
+    Input("ecn-quote-vol-select", "value"),
 )
-def render_passive_ecn_diagnostics(solution, cfg):
+def render_passive_ecn_diagnostics(solution, cfg, quote_volatility_index):
     if not solution or not cfg:
-        return (go.Figure(),) * 5 + (html.Div("Solve the model first"), html.Div("Solve the model first"))
+        return (go.Figure(),) * 7 + (html.Div("Solve the model first"), html.Div("Solve the model first"))
     if not cfg.get("passiveEcn", {}).get("enabled", False):
         disabled = go.Figure()
         disabled.add_annotation(text="Passive ECN disabled", showarrow=False)
         disabled.update_layout(template="trinity_dark")
         note = html.Div("Passive ECN disabled", className="muted-note")
-        return disabled, disabled, disabled, disabled, disabled, note, note
+        return disabled, disabled, disabled, disabled, disabled, disabled, disabled, note, note
     return (
         passive_ecn_fill_figure(cfg),
         passive_ecn_hit_ratio_figure(cfg),
         passive_ecn_implied_hit_ratio_figure(solution, cfg),
-        passive_ecn_quote_inventory_figure(solution, cfg),
+        passive_ecn_quote_inventory_figure(solution, cfg, quote_volatility_index),
+        passive_ecn_volatility_heatmap(solution, "bid"),
+        passive_ecn_volatility_heatmap(solution, "ask"),
         passive_ecn_policy_figure(solution),
         passive_ecn_parameter_table(cfg),
         passive_ecn_table(solution),

@@ -71,6 +71,10 @@ std::vector<double> numbers(const py::handle& value) {
     return py::cast<std::vector<double>>(value);
 }
 
+std::vector<std::vector<double>> number_matrix(const py::handle& value) {
+    return py::cast<std::vector<std::vector<double>>>(value);
+}
+
 std::vector<double> optional_numbers(const py::dict& object, const char* key) {
     const py::str k(key);
     return object.contains(k) ? numbers(object[k]) : std::vector<double>{};
@@ -295,6 +299,31 @@ std::optional<PassiveECN> build_passive_ecn(const py::dict& cfg, double target_s
         number(cfg, "quoteSize"), fee_price_units(cfg, "makerFeeEurPerEurM", reference_spot));
 }
 
+VolatilityModel build_volatility_model(const py::dict& cfg) {
+    const py::str key("volatilityModel");
+    if (!cfg.contains(key)) {
+        const double sigma = number(cfg, "sigmaPips") / 10000.0;
+        return VolatilityModel({sigma}, {{0.0}}, 0);
+    }
+
+    const py::dict vol = py::cast<py::dict>(cfg[key]);
+    const bool enabled = boolean(vol, "enabled");
+    const auto states_pips = numbers(vol[py::str("sigmaStatesPips")]);
+    if (states_pips.empty()) throw std::invalid_argument("volatilityModel.sigmaStatesPips must not be empty");
+    std::size_t initial = static_cast<std::size_t>(py::cast<int>(vol[py::str("initialState")]));
+    if (initial >= states_pips.size()) throw std::invalid_argument("volatilityModel.initialState is out of range");
+
+    std::vector<double> states;
+    states.reserve(states_pips.size());
+    for (double x : states_pips) states.push_back(x / 10000.0);
+
+    if (!enabled) {
+        return VolatilityModel({states[initial]}, {{0.0}}, 0);
+    }
+    auto generator = number_matrix(vol[py::str("generatorPerMinute")]);
+    return VolatilityModel(std::move(states), std::move(generator), initial);
+}
+
 PricingProblem build_problem(const py::dict& cfg, std::optional<double> gamma_override = std::nullopt) {
     const double reference_spot = number(cfg, "spot");
     std::vector<Tier> tiers;
@@ -320,13 +349,15 @@ PricingProblem build_problem(const py::dict& cfg, std::optional<double> gamma_ov
     }
 
     const py::dict internal = py::cast<py::dict>(cfg[py::str("internalization")]);
-    const double sigma = number(cfg, "sigmaPips") / 10000.0;
+    auto volatility = build_volatility_model(cfg);
+    const double sigma0 = volatility.sigma(volatility.initial_state());
     const double gamma = gamma_override.value_or(number(cfg, "gamma"));
     return PricingProblem(
         build_grid(py::cast<py::dict>(cfg[py::str("grid")])),
         number(cfg, "spreadPips") / 10000.0,
         number(cfg, "spotDrift"),
-        QuadraticPenalty(gamma, sigma),
+        QuadraticPenalty(gamma, sigma0),
+        std::move(volatility),
         InternalizationTime(number(internal, "tau0"), number(internal, "tau1"), number(internal, "tau2")),
         std::move(tiers),
         build_dark_pool(py::cast<py::dict>(cfg[py::str("darkPool")]), reference_spot),
@@ -343,6 +374,12 @@ py::dict solution_value(const Solution& solution, const PricingProblem& problem,
     py::dict out;
     out["qGrid"] = solution.q_grid;
     out["value"] = solution.value;
+    std::vector<double> volatility_pips;
+    volatility_pips.reserve(solution.volatility_states.size());
+    for (double sigma : solution.volatility_states) volatility_pips.push_back(sigma * 10000.0);
+    out["volatilityStatesPips"] = volatility_pips;
+    out["initialVolatilityState"] = static_cast<int>(problem.volatility().initial_state());
+    out["valueByVolatility"] = matrix_value(solution.value_by_volatility);
     out["averageReward"] = solution.average_reward;
     out["hardInventoryLimit"] = solution.hard_inventory_limit;
     out["converged"] = solution.diagnostics.converged;
@@ -362,6 +399,21 @@ py::dict solution_value(const Solution& solution, const PricingProblem& problem,
     }
     out["markoutExposure"] = std::move(markout_exposure);
 
+    py::list markout_by_vol;
+    const std::size_t nq_operational = solution.q_grid.size();
+    for (const auto& curve : solution.markout_exposure_joint) {
+        py::dict item;
+        item["tauMinutes"] = curve.tau_minutes;
+        py::list rows;
+        for (std::size_t v = 0; v < solution.volatility_states.size(); ++v) {
+            const auto begin = curve.effective_inventory.begin() + static_cast<std::ptrdiff_t>(v * nq_operational);
+            rows.append(std::vector<double>(begin, begin + static_cast<std::ptrdiff_t>(nq_operational)));
+        }
+        item["effectiveInventoryByVolatility"] = std::move(rows);
+        markout_by_vol.append(std::move(item));
+    }
+    out["markoutExposureByVolatility"] = std::move(markout_by_vol);
+
     py::list tier_values;
     for (std::size_t k = 0; k < solution.tier_policies.size(); ++k) {
         py::dict tier;
@@ -373,6 +425,22 @@ py::dict solution_value(const Solution& solution, const PricingProblem& problem,
         tier_values.append(std::move(tier));
     }
     out["tiers"] = std::move(tier_values);
+
+    py::list tiers_by_vol;
+    for (std::size_t v = 0; v < solution.tier_policies_by_volatility.size(); ++v) {
+        py::list one_vol;
+        for (std::size_t k = 0; k < solution.tier_policies_by_volatility[v].size(); ++k) {
+            const auto& p = solution.tier_policies_by_volatility[v][k];
+            py::dict tier;
+            tier["name"] = problem.tiers()[k].name();
+            tier["sizes"] = p.sizes;
+            tier["bid"] = matrix_value(p.bid);
+            tier["ask"] = matrix_value(p.ask);
+            one_vol.append(std::move(tier));
+        }
+        tiers_by_vol.append(std::move(one_vol));
+    }
+    out["tiersByVolatility"] = std::move(tiers_by_vol);
 
     if (solution.dark_pool_policy && problem.dark_pool()) {
         const auto& policy = *solution.dark_pool_policy;
@@ -434,6 +502,22 @@ py::dict solution_value(const Solution& solution, const PricingProblem& problem,
     } else {
         out["passiveEcn"] = py::none();
     }
+
+    py::list ecn_by_vol;
+    for (const auto& maybe_policy : solution.passive_ecn_policies_by_volatility) {
+        if (!maybe_policy) {
+            ecn_by_vol.append(py::none());
+            continue;
+        }
+        py::dict item;
+        item["qGrid"] = maybe_policy->q_grid;
+        item["bidDelta"] = maybe_policy->bid_delta;
+        item["askDelta"] = maybe_policy->ask_delta;
+        item["bidActive"] = maybe_policy->bid_active;
+        item["askActive"] = maybe_policy->ask_active;
+        ecn_by_vol.append(std::move(item));
+    }
+    out["passiveEcnByVolatility"] = std::move(ecn_by_vol);
     return out;
 }
 
@@ -546,6 +630,7 @@ py::dict path_value(const SamplePath& path) {
     out["spots"] = path.spots;
     out["inventories"] = path.inventories;
     out["cashes"] = path.cashes;
+    out["volatilityStates"] = path.volatility_states;
     py::list fills;
     for (const auto& fill : path.fills) fills.append(fill_value(fill));
     out["fills"] = std::move(fills);

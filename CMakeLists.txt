@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
 project(trinity_ladder_pricer LANGUAGES CXX)
 
+if(APPLE)
+    find_library(ACCELERATE_FRAMEWORK Accelerate REQUIRED)
+else()
+    find_package(BLAS REQUIRED)
+    find_package(LAPACK REQUIRED)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -13,6 +20,11 @@ add_library(ladder_pricer_core STATIC
     cpp/src/simulation.cpp
 )
 target_include_directories(ladder_pricer_core PUBLIC cpp/include)
+if(APPLE)
+    target_link_libraries(ladder_pricer_core PUBLIC ${ACCELERATE_FRAMEWORK})
+else()
+    target_link_libraries(ladder_pricer_core PUBLIC LAPACK::LAPACK BLAS::BLAS)
+endif()
 target_compile_options(ladder_pricer_core PRIVATE -Wall -Wextra -Wpedantic)
 
 option(TRINITY_BUILD_TESTS "Build native C++ regression tests" ON)

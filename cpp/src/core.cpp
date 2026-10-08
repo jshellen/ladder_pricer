@@ -625,6 +625,32 @@ double InternalizationTime::value(double inventory) const noexcept {
     return tau0_ + tau1_ * x + tau2_ * x * x;
 }
 
+VolatilityModel::VolatilityModel(std::vector<double> sigma_states,
+                                 std::vector<std::vector<double>> generator_per_minute,
+                                 std::size_t initial_state)
+    : sigma_states_(std::move(sigma_states)),
+      generator_(std::move(generator_per_minute)),
+      initial_state_(initial_state) {
+    require(!sigma_states_.empty(), "volatility states must not be empty");
+    require(initial_state_ < sigma_states_.size(), "initial volatility state is out of range");
+    for (double sigma : sigma_states_) {
+        require(sigma >= 0.0 && std::isfinite(sigma), "volatility states must be finite and nonnegative");
+    }
+    require(generator_.size() == sigma_states_.size(), "volatility generator has wrong row count");
+    for (std::size_t i = 0; i < generator_.size(); ++i) {
+        require(generator_[i].size() == sigma_states_.size(), "volatility generator must be square");
+        double rowsum = 0.0;
+        for (std::size_t j = 0; j < generator_[i].size(); ++j) {
+            const double rate = generator_[i][j];
+            require(std::isfinite(rate), "volatility generator entries must be finite");
+            if (i != j) require(rate >= -1e-12, "volatility off-diagonal rates must be nonnegative");
+            rowsum += rate;
+        }
+        require(std::abs(rowsum) <= 1e-9, "volatility generator rows must sum to zero");
+        require(generator_[i][i] <= 1e-12, "volatility generator diagonal must be nonpositive");
+    }
+}
+
 QuadraticPenalty::QuadraticPenalty(double risk_aversion, double sigma)
     : risk_aversion_(risk_aversion), sigma_(sigma) {
     require(risk_aversion_ >= 0.0, "risk aversion must be nonnegative");
@@ -632,7 +658,11 @@ QuadraticPenalty::QuadraticPenalty(double risk_aversion, double sigma)
 }
 
 double QuadraticPenalty::value(double inventory) const noexcept {
-    return risk_aversion_ * sigma_ * sigma_ * inventory * inventory;
+    return value(inventory, sigma_);
+}
+
+double QuadraticPenalty::value(double inventory, double sigma) const noexcept {
+    return risk_aversion_ * sigma * sigma * inventory * inventory;
 }
 
 namespace {
@@ -827,8 +857,23 @@ PricingProblem::PricingProblem(std::vector<double> operational_inventory_grid,
                                std::vector<Tier> tiers,
                                std::optional<DarkPool> dark_pool,
                                std::optional<PassiveECN> passive_ecn)
+    : PricingProblem(std::move(operational_inventory_grid), spread, spot_drift, penalty,
+                     VolatilityModel({penalty.sigma()}, {{0.0}}, 0),
+                     std::move(internalization_time), std::move(tiers),
+                     std::move(dark_pool), std::move(passive_ecn)) {}
+
+PricingProblem::PricingProblem(std::vector<double> operational_inventory_grid,
+                               double spread,
+                               double spot_drift,
+                               QuadraticPenalty penalty,
+                               VolatilityModel volatility,
+                               InternalizationTime internalization_time,
+                               std::vector<Tier> tiers,
+                               std::optional<DarkPool> dark_pool,
+                               std::optional<PassiveECN> passive_ecn)
     : grid_(std::move(operational_inventory_grid), max_inventory_jump(tiers, dark_pool, passive_ecn)),
       spread_(spread), spot_drift_(spot_drift), penalty_(std::move(penalty)),
+      volatility_(std::move(volatility)),
       internalization_time_(std::move(internalization_time)), tiers_(std::move(tiers)),
       dark_pool_(std::move(dark_pool)), passive_ecn_(std::move(passive_ecn)) {
     require(spread_ > 0.0, "spread must be positive");

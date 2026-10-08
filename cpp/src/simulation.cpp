@@ -21,6 +21,7 @@ struct Event {
     bool dark = false;
     bool ecn = false;
     bool tier_rfq = false;
+    bool volatility_transition = false;
     bool ecn_quote_active = false;
     std::size_t tier = 0;
     Side side = Side::Bid;
@@ -30,6 +31,7 @@ struct Event {
     double rate = 0.0;
     std::size_t ecn_source = 0;
     std::size_t flow_source = 0;
+    std::size_t volatility_target = 0;
 };
 
 std::size_t bracket_left(const std::vector<double>& grid, double q) {
@@ -98,7 +100,8 @@ double dark_posted(const DarkPoolPolicy& policy, Side side, double q) {
     return sizes[i];
 }
 
-std::vector<Event> events(const PricingProblem& problem, const Solution& solution, double q, bool record_all_ecn_arrivals) {
+std::vector<Event> events(const PricingProblem& problem, const Solution& solution, double q,
+                          std::size_t volatility_state, bool record_all_ecn_arrivals) {
     std::vector<Event> out;
     for (std::size_t k = 0; k < problem.tiers().size(); ++k) {
         const auto& tier = problem.tiers()[k];
@@ -119,9 +122,12 @@ std::vector<Event> events(const PricingProblem& problem, const Solution& solutio
             out.push_back(event);
         }
     }
-    if (problem.dark_pool() && solution.solve_dark_pool_policy) {
+    const auto dark_policy = !solution.solve_dark_pool_policies_by_volatility.empty()
+        ? solution.solve_dark_pool_policies_by_volatility.at(volatility_state)
+        : solution.solve_dark_pool_policy;
+    if (problem.dark_pool() && dark_policy) {
         const auto& venue = *problem.dark_pool();
-        const auto& policy = *solution.solve_dark_pool_policy;
+        const auto& policy = *dark_policy;
         for (Side side : {Side::Bid, Side::Ask}) {
             const double dir = direction(side);
             const int u = static_cast<int>(std::llround(dark_posted(policy, side, q)));
@@ -133,13 +139,22 @@ std::vector<Event> events(const PricingProblem& problem, const Solution& solutio
             // realized fill is min(incoming size, our posted size).
             const double rate = venue.arrivals(side).arrival_intensity();
             if (rate > 0.0) {
-                out.push_back({true, false, false, false, 0, side, static_cast<double>(u), 0.0, venue.fee(side), rate});
+                Event event;
+                event.dark = true;
+                event.side = side;
+                event.size = static_cast<double>(u);
+                event.fee = venue.fee(side);
+                event.rate = rate;
+                out.push_back(std::move(event));
             }
         }
     }
-    if (problem.passive_ecn() && solution.solve_passive_ecn_policy) {
+    const auto ecn_policy = !solution.solve_passive_ecn_policies_by_volatility.empty()
+        ? solution.solve_passive_ecn_policies_by_volatility.at(volatility_state)
+        : solution.solve_passive_ecn_policy;
+    if (problem.passive_ecn() && ecn_policy) {
         const auto& venue = *problem.passive_ecn();
-        const auto& policy = *solution.solve_passive_ecn_policy;
+        const auto& policy = *ecn_policy;
         const std::size_t i = bracket_left(policy.q_grid, q);
         const double z = venue.quote_size();
 
@@ -173,6 +188,20 @@ std::vector<Event> events(const PricingProblem& problem, const Solution& solutio
                 out.push_back(std::move(event));
             }
         }
+    }
+
+    // Exogenous volatility CTMC transitions.  Q is in 1/min, matching all
+    // other event intensities in the simulator.
+    const auto& qvol = problem.volatility().generator();
+    for (std::size_t target = 0; target < problem.volatility().state_count(); ++target) {
+        if (target == volatility_state) continue;
+        const double rate = qvol[volatility_state][target];
+        if (rate <= 0.0) continue;
+        Event event;
+        event.volatility_transition = true;
+        event.volatility_target = target;
+        event.rate = rate;
+        out.push_back(std::move(event));
     }
     return out;
 }
@@ -224,7 +253,8 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                                            double q0, std::uint64_t seed,
                                            int retained_paths, int sample_points,
                                            const std::function<void(int, int)>& progress) const {
-    if (horizon < 0.0 || paths <= 0 || sigma < 0.0 || sample_points < 2) {
+    (void)sigma;  // volatility now comes from PricingProblem::volatility()
+    if (horizon < 0.0 || paths <= 0 || sample_points < 2) {
         throw std::invalid_argument("invalid Monte Carlo settings");
     }
     if (reference_spot_ <= 0.0) throw std::invalid_argument("reference spot must be positive");
@@ -282,6 +312,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
         double spot = reference_spot_;
         double cash = 0.0;  // million quote currency
         int trades = 0;
+        std::size_t vol_state = problem_.volatility().initial_state();
         std::map<double, double> impacts;
         int next_sample = 0;
         long long market_tick = 1;
@@ -293,6 +324,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
             detailed.spots.push_back(spot);
             detailed.inventories.push_back(q);
             detailed.cashes.push_back(cash);
+            detailed.volatility_states.push_back(static_cast<int>(vol_state));
         }
 
         // Inventory is piecewise constant, so confidence-band snapshots do not need
@@ -312,7 +344,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
         record_inventory_through(0.0);
 
         while (t < horizon - 1e-12) {
-            const auto ev = events(problem_, solution_, q, retain);
+            const auto ev = events(problem_, solution_, q, vol_state, retain);
             double total_rate = 0.0;
             for (const auto& e : ev) total_rate += e.rate;
 
@@ -338,7 +370,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                 if (next_market_time >= event_time - 1e-12 || next_market_time > horizon + 1e-12) break;
 
                 record_inventory_before(next_market_time);
-                spot = advance_spot(spot, next_market_time - t, sigma, problem_.spot_drift(), impacts, spot_rng);
+                spot = advance_spot(spot, next_market_time - t, problem_.volatility().sigma(vol_state), problem_.spot_drift(), impacts, spot_rng);
                 t = next_market_time;
                 ++market_tick;
                 record_inventory_through(t);
@@ -347,12 +379,13 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                     detailed.spots.push_back(spot);
                     detailed.inventories.push_back(q);
                     detailed.cashes.push_back(cash);
+                    detailed.volatility_states.push_back(static_cast<int>(vol_state));
                 }
             }
 
             record_inventory_before(event_time);
             if (event_time > t + 1e-12) {
-                spot = advance_spot(spot, event_time - t, sigma, problem_.spot_drift(), impacts, spot_rng);
+                spot = advance_spot(spot, event_time - t, problem_.volatility().sigma(vol_state), problem_.spot_drift(), impacts, spot_rng);
                 t = event_time;
             } else {
                 t = event_time;
@@ -365,6 +398,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                     detailed.spots.push_back(spot);
                     detailed.inventories.push_back(q);
                     detailed.cashes.push_back(cash);
+                    detailed.volatility_states.push_back(static_cast<int>(vol_state));
                 }
                 break;
             }
@@ -378,11 +412,26 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
 
             const double before = q;
 
+            if (chosen->volatility_transition) {
+                vol_state = chosen->volatility_target;
+                if (retain) {
+                    detailed.times.push_back(t);
+                    detailed.spots.push_back(spot);
+                    detailed.inventories.push_back(q);
+                    detailed.cashes.push_back(cash);
+                    detailed.volatility_states.push_back(static_cast<int>(vol_state));
+                }
+                record_inventory_through(t);
+                continue;
+            }
+
             if (chosen->tier_rfq) {
                 const Side rfq_side = uniform(event_rng) < 0.5 ? Side::Bid : Side::Ask;
                 const double dir = direction(rfq_side);
                 const auto& tier = problem_.tiers()[chosen->tier];
-                const auto& policy = solution_.solve_tier_policies[chosen->tier];
+                const auto& policy = !solution_.solve_tier_policies_by_volatility.empty()
+                    ? solution_.solve_tier_policies_by_volatility.at(vol_state).at(chosen->tier)
+                    : solution_.solve_tier_policies.at(chosen->tier);
                 const auto& source = tier.flow().sources().at(chosen->flow_source);
                 const std::size_t size_idx = source.sample_target_size_index(event_rng);
                 const double rfq_size = source.target_sizes().at(size_idx);
@@ -470,6 +519,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                             detailed.spots.push_back(spot);
                             detailed.inventories.push_back(q);
                             detailed.cashes.push_back(cash);
+                            detailed.volatility_states.push_back(static_cast<int>(vol_state));
                         }
                         continue;
                     }
@@ -513,6 +563,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                             detailed.spots.push_back(spot);
                             detailed.inventories.push_back(q);
                             detailed.cashes.push_back(cash);
+                            detailed.volatility_states.push_back(static_cast<int>(vol_state));
                         }
                         continue;
                     }
@@ -559,6 +610,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                 detailed.spots.push_back(spot);
                 detailed.inventories.push_back(q);
                 detailed.cashes.push_back(cash);
+                detailed.volatility_states.push_back(static_cast<int>(vol_state));
             }
             record_inventory_through(t);
         }

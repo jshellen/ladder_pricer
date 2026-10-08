@@ -8,7 +8,9 @@ def ui_values_from_default():
     values = {
         "qmax": cfg["grid"]["maxAbs"],
         "spot": cfg["spot"], "spread": cfg["spreadPips"], "drift": cfg["spotDrift"],
-        "sigma": cfg["sigmaPips"], "gamma": cfg["gamma"],
+        "vol-enabled": ["on"] if cfg["volatilityModel"]["enabled"] else [],
+        "vol-initial-state": cfg["volatilityModel"]["initialState"],
+        "gamma": cfg["gamma"],
         "tau0": cfg["internalization"]["tau0"], "tau1": cfg["internalization"]["tau1"], "tau2": cfg["internalization"]["tau2"],
     }
     for i, tier in enumerate(cfg["tiers"]):
@@ -47,6 +49,26 @@ def test_default_dash_values_round_trip_to_model_config():
     expected = default_config()
     actual = build_config(ui_values_from_default())
     assert actual == expected
+
+
+def test_volatility_calibration_round_trips_from_ui():
+    values = ui_values_from_default()
+    cfg = build_config(values)
+    vol = cfg["volatilityModel"]
+    assert vol["enabled"] is True
+    assert vol["initialState"] == 2
+    assert len(vol["sigmaStatesPips"]) == 5
+    assert len(vol["generatorPerMinute"]) == 5
+    assert cfg["sigmaPips"] == pytest.approx(vol["sigmaStatesPips"][2])
+
+
+def test_disabling_stochastic_vol_keeps_selected_sigma_as_legacy_scalar():
+    values = ui_values_from_default()
+    values["vol-enabled"] = []
+    values["vol-initial-state"] = 4
+    cfg = build_config(values)
+    assert cfg["volatilityModel"]["enabled"] is False
+    assert cfg["sigmaPips"] == pytest.approx(cfg["volatilityModel"]["sigmaStatesPips"][4])
 
 
 def test_markout_checkbox_is_not_parsed_as_markout_level():
@@ -151,7 +173,6 @@ def test_continuous_parameters_accept_extra_decimal_precision():
         "spot": 11.51234567,
         "spread": 19.375,
         "drift": 0.000012345,
-        "sigma": 20.125,
         "gamma": 0.0144,
         "tau0": 4.0125,
         "tau1": 0.00703125,

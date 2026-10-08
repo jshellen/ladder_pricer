@@ -59,7 +59,14 @@ def build_config(values: Mapping[str, Any]) -> dict[str, Any]:
     cfg["spot"] = _number(values, "spot")
     cfg["spreadPips"] = _number(values, "spread")
     cfg["spotDrift"] = _number(values, "drift")
-    cfg["sigmaPips"] = _number(values, "sigma")
+    vol = cfg.get("volatilityModel", {})
+    vol["enabled"] = checked(values.get("vol-enabled"))
+    if values.get("vol-initial-state") is not None:
+        vol["initialState"] = int(values.get("vol-initial-state"))
+    cfg["volatilityModel"] = vol
+    states = vol.get("sigmaStatesPips", [cfg.get("sigmaPips", 0.0)])
+    initial = min(max(int(vol.get("initialState", 0)), 0), len(states) - 1)
+    cfg["sigmaPips"] = float(states[initial])
     cfg["gamma"] = _number(values, "gamma")
     cfg["internalization"] = {
         "tau0": _number(values, "tau0"),

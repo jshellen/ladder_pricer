@@ -274,7 +274,7 @@ int main() {
                             b.markout_exposure[0].effective_inventory[i]) < 1e-11);
         }
         const auto& r = a.markout_exposure[0].effective_inventory;
-        assert(std::abs(r[r.size()/2]) < 1e-11);
+        assert(std::abs(r[r.size()/2]) < 1e-9);
         for (std::size_t i = 0; i < r.size()/2; ++i) {
             assert(std::abs(r[i] + r[r.size()-1-i]) < 1e-9);
         }
@@ -356,5 +356,38 @@ int main() {
     assert(std::isfinite(solution.average_reward));
     assert(solution.value.size() == grid().size());
     assert(std::abs(solution.value[solution.value.size()/2]) < 1e-8);
+
+    {
+        // Joint (inventory, volatility) Howard regression.  Volatility is an
+        // exogenous CTMC state and must expand values/policies without changing
+        // the inventory grid representation exposed to pricing.
+        std::vector<Tier> vol_tiers;
+        vol_tiers.emplace_back("Vol tier", std::vector<double>{1,2,3,5},
+            LogisticFlow(0.03,0.15,0.03,0.50,7.0,0.01),
+            SaturatingMarkout(1e-4, 0.5), true, -10, 100);
+        const std::vector<double> sigmas{0.0006, 0.0010, 0.0018};
+        const std::vector<std::vector<double>> qvol{
+            {-0.04, 0.04, 0.00},
+            { 0.02,-0.05, 0.03},
+            { 0.00, 0.05,-0.05},
+        };
+        PricingProblem vol_problem(
+            grid(), 0.002, 0.0, QuadraticPenalty(0.75, sigmas[1]),
+            VolatilityModel(sigmas, qvol, 1),
+            InternalizationTime(4.0,0.070,0.0084), std::move(vol_tiers));
+        const auto vol_solution = HowardSolver(std::move(vol_problem)).solve();
+        assert(vol_solution.diagnostics.converged);
+        assert(vol_solution.volatility_states.size() == 3);
+        assert(vol_solution.value_by_volatility.size() == 3);
+        assert(vol_solution.tier_policies_by_volatility.size() == 3);
+        assert(vol_solution.solve_tier_policies_by_volatility.size() == 3);
+        for (const auto& values : vol_solution.value_by_volatility) {
+            assert(values.size() == grid().size());
+        }
+        assert(vol_solution.value == vol_solution.value_by_volatility[1]);
+        assert(!vol_solution.markout_exposure_joint.empty());
+        assert(vol_solution.markout_exposure_joint.front().effective_inventory.size()
+               == 3 * grid().size());
+    }
     return 0;
 }

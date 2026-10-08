@@ -94,6 +94,7 @@ struct SamplePath {
     std::vector<double> spots;
     std::vector<double> inventories;
     std::vector<double> cashes;
+    std::vector<int> volatility_states;
     std::vector<FillEvent> fills;
     std::vector<RfqEvent> rfq_events;
     std::vector<EcnArrivalEvent> ecn_arrivals;
