@@ -86,12 +86,11 @@ def build_config(values: Mapping[str, Any]) -> dict[str, Any]:
             "rfqSizeStep": _number(values, f"{p}-rfq-size-step") if values.get(f"{p}-rfq-size-step") is not None else 1.0,
             "flow": flow,
             "markout": {
-                "impactScalePips": _number(values, f"{p}-impact"),
-                "sizeExponent": _number(values, f"{p}-impact-beta"),
-                "tauMinutes": _number(values, f"{p}-impact-tau"),
+                "asymptoticEurPerEurM": _number(values, f"{p}-markout-level"),
+                "tauMinutes": _number(values, f"{p}-markout-tau"),
             },
             "useMarkout": checked(values.get(f"{p}-markout-enabled")),
-            "feePips": _number(values, f"{p}-fee") if values.get(f"{p}-fee") is not None else 0.0,
+            "feeEurPerEurM": _number(values, f"{p}-fee") if values.get(f"{p}-fee") is not None else 0.0,
             "deltaMin": _number(values, f"{p}-dmin"),
             "deltaMax": _number(values, f"{p}-dmax"),
         })
@@ -102,7 +101,7 @@ def build_config(values: Mapping[str, Any]) -> dict[str, Any]:
         "lambda": _number(values, "dp-lambda"),
         "mu": _number(values, "dp-mu"),
         "p0": _number(values, "dp-p0"),
-        "feePips": _number(values, "dp-fee"),
+        "feeEurPerEurM": _number(values, "dp-fee"),
         "postedSizes": parse_numbers(values.get("dp-sizes", "")),
     }
     ecn_default = cfg["passiveEcn"]
@@ -121,6 +120,6 @@ def build_config(values: Mapping[str, Any]) -> dict[str, Any]:
             values, ecn_default["tradeSizeProbabilities"]
         ),
         "quoteSize": _number(values, "ecn-size") if values.get("ecn-size") is not None else ecn_default["quoteSize"],
-        "makerFeePips": _number(values, "ecn-fee") if values.get("ecn-fee") is not None else ecn_default["makerFeePips"],
+        "makerFeeEurPerEurM": _number(values, "ecn-fee") if values.get("ecn-fee") is not None else ecn_default["makerFeeEurPerEurM"],
     }
     return cfg

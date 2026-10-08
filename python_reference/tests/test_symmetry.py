@@ -36,7 +36,7 @@ def build_solution(
         steepness=10.0,
         volume_shift=0.015,
     )
-    markout = lp.SaturatingMarkoutModel(impact_scale=0.0, size_exponent=0.5, tau=0.5)
+    markout = lp.SaturatingMarkoutModel(asymptotic_price_move=0.0, tau=0.5)
     tier = lp.MDPTier(
         name="test",
         sizes=sizes,
@@ -206,24 +206,28 @@ class TestDarkPoolZIPPolicySymmetry(unittest.TestCase):
 class TestSaturatingMarkoutModel(unittest.TestCase):
 
     def setUp(self):
-        self.model = lp.SaturatingMarkoutModel(
-            impact_scale=1.0 / 10_000.0, size_exponent=0.5, tau=0.5
+        self.model = lp.SaturatingMarkoutModel(asymptotic_price_move=1.0 / 10_000.0, tau=0.5
         )
 
     def test_zero_at_trade_time_and_increases_then_saturates(self):
-        self.assertEqual(self.model.expected_markout(5.0, 0.0), 0.0)
-        vals = [self.model.expected_markout(5.0, t) for t in [0.1, 0.5, 1.0, 3.0]]
+        self.assertEqual(self.model.expected_markout(0.0), 0.0)
+        vals = [self.model.expected_markout(t) for t in [0.1, 0.5, 1.0, 3.0]]
         self.assertTrue(all(vals[i + 1] > vals[i] for i in range(len(vals) - 1)))
-        asymptote = self.model.asymptotic_markout(5.0)
+        asymptote = self.model.asymptotic_markout()
         self.assertLess(vals[-1], asymptote)
         self.assertAlmostEqual(
-            self.model.expected_markout(5.0, 20.0), asymptote, delta=1e-12
+            self.model.expected_markout(20.0), asymptote, delta=1e-12
         )
 
-    def test_larger_trade_has_larger_total_impact(self):
+    def test_normalized_markout_is_size_independent(self):
         t = 1.0
-        impacts = [self.model.expected_markout(z, t) for z in [1.0, 2.0, 5.0, 10.0, 20.0]]
-        self.assertTrue(all(impacts[i + 1] > impacts[i] for i in range(len(impacts) - 1)))
+        expected = self.model.expected_markout(t)
+        tier = lp.MDPTier(
+            name="T", sizes=[1.0, 2.0, 5.0, 10.0, 20.0],
+            markout_model=self.model,
+        )
+        impacts = [tier.expected_markout(z, t) for z in tier.sizes()]
+        self.assertTrue(all(abs(x - expected) < 1e-15 for x in impacts))
 
 
 class TestQuadraticInventoryPenalty(unittest.TestCase):
@@ -288,8 +292,7 @@ class TestProductionLikeHowardSolve(unittest.TestCase):
                 A0=A0, theta=theta, beta=beta, shift=shift,
                 steepness=steepness, volume_shift=volume_shift,
             )
-            markout = lp.SaturatingMarkoutModel(
-                impact_scale=1.0 / 10_000.0, size_exponent=0.5, tau=0.5
+            markout = lp.SaturatingMarkoutModel(asymptotic_price_move=1.0 / 10_000.0, tau=0.5
             )
             tiers.append(lp.MDPTier(
                 name=f"Tier {idx + 1}", sizes=SIZES, flow_curve=flow,
@@ -327,8 +330,7 @@ class TestLowPenaltyHoward(unittest.TestCase):
                 name=f"Tier {idx + 1}",
                 sizes=SIZES,
                 flow_curve=lp.LogisticFlowCurve(A0, theta, beta, shift, steepness, volume_shift),
-                markout_model=lp.SaturatingMarkoutModel(
-                    impact_scale=1.0 / 10_000.0, size_exponent=0.5, tau=0.5
+                markout_model=lp.SaturatingMarkoutModel(asymptotic_price_move=1.0 / 10_000.0, tau=0.5
                 ),
                 delta_min=-10.0,
                 delta_max=100.0,
@@ -516,9 +518,7 @@ class TestMonteCarloPnL(unittest.TestCase):
                 A0=0.15, theta=0.0, beta=0.0, shift=0.2,
                 steepness=8.0, volume_shift=0.01,
             ),
-            markout_model=lp.SaturatingMarkoutModel(
-                impact_scale=0.5 / 10_000.0, size_exponent=0.5, tau=0.5,
-            ),
+            markout_model=lp.SaturatingMarkoutModel(asymptotic_price_move=0.5 / 10_000.0, tau=0.5),
             delta_min=-5.0,
             delta_max=5.0,
         )
@@ -545,9 +545,7 @@ class TestMonteCarloPnL(unittest.TestCase):
                     A0=A0, theta=theta, beta=beta, shift=shift,
                     steepness=steepness, volume_shift=volume_shift,
                 ),
-                markout_model=lp.SaturatingMarkoutModel(
-                    impact_scale=impact_pips / 10_000.0, size_exponent=0.5, tau=tau,
-                ),
+                markout_model=lp.SaturatingMarkoutModel(asymptotic_price_move=impact_pips / 10_000.0, tau=tau),
                 delta_min=-10.0, delta_max=100.0, use_markout=True,
             )
 

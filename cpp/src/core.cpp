@@ -108,8 +108,37 @@ double direction(Side side) noexcept {
     return side == Side::Bid ? 1.0 : -1.0;
 }
 
+// Expected PnL from one RFQ information shock under the current fixed policy.
+// The resolvent supplies
+//   r_tau(q) = beta E_q[int_0^inf exp(-beta t) Q_t dt], beta=1/tau,
+// i.e. the inventory actually exposed while an exponential markout develops.
+// A customer sell (our Bid, dir=+1) predicts a downward move; a customer buy
+// (our Ask, dir=-1) predicts an upward move, matching Monte Carlo's -dir sign.
+double rfq_markout_inventory_pnl(const PricingProblem& problem, const Tier& tier,
+                                 Side side, double inventory_after_branch,
+                                 const MarkoutResolvent* markout) {
+    if (!tier.use_markout() || markout == nullptr) return 0.0;
+    const auto* exposure = markout->effective_inventory(tier.markout().tau_minutes());
+    if (exposure == nullptr) {
+        throw std::runtime_error("missing policy markout resolvent for tier '" + tier.name() + "'");
+    }
+    const double effective_q = problem.grid().interpolate(*exposure, inventory_after_branch);
+    return (-direction(side)) * tier.markout().asymptotic() * effective_q;
+}
+
 
 }  // namespace
+
+const std::vector<double>* MarkoutResolvent::effective_inventory(double tau_minutes) const noexcept {
+    constexpr double tol = 1e-12;
+    for (const auto& curve : curves) {
+        if (std::abs(curve.tau_minutes - tau_minutes) <=
+            tol * std::max({1.0, std::abs(curve.tau_minutes), std::abs(tau_minutes)})) {
+            return &curve.effective_inventory;
+        }
+    }
+    return nullptr;
+}
 
 // ---------------------------------------------------------------------------
 // Inventory grid
@@ -578,23 +607,17 @@ double AggregatedFlow::optimal_delta(double target_size, double spread, double a
     return objective(candidate) >= best_value ? candidate : knots[best];
 }
 
-SaturatingMarkout::SaturatingMarkout(double impact_scale, double size_exponent, double tau_minutes)
-    : impact_scale_(impact_scale), size_exponent_(size_exponent), tau_minutes_(tau_minutes) {
-    require(impact_scale_ >= 0.0, "markout impact scale must be nonnegative");
-    require(size_exponent_ >= 0.0, "markout size exponent must be nonnegative");
+SaturatingMarkout::SaturatingMarkout(double asymptotic_price_move, double tau_minutes)
+    : asymptotic_price_move_(asymptotic_price_move), tau_minutes_(tau_minutes) {
+    require(asymptotic_price_move_ >= 0.0, "markout asymptotic price move must be nonnegative");
     require(tau_minutes_ > 0.0, "markout tau must be positive");
 }
 
-double SaturatingMarkout::asymptotic(double size) const {
-    require(size > 0.0, "trade size must be positive");
-    return impact_scale_ * std::pow(size, size_exponent_);
-}
-
-double SaturatingMarkout::expected(double size, double minutes) const {
+double SaturatingMarkout::expected(double minutes) const {
     if (minutes <= 0.0) {
         return 0.0;
     }
-    return asymptotic(size) * (-std::expm1(-minutes / tau_minutes_));
+    return asymptotic_price_move_ * (-std::expm1(-minutes / tau_minutes_));
 }
 
 double InternalizationTime::value(double inventory) const noexcept {
@@ -900,10 +923,18 @@ std::vector<double> PolicyBuilder::build_ladder(const Tier& tier,
         }
 
         const double q_next = inventory + dq;
-        const double markout = tier.use_markout()
-            ? tier.markout().expected(z, problem_.internalization_time().value(q_next))
-            : 0.0;
-        const double additive = -z * (markout + tier.fee()) + grid.interpolate(value, q_next) - hq;
+        // Delta only changes the probability of taking the win branch.  The
+        // RFQ information event occurs in either branch, so the optimizer sees
+        // the incremental value G_win - G_loss.  Win markout is applied to the
+        // post-trade inventory q_next over tau(q_next); loss markout is applied
+        // to the unchanged inventory q over tau(q).
+        const double win_markout_pnl =
+            rfq_markout_inventory_pnl(problem_, tier, side, q_next, markout_);
+        const double loss_markout_pnl =
+            rfq_markout_inventory_pnl(problem_, tier, side, inventory, markout_);
+        const double additive = -z * tier.fee()
+                              + win_markout_pnl - loss_markout_pnl
+                              + grid.interpolate(value, q_next) - hq;
         const double unconstrained = tier.flow().optimal_delta(
             z, problem_.spread(), additive, lower, upper);
         row.push_back(std::clamp(unconstrained, lower, upper));
@@ -933,16 +964,27 @@ double PolicyBuilder::ladder_hamiltonian(const Tier& tier,
     double total = 0.0;
     for (std::size_t j = 0; j < tier.sizes().size(); ++j) {
         const double z = tier.sizes()[j];
-        if (!grid.admissible(inventory, dir * z)) continue;
+        const double rfq_rate = tier.flow().rfq_arrival_rate(z);
+        const double loss_markout_pnl =
+            rfq_markout_inventory_pnl(problem_, tier, side, inventory, markout_);
+
+        // Even when the inventory hard limit makes the RFQ untradeable, the
+        // RFQ still arrives and carries information, exactly as in Monte Carlo.
+        if (!grid.admissible(inventory, dir * z)) {
+            total += rfq_rate * loss_markout_pnl;
+            continue;
+        }
+
         const double q_next = inventory + dir * z;
-        const double markout = tier.use_markout()
-            ? tier.markout().expected(z, problem_.internalization_time().value(q_next))
-            : 0.0;
         const double delta = row_values[j];
-        const double rate = tier.flow().arrival_rate(delta, z);
-        total += rate * (z * (problem_.spread() * (0.5 - delta) - tier.fee())
-                         - z * markout
-                         + grid.interpolate(value, q_next) - hq);
+        const double win_rate = tier.flow().arrival_rate(delta, z);
+        const double loss_rate = std::max(0.0, rfq_rate - win_rate);
+        const double win_markout_pnl =
+            rfq_markout_inventory_pnl(problem_, tier, side, q_next, markout_);
+        const double win_value = z * (problem_.spread() * (0.5 - delta) - tier.fee())
+                               + win_markout_pnl
+                               + grid.interpolate(value, q_next) - hq;
+        total += win_rate * win_value + loss_rate * loss_markout_pnl;
     }
     return total;
 }
@@ -1275,20 +1317,27 @@ std::vector<double> BellmanModel::rhs(const std::vector<double>& value, const Po
                 const auto& row = matrix(p, side, i);
                 for (std::size_t j = 0; j < tier.sizes().size(); ++j) {
                     const double z = tier.sizes()[j];
-                    const double dq = direction(side) * z;
+                    const double dir = direction(side);
+                    const double dq = dir * z;
+                    const double rfq_rate = tier.flow().rfq_arrival_rate(z);
+                    const double loss_markout_pnl =
+                        rfq_markout_inventory_pnl(problem_, tier, side, q, markout_);
+
                     if (!grid.admissible(q, dq)) {
+                        total += rfq_rate * loss_markout_pnl;
                         continue;
                     }
+
                     const double delta = row[j];
-                    const double rate = tier.flow().arrival_rate(delta, z);
+                    const double win_rate = tier.flow().arrival_rate(delta, z);
+                    const double loss_rate = std::max(0.0, rfq_rate - win_rate);
                     const double q_next = q + dq;
-                    const double markout = tier.use_markout()
-                        ? tier.markout().expected(z, problem_.internalization_time().value(q_next))
-                        : 0.0;
-                    const double fill_value = z * (problem_.spread() * (0.5 - delta) - tier.fee())
-                                            - z * markout
-                                            + grid.interpolate(value, q_next) - hq;
-                    total += rate * fill_value;
+                    const double win_markout_pnl =
+                        rfq_markout_inventory_pnl(problem_, tier, side, q_next, markout_);
+                    const double win_value = z * (problem_.spread() * (0.5 - delta) - tier.fee())
+                                           + win_markout_pnl
+                                           + grid.interpolate(value, q_next) - hq;
+                    total += win_rate * win_value + loss_rate * loss_markout_pnl;
                 }
             }
         }

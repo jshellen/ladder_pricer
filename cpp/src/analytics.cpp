@@ -167,14 +167,33 @@ PnlStatistics PnlAnalytics::statistics(double horizon, double sigma, double q0) 
             for(Side side:{Side::Bid,Side::Ask}){
                 const double dir=direction(side); const auto& deltas=row(policy,side,i);
                 for(double z:tier.rfq_sizes()){
-                    if(!problem_.grid().admissible(q,dir*z)) continue;
+                    const double rfq_rate=tier.flow().rfq_arrival_rate(z);
+                    if(rfq_rate<=0.0) continue;
+
+                    const bool admissible=problem_.grid().admissible(q,dir*z);
                     const double delta=interpolate_size_row(tier.sizes(),deltas,z);
-                    const double rate=tier.flow().arrival_rate(delta,z);
-                    if(rate<=0.0) continue;
-                    std::vector<double> shift(nvars,0.0);
-                    shift[static_cast<std::size_t>(pnlvar)]=z*(problem_.spread()*(0.5-delta)-tier.fee());
-                    if(tier.use_markout()) shift[static_cast<std::size_t>(tau_to_var[tier.markout().tau_minutes()])]=-dir*tier.markout().asymptotic(z);
-                    events.push_back({q+dir*z,rate,std::move(shift)});
+                    const double win_rate=admissible?tier.flow().arrival_rate(delta,z):0.0;
+                    const double loss_rate=std::max(0.0,rfq_rate-win_rate);
+
+                    // Won RFQ: execution cashflow + inventory transition.  The
+                    // information shock is the same RFQ markout shock used by
+                    // Monte Carlo and subsequently acts on the post-trade
+                    // inventory through the mark-to-market dynamics.
+                    if(win_rate>0.0){
+                        std::vector<double> shift(nvars,0.0);
+                        shift[static_cast<std::size_t>(pnlvar)]=z*(problem_.spread()*(0.5-delta)-tier.fee());
+                        if(tier.use_markout()) shift[static_cast<std::size_t>(tau_to_var[tier.markout().tau_minutes()])]=-dir*tier.markout().asymptotic();
+                        events.push_back({q+dir*z,win_rate,std::move(shift)});
+                    }
+
+                    // Lost (or hard-limit blocked) RFQ: inventory is unchanged,
+                    // but the RFQ is still an information event.  Do not add a
+                    // no-op event when markout is disabled.
+                    if(loss_rate>0.0 && tier.use_markout()){
+                        std::vector<double> shift(nvars,0.0);
+                        shift[static_cast<std::size_t>(tau_to_var[tier.markout().tau_minutes()])]=-dir*tier.markout().asymptotic();
+                        events.push_back({q,loss_rate,std::move(shift)});
+                    }
                 }
             }
         }

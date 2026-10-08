@@ -144,9 +144,9 @@ std::vector<Event> events(const PricingProblem& problem, const Solution& solutio
         const double z = venue.quote_size();
 
         // Each ECN source has its own exogenous market-trade clock and reach
-        // distribution.  The policy chooses one master target-pair delta.  A
-        // crossed source maps it to d_source = 0.5 + alpha(d_target-0.5), so
-        // its fill threshold is alpha*(0.5-d_target) in source spread units.
+        // distribution.  The policy chooses one master target-pair delta. A
+        // crossed source inherits the same normalized delta because its quote
+        // and theoretical spread are both obtained by crossing the target pair.
         // Keeping the parent clocks separate preserves the exact sum of the
         // source-specific fill curves and lets retained paths identify which
         // ECN pair generated an arrival/fill.
@@ -443,7 +443,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
 
                 // An RFQ is an information event whether or not we win it.
                 if (tier.use_markout()) {
-                    impacts[tier.markout().tau_minutes()] += -dir * tier.markout().asymptotic(rfq_size);
+                    impacts[tier.markout().tau_minutes()] += -dir * tier.markout().asymptotic();
                 }
 
                 if (retain && won) {
@@ -478,8 +478,8 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
 
                     // A parent trade arrived on one concrete ECN source. Sample
                     // reach in that source pair, then convert it back into the
-                    // target-pair spread coordinate for diagnostics.  The quote
-                    // wins exactly when source_reach >= alpha*(0.5-d_target).
+                    // target-pair spread coordinate for diagnostics. For crossed
+                    // sources delta_scale=1, so d_source == d_target exactly.
                     const auto& source = venue.flow().sources().at(chosen->ecn_source);
                     std::exponential_distribution<double> reach_distribution(source.flow().k());
                     const double source_reach = reach_distribution(event_rng);

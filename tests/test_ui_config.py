@@ -21,16 +21,16 @@ def ui_values_from_default():
             f"{p}-A0": tier["flow"]["A0"],
             f"{p}-theta": tier["flow"]["theta"], f"{p}-beta": tier["flow"]["beta"],
             f"{p}-steep": tier["flow"]["steepness"], f"{p}-shift": tier["flow"]["shift"], f"{p}-vshift": tier["flow"]["volumeShift"],
-            f"{p}-fee": tier.get("feePips", 0.0),
+            f"{p}-fee": tier.get("feeEurPerEurM", 0.0),
             f"{p}-markout-enabled": ["on"] if tier["useMarkout"] else [],
-            f"{p}-impact": tier["markout"]["impactScalePips"], f"{p}-impact-beta": tier["markout"]["sizeExponent"],
-            f"{p}-impact-tau": tier["markout"]["tauMinutes"], f"{p}-dmin": tier["deltaMin"], f"{p}-dmax": tier["deltaMax"],
+            f"{p}-markout-level": tier["markout"]["asymptoticEurPerEurM"],
+            f"{p}-markout-tau": tier["markout"]["tauMinutes"], f"{p}-dmin": tier["deltaMin"], f"{p}-dmax": tier["deltaMax"],
         })
     dp = cfg["darkPool"]
     values.update({
         "dp-enabled": ["on"] if dp["enabled"] else [],
         "dp-lambda": dp["lambda"], "dp-mu": dp["mu"], "dp-p0": dp["p0"],
-        "dp-fee": dp["feePips"], "dp-sizes": ", ".join(str(x) for x in dp["postedSizes"]),
+        "dp-fee": dp["feeEurPerEurM"], "dp-sizes": ", ".join(str(x) for x in dp["postedSizes"]),
     })
     ecn = cfg["passiveEcn"]
     values.update({
@@ -38,7 +38,7 @@ def ui_values_from_default():
         "ecn-A": ecn["flow"]["A"], "ecn-k": ecn["flow"]["k"],
         "ecn-size-probs": list(ecn["tradeSizeProbabilities"]),
         "ecn-dmin": ecn["minDelta"], "ecn-dmax": ecn["maxDelta"],
-        "ecn-size": ecn["quoteSize"], "ecn-fee": ecn["makerFeePips"],
+        "ecn-size": ecn["quoteSize"], "ecn-fee": ecn["makerFeeEurPerEurM"],
     })
     return values
 
@@ -49,13 +49,13 @@ def test_default_dash_values_round_trip_to_model_config():
     assert actual == expected
 
 
-def test_markout_checkbox_is_not_parsed_as_impact_scale():
+def test_markout_checkbox_is_not_parsed_as_markout_level():
     values = ui_values_from_default()
     values["t0-markout-enabled"] = ["on"]
-    values["t0-impact"] = 1.25
+    values["t0-markout-level"] = 12.5
     actual = build_config(values)
     assert actual["tiers"][0]["useMarkout"] is True
-    assert actual["tiers"][0]["markout"]["impactScalePips"] == 1.25
+    assert actual["tiers"][0]["markout"]["asymptoticEurPerEurM"] == 12.5
 
 
 def test_checked_dash_checklist_values():
@@ -109,7 +109,7 @@ def test_tier_fee_round_trips_from_ui():
     values = ui_values_from_default()
     values["t0-fee"] = 1.75
     cfg = build_config(values)
-    assert cfg["tiers"][0]["feePips"] == 1.75
+    assert cfg["tiers"][0]["feeEurPerEurM"] == 1.75
 
 
 def test_tier_theta_accepts_four_decimal_precision():
@@ -163,9 +163,8 @@ def test_continuous_parameters_accept_extra_decimal_precision():
         "t0-shift": 0.52125,
         "t0-vshift": 0.0026125,
         "t0-fee": 0.1375,
-        "t0-impact": 1.0125,
-        "t0-impact-beta": 0.5125,
-        "t0-impact-tau": 0.4875,
+        "t0-markout-level": 9.0125,
+        "t0-markout-tau": 0.4875,
         "t0-dmin": -10.125,
         "t0-dmax": 99.875,
         "dp-lambda": 2.0125,
@@ -188,7 +187,7 @@ def test_continuous_parameters_accept_extra_decimal_precision():
     assert cfg["darkPool"]["lambda"] == 2.0125
     assert cfg["darkPool"]["mu"] == 2.0125
     assert cfg["darkPool"]["p0"] == 0.1125
-    assert cfg["darkPool"]["feePips"] == 0.3125
+    assert cfg["darkPool"]["feeEurPerEurM"] == 0.3125
     assert cfg["passiveEcn"]["flow"]["A"] == 0.15125
     assert cfg["passiveEcn"]["tradeSizeProbabilities"] == [0.30, 0.20, 0.15, 0.10, 0.25]
     assert cfg["passiveEcn"]["quoteSize"] == 1.125
@@ -382,3 +381,58 @@ def test_mc_inventory_quantiles_use_parallel_selection_not_full_sort():
     assert 'std::nth_element' in source
     assert 'std::atomic<int> next_snapshot' in source
     assert 'std::sort(snapshot.begin(), snapshot.end())' not in source
+
+
+def test_default_ecn_fee_is_three_eur_per_eurm():
+    cfg = default_config()
+    fee = cfg["passiveEcn"]["makerFeeEurPerEurM"]
+    assert fee == pytest.approx(3.0)
+
+def test_default_tier_fees_are_three_eur_per_eurm():
+    cfg = default_config()
+    assert [tier["feeEurPerEurM"] for tier in cfg["tiers"]] == pytest.approx([3.0, 3.0, 3.0])
+
+
+
+def test_crossed_fx_sources_inherit_target_delta_and_do_not_configure_source_spread():
+    """Crossed SEK sources are theoretical crosses of the target quote, so delta is 1:1."""
+    from pathlib import Path
+
+    app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
+    bindings_source = (Path(__file__).resolve().parents[1] / "cpp" / "src" / "python_bindings.cpp").read_text()
+    assert 'number_input("Source spread [pips]"' not in app_source
+    assert 'sourceSpreadPips' not in app_source
+    assert 'delta_scale = 1.0;' in bindings_source
+    assert 'crossed flow mapping requires positive crossMid' in bindings_source
+    assert 'crossed ECN flow mapping requires positive crossMid' in bindings_source
+
+
+def test_tier_markout_is_native_eur_per_eurm_and_size_independent():
+    from pathlib import Path
+
+    app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
+    defaults_source = (Path(__file__).resolve().parents[1] / "python" / "trinity" / "defaults.py").read_text()
+    assert 'Show as EUR / EURm traded' not in app_source
+    assert 'Size exponent' not in app_source
+    assert 'impactScalePips' not in app_source
+    assert 'sizeExponent' not in app_source
+    assert 'Asymptotic markout [EUR / EURm traded]' in app_source
+    assert 'Adverse markout [EUR / EURm traded]' in app_source
+    assert 'asymptoticEurPerEurM' in defaults_source
+
+
+def test_native_markout_boundary_uses_eur_per_eurm_and_no_size_scaling():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    bindings = (root / "cpp" / "src" / "python_bindings.cpp").read_text()
+    core_hpp = (root / "cpp" / "include" / "ladder_pricer" / "core.hpp").read_text()
+    core_cpp = (root / "cpp" / "src" / "core.cpp").read_text()
+    assert 'number(markout, "asymptoticEurPerEurM")' in bindings
+    assert 'eur_per_eurm_to_price_units' in bindings
+    assert 'impactScalePips' not in bindings
+    assert 'sizeExponent' not in bindings
+    assert 'double asymptotic() const noexcept' in core_hpp
+    assert 'size_exponent' not in core_hpp
+    assert 'markout().asymptotic(z)' not in core_cpp
+    assert 'size_exponent' not in core_cpp

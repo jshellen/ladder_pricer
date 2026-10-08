@@ -59,8 +59,9 @@ def reference_solver_from_config(cfg: dict) -> ref.HJBLadderSolver:
                     volume_shift=float(flow["volumeShift"]),
                 ),
                 markout_model=ref.SaturatingMarkoutModel(
-                    impact_scale=float(markout["impactScalePips"]) / 10_000.0,
-                    size_exponent=float(markout["sizeExponent"]),
+                    asymptotic_price_move=(
+                        float(markout["asymptoticEurPerEurM"]) * float(cfg["spot"]) / 1_000_000.0
+                    ),
                     tau=float(markout["tauMinutes"]),
                 ),
                 delta_min=float(spec["deltaMin"]),

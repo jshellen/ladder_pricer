@@ -12,6 +12,18 @@ constexpr double kTolerance = 1e-10;
 
 double direction(Side side) noexcept { return side == Side::Bid ? 1.0 : -1.0; }
 
+double rfq_markout_inventory_pnl(const PricingProblem& problem, const Tier& tier,
+                                 Side side, double inventory_after_branch,
+                                 const MarkoutResolvent* markout) {
+    if (!tier.use_markout() || markout == nullptr) return 0.0;
+    const auto* exposure = markout->effective_inventory(tier.markout().tau_minutes());
+    if (exposure == nullptr) {
+        throw std::runtime_error("missing policy markout resolvent for tier '" + tier.name() + "'");
+    }
+    const double effective_q = problem.grid().interpolate(*exposure, inventory_after_branch);
+    return (-direction(side)) * tier.markout().asymptotic() * effective_q;
+}
+
 const std::vector<double>& row(const LadderPolicy& policy, Side side, std::size_t i) {
     return side == Side::Bid ? policy.bid[i] : policy.ask[i];
 }
@@ -143,7 +155,8 @@ PassiveECNPolicy slice_policy(const PassiveECNPolicy& policy,
 
 }  // namespace
 
-HowardSolver::AffineOperator HowardSolver::fixed_policy_operator(const Policy& policy) const {
+HowardSolver::AffineOperator HowardSolver::fixed_policy_operator(
+        const Policy& policy, const MarkoutResolvent* markout) const {
     const auto& grid = problem_.grid();
     const auto& states = grid.states();
     const std::size_t n = states.size();
@@ -162,15 +175,28 @@ HowardSolver::AffineOperator HowardSolver::fixed_policy_operator(const Policy& p
                 for (std::size_t j = 0; j < tier.sizes().size(); ++j) {
                     const double z = tier.sizes()[j];
                     const double dq = dir * z;
-                    if (!grid.admissible(q, dq)) continue;
+                    const double rfq_rate = tier.flow().rfq_arrival_rate(z);
+                    const double loss_markout_pnl =
+                        rfq_markout_inventory_pnl(problem_, tier, side, q, markout);
+
+                    if (!grid.admissible(q, dq)) {
+                        // Hard-limit RFQs cannot fill, but their information
+                        // shock still affects the inventory we continue to hold.
+                        op.reward[i] += rfq_rate * loss_markout_pnl;
+                        continue;
+                    }
+
                     const double delta = deltas[j];
-                    const double rate = tier.flow().arrival_rate(delta, z);
+                    const double win_rate = tier.flow().arrival_rate(delta, z);
+                    const double loss_rate = std::max(0.0, rfq_rate - win_rate);
                     const double q_next = q + dq;
-                    const double markout = tier.use_markout()
-                        ? tier.markout().expected(z, problem_.internalization_time().value(q_next))
-                        : 0.0;
-                    op.reward[i] += rate * (z * (problem_.spread() * (0.5 - delta) - tier.fee()) - z * markout);
-                    add_transition(op.generator, states, i, q_next, rate);
+                    const double win_markout_pnl =
+                        rfq_markout_inventory_pnl(problem_, tier, side, q_next, markout);
+                    op.reward[i] += win_rate *
+                        (z * (problem_.spread() * (0.5 - delta) - tier.fee())
+                         + win_markout_pnl)
+                        + loss_rate * loss_markout_pnl;
+                    add_transition(op.generator, states, i, q_next, win_rate);
                 }
             }
         }
@@ -218,8 +244,45 @@ HowardSolver::AffineOperator HowardSolver::fixed_policy_operator(const Policy& p
     return op;
 }
 
-std::pair<std::vector<double>, double> HowardSolver::evaluate_policy(const Policy& policy) const {
-    const auto op = fixed_policy_operator(policy);
+MarkoutResolvent HowardSolver::markout_resolvent(const Policy& policy) const {
+    // The inventory generator is independent of markout rewards, so build it
+    // with markout disabled and use it for all exponential impact kernels.
+    const auto generator_op = fixed_policy_operator(policy, nullptr);
+    const auto& L = generator_op.generator;
+    const auto& states = problem_.grid().states();
+    const std::size_t n = states.size();
+
+    MarkoutResolvent out;
+    std::vector<double> unique_taus;
+    for (const auto& tier : problem_.tiers()) {
+        if (!tier.use_markout()) continue;
+        const double tau = tier.markout().tau_minutes();
+        const bool seen = std::any_of(unique_taus.begin(), unique_taus.end(), [&](double x) {
+            return std::abs(x - tau) <= 1e-12 * std::max({1.0, std::abs(x), std::abs(tau)});
+        });
+        if (!seen) unique_taus.push_back(tau);
+    }
+
+    for (double tau : unique_taus) {
+        const double beta = 1.0 / tau;
+        DenseMatrix A(n, n);
+        for (std::size_t i = 0; i < n; ++i) {
+            for (std::size_t j = 0; j < n; ++j) A(i, j) = -L(i, j);
+            A(i, i) += beta;
+        }
+        const auto x = A.solve(states);
+        MarkoutExposureCurve curve;
+        curve.tau_minutes = tau;
+        curve.effective_inventory.resize(n);
+        for (std::size_t i = 0; i < n; ++i) curve.effective_inventory[i] = beta * x[i];
+        out.curves.push_back(std::move(curve));
+    }
+    return out;
+}
+
+std::pair<std::vector<double>, double> HowardSolver::evaluate_policy(
+        const Policy& policy, const MarkoutResolvent& markout) const {
+    const auto op = fixed_policy_operator(policy, &markout);
     const std::size_t n = op.reward.size();
     DenseMatrix A(n + 1, n + 1);
     std::vector<double> b(n + 1, 0.0);
@@ -265,6 +328,25 @@ double HowardSolver::policy_change(const Policy& lhs, const Policy& rhs) {
     return out;
 }
 
+double HowardSolver::markout_change(const MarkoutResolvent& lhs, const MarkoutResolvent& rhs) {
+    double out = 0.0;
+    for (const auto& curve : lhs.curves) {
+        const auto* other = rhs.effective_inventory(curve.tau_minutes);
+        if (other == nullptr || other->size() != curve.effective_inventory.size()) return std::numeric_limits<double>::infinity();
+        for (std::size_t i = 0; i < other->size(); ++i) {
+            out = std::max(out, std::abs(curve.effective_inventory[i] - (*other)[i]));
+        }
+    }
+    if (lhs.curves.size() != rhs.curves.size()) return std::numeric_limits<double>::infinity();
+    return out;
+}
+
+double HowardSolver::markout_scale(const MarkoutResolvent& markout) {
+    double out = 1.0;
+    for (const auto& curve : markout.curves) out = std::max(out, max_abs(curve.effective_inventory));
+    return out;
+}
+
 double HowardSolver::policy_scale(const Policy& policy) { return max_abs_policy(policy); }
 
 Solution HowardSolver::solve() const {
@@ -273,9 +355,13 @@ Solution HowardSolver::solve() const {
     const auto& op_indices = grid.operational_indices();
     const double sqrt_eps = std::sqrt(std::numeric_limits<double>::epsilon());
 
-    PolicyBuilder builder(problem_);
-    BellmanModel bellman(problem_);
-    Policy policy = builder.initial_policy();
+    // Seed a stabilizing policy without the obsolete exogenous tau(q) closure.
+    // Each Howard step then evaluates the current policy with its own exact
+    // policy-implied markout resolvent, improves the policy, and recomputes the
+    // resolvent for the improved inventory generator.
+    PolicyBuilder initial_builder(problem_);
+    Policy policy = initial_builder.initial_policy();
+    MarkoutResolvent markout = markout_resolvent(policy);
     std::vector<double> h(states.size(), 0.0);
     double rho = 0.0;
 
@@ -283,19 +369,26 @@ Solution HowardSolver::solve() const {
     constexpr int kMaximumIterations = 256;
     for (int iteration = 1; iteration <= kMaximumIterations; ++iteration) {
         const auto h_previous = h;
-        std::tie(h, rho) = evaluate_policy(policy);
+        std::tie(h, rho) = evaluate_policy(policy, markout);
+
+        PolicyBuilder builder(problem_, &markout);
         const Policy improved = builder.improve(h, policy);
         const double p_change = policy_change(improved, policy);
-        policy = improved;
+        MarkoutResolvent improved_markout = markout_resolvent(improved);
+        const double m_change = markout_change(improved_markout, markout);
 
-        const auto rhs = bellman.rhs(h, policy);
+        BellmanModel bellman(problem_, &improved_markout);
+        const auto rhs = bellman.rhs(h, improved);
         double residual = 0.0;
         for (double x : rhs) residual = std::max(residual, std::abs(x - rho));
         double h_change = 0.0;
-        for (std::size_t i = 0; i < h.size(); ++i) h_change = std::max(h_change, std::abs(h[i] - h_previous[i]));
+        for (std::size_t i = 0; i < h.size(); ++i) {
+            h_change = std::max(h_change, std::abs(h[i] - h_previous[i]));
+        }
         const double scale = std::max({1.0, std::abs(rho), max_abs(rhs)});
         const double residual_tol = sqrt_eps * scale;
-        const double policy_tol = sqrt_eps * policy_scale(policy);
+        const double policy_tol = sqrt_eps * policy_scale(improved);
+        const double markout_tol = sqrt_eps * markout_scale(improved_markout);
 
         diagnostics.iterations = iteration;
         diagnostics.average_reward = rho;
@@ -303,17 +396,26 @@ Solution HowardSolver::solve() const {
         diagnostics.reward_upper_bound = rho + residual;
         diagnostics.value_change.push_back(h_change);
         diagnostics.bellman_residual.push_back(residual);
+        diagnostics.markout_resolvent_change.push_back(m_change);
 
-        if (residual <= residual_tol && p_change <= policy_tol) {
+        policy = improved;
+        markout = std::move(improved_markout);
+
+        if (residual <= residual_tol && p_change <= policy_tol && m_change <= markout_tol) {
             diagnostics.converged = true;
             break;
         }
     }
 
-    policy = builder.snap_operational_constraints(policy);
-    const auto final_rhs = bellman.rhs(h, policy);
+    PolicyBuilder final_builder(problem_, &markout);
+    policy = final_builder.snap_operational_constraints(policy);
+    markout = markout_resolvent(policy);
+    std::tie(h, rho) = evaluate_policy(policy, markout);
+    BellmanModel final_bellman(problem_, &markout);
+    const auto final_rhs = final_bellman.rhs(h, policy);
     double residual = 0.0;
     for (double x : final_rhs) residual = std::max(residual, std::abs(x - rho));
+    diagnostics.average_reward = rho;
     diagnostics.reward_lower_bound = rho - residual;
     diagnostics.reward_upper_bound = rho + residual;
 
@@ -329,6 +431,12 @@ Solution HowardSolver::solve() const {
     solution.tier_policies.reserve(policy.tiers.size());
     for (const auto& p : policy.tiers) {
         solution.tier_policies.push_back(slice_policy(p, op_indices, grid.operational_states()));
+    }
+    for (const auto& curve : markout.curves) {
+        MarkoutExposureCurve sliced;
+        sliced.tau_minutes = curve.tau_minutes;
+        sliced.effective_inventory = slice_values(curve.effective_inventory, op_indices);
+        solution.markout_exposure.push_back(std::move(sliced));
     }
     if (policy.dark_pool) {
         solution.solve_dark_pool_policy = *policy.dark_pool;

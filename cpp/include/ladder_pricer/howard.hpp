@@ -18,10 +18,15 @@ private:
         DenseMatrix generator;
     };
 
-    AffineOperator fixed_policy_operator(const Policy& policy) const;
-    std::pair<std::vector<double>, double> evaluate_policy(const Policy& policy) const;
+    AffineOperator fixed_policy_operator(const Policy& policy,
+                                         const MarkoutResolvent* markout = nullptr) const;
+    MarkoutResolvent markout_resolvent(const Policy& policy) const;
+    std::pair<std::vector<double>, double> evaluate_policy(
+        const Policy& policy, const MarkoutResolvent& markout) const;
 
     static double policy_change(const Policy& lhs, const Policy& rhs);
+    static double markout_change(const MarkoutResolvent& lhs, const MarkoutResolvent& rhs);
+    static double markout_scale(const MarkoutResolvent& markout);
     static double policy_scale(const Policy& policy);
 
     PricingProblem problem_;

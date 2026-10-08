@@ -8,7 +8,7 @@ from typing import Any, Callable, Iterable
 from . import _native
 
 
-_EXPECTED_ECN_PARAMETERIZATION_VERSION = 10
+_EXPECTED_ECN_PARAMETERIZATION_VERSION = 11
 if getattr(_native, "ECN_PARAMETERIZATION_VERSION", None) != _EXPECTED_ECN_PARAMETERIZATION_VERSION:
     raise RuntimeError(
         "The compiled trinity._native extension is stale. Rebuild it with "

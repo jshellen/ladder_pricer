@@ -309,7 +309,7 @@ def _default_cross_flow_source(index: int = 0, target_pair: str | None = None) -
         "name": "Select FX pair",
         "pair": None,
         "crossPair": None,
-        "mapping": {"type": "crossed", "crossMid": None, "sourceSpreadPips": 20.0},
+        "mapping": {"type": "crossed", "crossMid": None},
         "flow": {"A0": 0.01, "theta": 0.144, "beta": 0.0857, "steepness": 8.42, "shift": 0.52, "volumeShift": 0.026},
     }
 
@@ -368,7 +368,7 @@ def _default_cross_ecn_flow_source(index: int = 0, target_pair: str | None = Non
         "name": "Select FX pair",
         "pair": None,
         "crossPair": None,
-        "mapping": {"type": "crossed", "crossMid": None, "sourceSpreadPips": 20.0},
+        "mapping": {"type": "crossed", "crossMid": None},
         "flow": {"A": 0.10, "k": 8.4},
         "tradeSizeProbabilities": list(ECN_TRADE_SIZE_PROBABILITIES),
     }
@@ -429,7 +429,6 @@ def flow_source_settings_editor(source_key: str, source: dict[str, Any], target_
             dcc.Dropdown(id="flow-edit-pair", value=target_pair, options=FX_PAIR_OPTIONS),
             dcc.Dropdown(id="flow-edit-cross-pair", value=None, options=FX_PAIR_OPTIONS),
             dcc.Input(id="flow-edit-cross-mid", type="number", value=1.0),
-            dcc.Input(id="flow-edit-spread", type="number", value=1.0),
             html.Button("Remove FX pair", id="flow-source-remove-selected", n_clicks=0),
         ], style={"display": "none"})]
     else:
@@ -442,7 +441,6 @@ def flow_source_settings_editor(source_key: str, source: dict[str, Any], target_
                 _dropdown_field("Source pair", "flow-edit-pair", pair, _source_pair_options(target_pair)),
                 _dropdown_field("Cross / hedge pair", "flow-edit-cross-pair", cross_pair, _cross_pair_options(target_pair, pair), "Select hedge pair"),
                 number_input("Cross mid", "flow-edit-cross-mid", cross_mid, "any"),
-                number_input("Source spread [pips]", "flow-edit-spread", float(mapping.get("sourceSpreadPips", 20.0)), "any"),
             ], className="grid-2"),
             html.Div("Flow calibration", className="subhead"),
         ]
@@ -505,7 +503,6 @@ def ecn_flow_source_settings_editor(source_key: str, source: dict[str, Any], tar
             dcc.Dropdown(id="ecn-flow-edit-pair", value=target_pair, options=FX_PAIR_OPTIONS),
             dcc.Dropdown(id="ecn-flow-edit-cross-pair", value=None, options=FX_PAIR_OPTIONS),
             dcc.Input(id="ecn-flow-edit-cross-mid", type="number", value=1.0),
-            dcc.Input(id="ecn-flow-edit-spread", type="number", value=1.0),
             html.Button("Remove FX pair", id="ecn-flow-source-remove-selected", n_clicks=0),
         ], style={"display": "none"})]
     else:
@@ -518,7 +515,6 @@ def ecn_flow_source_settings_editor(source_key: str, source: dict[str, Any], tar
                 _ecn_dropdown_field("Source pair", "ecn-flow-edit-pair", pair, _source_pair_options(target_pair)),
                 _ecn_dropdown_field("Cross / hedge pair", "ecn-flow-edit-cross-pair", cross_pair, _cross_pair_options(target_pair, pair), "Select hedge pair"),
                 number_input("Cross mid", "ecn-flow-edit-cross-mid", cross_mid, "any"),
-                number_input("Source spread [pips]", "ecn-flow-edit-spread", float(mapping.get("sourceSpreadPips", 20.0)), "any"),
             ], className="grid-2"),
             html.Div("ECN flow calibration", className="subhead"),
         ]
@@ -563,14 +559,13 @@ def tier_panel(index: int, tier: dict[str, Any], open_: bool = False):
         ], style={"display": "none"}),
         html.Div("Trading economics", className="subhead"),
         html.Div([
-            number_input("Fee [pips]", f"{p}-fee", tier.get("feePips", 0.0), "any"),
+            number_input("Fee [EUR / EURm]", f"{p}-fee", tier.get("feeEurPerEurM", 0.0), "any"),
         ], className="grid-2"),
         html.Div("Markout", className="subhead"),
         checkbox("Enabled", f"{p}-markout-enabled", tier["useMarkout"]),
         html.Div([
-            number_input("Scale [pips]", f"{p}-impact", tier["markout"]["impactScalePips"], "any"),
-            number_input("Size exponent", f"{p}-impact-beta", tier["markout"]["sizeExponent"], "any"),
-            number_input("Tau [min]", f"{p}-impact-tau", tier["markout"]["tauMinutes"], "any"),
+            number_input("Asymptotic markout [EUR / EURm traded]", f"{p}-markout-level", tier["markout"]["asymptoticEurPerEurM"], "any"),
+            number_input("Tau [min]", f"{p}-markout-tau", tier["markout"]["tauMinutes"], "any"),
             number_input("Delta min", f"{p}-dmin", tier["deltaMin"], "any"),
             number_input("Delta max", f"{p}-dmax", tier["deltaMax"], "any"),
         ], className="grid-2"),
@@ -717,10 +712,12 @@ def _source_delta_scale(source: dict[str, Any], target_spread_pips: float) -> fl
     mapping_type = str(mapping.get("type", "identity"))
     if mapping_type == "crossed":
         cross_mid = float(mapping.get("crossMid", 0.0))
-        source_spread = float(mapping.get("sourceSpreadPips", 0.0))
-        if cross_mid <= 0.0 or source_spread <= 0.0:
-            raise ValueError("Crossed RFQ source requires positive cross mid and source spread")
-        return float(target_spread_pips) / (cross_mid * source_spread)
+        if cross_mid <= 0.0:
+            raise ValueError("Crossed RFQ source requires positive cross mid")
+        # The source pair is priced by crossing the target-pair quote itself.
+        # Mid and spread therefore scale by the same FX cross, so the
+        # normalized spread-improvement delta is invariant.
+        return 1.0
     if mapping_type == "affine":
         return float(mapping.get("deltaScale", 1.0))
     if mapping_type != "identity":
@@ -754,14 +751,20 @@ def _arrival_rate(tier: dict[str, Any], delta, z: float, target_spread_pips: flo
     return _activity(tier, z) * _hit_ratio(tier, delta, z, target_spread_pips)
 
 
-def _markout_pips(tier: dict[str, Any], z: float, t_minutes):
+def _markout_eur_per_eurm(tier: dict[str, Any], t_minutes):
+    """Normalized RFQ markout curve in EUR per EURm traded.
+
+    The empirical markout is a single size-independent curve per tier:
+        m(t) = M_inf * (1 - exp(-t / tau)).
+    Trade size therefore does not scale the per-EURm price move.
+    """
     if not tier.get("useMarkout", True):
         return np.zeros_like(np.asarray(t_minutes, dtype=float))
     spec = tier["markout"]
     tau = max(float(spec["tauMinutes"]), 1e-15)
-    asymptotic = float(spec["impactScalePips"]) * float(z) ** float(spec["sizeExponent"])
-    return asymptotic * (1.0 - np.exp(-np.asarray(t_minutes, dtype=float) / tau))
-
+    asymptotic = float(spec["asymptoticEurPerEurM"])
+    values = asymptotic * (1.0 - np.exp(-np.asarray(t_minutes, dtype=float) / tau))
+    return float(values) if np.asarray(values).ndim == 0 else values
 
 def _quote_vs_mid_pips(delta, side: str, spread_pips: float):
     delta = np.asarray(delta, dtype=float)
@@ -1080,10 +1083,9 @@ def flow_parameter_table(tier: dict[str, Any]) -> html.Table:
         rows.append([
             f"{float(z):g}" + (" · price knot" if is_knot else ""),
             f"{100.0 * size_share:.2f}%", f"{rate:.6g}", f"{_delta50(tier,float(z)):.4f}",
-            f"{float(tier['flow']['steepness']):.4g}", f"{float(tier.get('feePips', 0.0)):.3f}",
-            f"{float(_markout_pips(tier,float(z),1.0)):.3f}",
+            f"{float(tier['flow']['steepness']):.4g}", f"{float(tier.get('feeEurPerEurM', 0.0)):.3f}",
         ])
-    return _simple_table(["Size [M]","RFQ size share","λ_RFQ(z) [1/min]","δ50(z)","Steepness","Fee [pips]","Markout @1m [pips]"], rows)
+    return _simple_table(["Size [M]","RFQ size share","λ_RFQ(z) [1/min]","δ50(z)","Steepness","Fee [EUR / EURm]"], rows)
 
 
 def ladder_table(solution: dict[str, Any], cfg: dict[str, Any], tier_index: int, q_value: float) -> html.Table:
@@ -1110,19 +1112,46 @@ def internalization_figure(cfg: dict[str, Any]) -> go.Figure:
     q=np.linspace(0,float(cfg["grid"]["maxAbs"]),300)
     p=cfg["internalization"]
     t=float(p["tau0"])+float(p["tau1"])*q+float(p["tau2"])*q*q
-    fig=go.Figure(go.Scatter(x=q,y=t,mode="lines",name="t(|q|)"))
-    fig.update_layout(title="Internalization time",xaxis_title="|q| [EUR M]",yaxis_title="Minutes",template="trinity_dark")
+    fig=go.Figure(go.Scatter(x=q,y=t,mode="lines",name="legacy t(|q|)"))
+    fig.update_layout(title="Legacy internalization-time benchmark (not used by HJB)",xaxis_title="|q| [EUR M]",yaxis_title="Minutes",template="trinity_dark")
+    return fig
+
+
+def markout_exposure_figure(solution: dict[str, Any]) -> go.Figure:
+    fig = go.Figure()
+    curves = solution.get("markoutExposure", []) if solution else []
+    for curve in curves:
+        q = np.asarray(curve.get("qGrid", []), dtype=float)
+        r = np.asarray(curve.get("effectiveInventory", []), dtype=float)
+        if q.size and r.size == q.size:
+            tau = float(curve.get("tauMinutes", 0.0))
+            fig.add_trace(go.Scatter(x=q, y=r, mode="lines+markers", name=f"tau={tau:g} min"))
+    if curves:
+        q = np.asarray(curves[0].get("qGrid", []), dtype=float)
+        if q.size:
+            fig.add_trace(go.Scatter(x=q, y=q, mode="lines", name="No internalization: r(q)=q", line={"dash":"dot"}))
+    fig.update_layout(
+        title="Policy-implied exponentially weighted inventory exposure",
+        xaxis_title="Starting inventory q [EUR M]",
+        yaxis_title="Effective inventory exposed to markout [EUR M]",
+        template="trinity_dark",
+    )
     return fig
 
 
 def markout_figure(tier: dict[str, Any]) -> go.Figure:
-    t=np.linspace(0,15,300)
-    fig=go.Figure()
-    for z in tier["sizes"]:
-        fig.add_trace(go.Scatter(x=t,y=_markout_pips(tier,float(z),t),mode="lines",name=f"{float(z):g}M"))
-    fig.update_layout(title=f"RFQ markout · {tier['name']}",xaxis_title="Time since trade [min]",yaxis_title="Adverse markout [pips]",template="trinity_dark")
+    t = np.linspace(0.0, 15.0, 300)
+    values = _markout_eur_per_eurm(tier, t)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=t, y=values, mode="lines", name="Markout"))
+    fig.update_layout(
+        title=f"RFQ markout · {tier['name']}",
+        xaxis_title="Time since trade [min]",
+        yaxis_title="Adverse markout [EUR / EURm traded]",
+        template="trinity_dark",
+        uirevision="tier-markout-eur-per-eurm",
+    )
     return fig
-
 
 def convergence_figure(values, title: str, ytitle: str) -> go.Figure:
     fig=go.Figure()
@@ -1220,10 +1249,11 @@ def _ecn_flow_sources(cfg: dict[str, Any]) -> list[dict[str, Any]]:
         size_scale = 1.0
         if mapping_type == "crossed":
             cross_mid = float(mapping.get("crossMid", 0.0))
-            source_spread = float(mapping.get("sourceSpreadPips", 0.0))
-            if cross_mid <= 0.0 or source_spread <= 0.0:
-                raise ValueError("Crossed ECN flow source requires positive cross mid and source spread")
-            alpha = target_spread / (cross_mid * source_spread)
+            if cross_mid <= 0.0:
+                raise ValueError("Crossed ECN flow source requires positive cross mid")
+            # Crossing the target quote scales mid and spread identically, so
+            # d_source == d_target.  Cross mid is still required for size conversion.
+            alpha = 1.0
             size_scale = cross_mid
         elif mapping_type == "affine":
             alpha = float(mapping.get("deltaScale", 1.0))
@@ -1350,16 +1380,15 @@ def _add_ecn_inventory_trace(fig: go.Figure, q: np.ndarray, values: np.ndarray, 
 def passive_ecn_parameter_table(cfg: dict[str, Any]) -> html.Table:
     e = cfg.get("passiveEcn", {})
     z = float(e.get("quoteSize", 1.0))
-    fee = float(e.get("makerFeePips", 0.0))
+    fee = float(e.get("makerFeeEurPerEurM", 0.0))
     rows = []
     for source in _ecn_flow_sources(cfg):
         mapping = source.get("mapping", {})
         mapping_type = str(mapping.get("type", "identity"))
         if mapping_type == "crossed":
             mapping_text = (
-                f"α={float(source['alpha']):.4g}; "
-                f"cross={float(mapping.get('crossMid', 0.0)):.6g}; "
-                f"spread={float(mapping.get('sourceSpreadPips', 0.0)):.4g}p"
+                f"delta 1:1; cross={float(mapping.get('crossMid', 0.0)):.6g}; "
+                f"size scale={float(source['sourceSizePerTarget']):.6g}"
             )
         else:
             mapping_text = "direct"
@@ -1386,7 +1415,7 @@ def passive_ecn_parameter_table(cfg: dict[str, Any]) -> html.Table:
         ["ECN source", "A = mid intensity/side", "k",
          "Size probs 1M / 750k / 500k / 250k / 100k", "Mean trade [source M]",
          "Mean trade [target M]", "E[fill] [target M]", "P(full fill)", "Mapping",
-         "Source size / target size", "Target-equivalent quote [M]", "Maker fee [pips]"],
+         "Source size / target size", "Target-equivalent quote [M]", "Maker fee [EUR / EURm]"],
         rows,
     )
 
@@ -1536,13 +1565,14 @@ sidebar = html.Aside([
             number_input("Gamma / φ", "gamma", DEFAULT["gamma"], "any"),
         ], className="grid-2"),
     ], True),
-    panel("Internalization time", [
-        html.Div([
-            number_input("Tau 0 [min]", "tau0", DEFAULT["internalization"]["tau0"], "any"),
-            number_input("Tau 1", "tau1", DEFAULT["internalization"]["tau1"], "any"),
-            number_input("Tau 2", "tau2", DEFAULT["internalization"]["tau2"], "any"),
-        ], className="grid-2"),
-    ]),
+    # Legacy tau(q) parameters are no longer user controls.  Keep the Dash
+    # components mounted invisibly because the config/callback plumbing still
+    # carries the legacy benchmark fields for backwards compatibility.
+    html.Div([
+        number_input("Tau 0 [min]", "tau0", DEFAULT["internalization"]["tau0"], "any"),
+        number_input("Tau 1", "tau1", DEFAULT["internalization"]["tau1"], "any"),
+        number_input("Tau 2", "tau2", DEFAULT["internalization"]["tau2"], "any"),
+    ], style={"display": "none"}),
     html.Div("Pricing tiers", className="section-title"),
     *[tier_panel(i, t, open_=(i == 0)) for i, t in enumerate(DEFAULT["tiers"])],
     panel("Dark pool", [
@@ -1552,7 +1582,7 @@ sidebar = html.Aside([
             number_input("λ / side / min", "dp-lambda", DEFAULT["darkPool"]["lambda"], "any"),
             number_input("μ", "dp-mu", DEFAULT["darkPool"]["mu"], "any"),
             number_input("p0", "dp-p0", DEFAULT["darkPool"]["p0"], "any"),
-            number_input("Broker fee [pips]", "dp-fee", DEFAULT["darkPool"]["feePips"], "any"),
+            number_input("Broker fee [EUR / EURm]", "dp-fee", DEFAULT["darkPool"]["feeEurPerEurM"], "any"),
         ], className="grid-2"),
         html.Div("Hedge-only: only the inventory-reducing side is posted and fills may not cross through flat.", className="muted-note"),
         text_input("Posted sizes", "dp-sizes", ", ".join(str(x) for x in DEFAULT["darkPool"]["postedSizes"])),
@@ -1574,7 +1604,7 @@ sidebar = html.Aside([
         ], className="grid-2"),
         html.Div([
             number_input("Quote size [M]", "ecn-size", DEFAULT["passiveEcn"]["quoteSize"], "any"),
-            number_input("Maker fee [pips]", "ecn-fee", DEFAULT["passiveEcn"]["makerFeePips"], "any"),
+            number_input("Maker fee [EUR / EURm]", "ecn-fee", DEFAULT["passiveEcn"]["makerFeeEurPerEurM"], "any"),
         ], className="grid-2"),
     ]),
     html.Button("Calibrate", id="solve", className="primary-button"),
@@ -1590,9 +1620,10 @@ policy_tab = html.Div([
     dcc.Tabs(id="policy-subtabs", value="overview", children=[
         dcc.Tab(label="Overview", value="overview", children=html.Div([
             diagnostic_expander("Continuation value h(q)", graph("value-chart"), open_=True),
-            diagnostic_expander("Internalization time", graph("internalization-chart")),
+            diagnostic_expander("Policy-implied markout exposure (resolvent)", graph("internalization-chart")),
             diagnostic_expander("Bellman residual", graph("residual-chart")),
             diagnostic_expander("Value-function change", graph("value-change-chart")),
+            diagnostic_expander("Markout resolvent change", graph("markout-resolvent-change-chart")),
         ], className="subtab-inner diagnostics-stack"), className="dash-tab", selected_className="dash-tab dash-tab-selected"),
         dcc.Tab(label="Tier diagnostics", value="tiers", children=html.Div([
             html.Div([
@@ -1846,7 +1877,7 @@ for i in range(3):
     p = f"t{i}"
     for suffix in (
         "enabled", "name", "sizes", "rfq-size-step", "A0", "theta", "beta", "steep", "shift", "vshift",
-        "fee", "markout-enabled", "impact", "impact-beta", "impact-tau", "dmin", "dmax",
+        "fee", "markout-enabled", "markout-level", "markout-tau", "dmin", "dmax",
     ):
         CONFIG_FIELDS.append((f"{p}-{suffix}", State(f"{p}-{suffix}", "value")))
 for component_id in (
@@ -2038,14 +2069,14 @@ def populate_flow_source_cross_mid(cross_pair):
     Input("flow-source-add", "n_clicks"),
     Input("flow-source-remove-selected", "n_clicks"),
     Input("flow-edit-pair", "value"), Input("flow-edit-cross-pair", "value"),
-    Input("flow-edit-cross-mid", "value"), Input("flow-edit-spread", "value"),
+    Input("flow-edit-cross-mid", "value"),
     Input("flow-edit-A0", "value"), Input("flow-edit-theta", "value"), Input("flow-edit-beta", "value"),
     Input("flow-edit-steep", "value"), Input("flow-edit-shift", "value"), Input("flow-edit-vshift", "value"),
     State("flow-source-tier-store", "data"), State("flow-target-pair", "value"), State("flow-source-selected-store", "data"), State("extra-flow-sources-store", "data"),
     *[State(f"t{i}-{suffix}", "value") for i in range(3) for suffix in ("A0", "theta", "beta", "steep", "shift", "vshift")],
     prevent_initial_call=True,
 )
-def update_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, spread, A0, theta, beta, steep, shift, vshift,
+def update_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, A0, theta, beta, steep, shift, vshift,
                               tier_index, target_pair, selected, data, *direct_values):
     if tier_index is None:
         return (no_update,) * 20
@@ -2087,7 +2118,7 @@ def update_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, spread
 
     if selected.startswith("extra-"):
         idx = int(selected.split("-", 1)[1])
-        if 0 <= idx < len(out.get(key, [])) and all(x is not None for x in (spread, A0, theta, beta, steep, shift, vshift)):
+        if 0 <= idx < len(out.get(key, [])) and all(x is not None for x in (A0, theta, beta, steep, shift, vshift)):
             src = out[key][idx]
             chosen_pair = str(pair) if pair else None
             derived_cross = _derive_cross_pair(target_pair, chosen_pair)
@@ -2105,11 +2136,8 @@ def update_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, spread
                 raise ValueError(f"No default mid available for cross {chosen_cross}")
             if chosen_mid is not None and chosen_mid <= 0.0:
                 raise ValueError("Cross mid must be positive")
-            if float(spread) <= 0.0:
-                raise ValueError("Source spread must be positive")
-
             src.update({"name": chosen_pair or "Select FX pair", "pair": chosen_pair, "crossPair": chosen_cross})
-            src["mapping"] = {"type": "crossed", "crossMid": chosen_mid, "sourceSpreadPips": float(spread)}
+            src["mapping"] = {"type": "crossed", "crossMid": chosen_mid}
             src["flow"] = {"A0": float(A0), "theta": float(theta), "beta": float(beta), "steepness": float(steep), "shift": float(shift), "volumeShift": float(vshift)}
         return out, no_update, *direct
 
@@ -2215,6 +2243,7 @@ def render_ecn_flow_source_settings(target_pair, selected, data, direct_A, direc
 
 
 @app.callback(
+    Output("ecn-flow-edit-A", "value"),
     Output("ecn-flow-edit-p1m", "value"),
     Output("ecn-flow-edit-p750k", "value"),
     Output("ecn-flow-edit-p500k", "value"),
@@ -2228,12 +2257,13 @@ def populate_ecn_trade_size_defaults(source_pair, selected):
     # calibrated pair is selected, seed its empirical size distribution.
     # Unknown pairs preserve the values already shown in the editor.
     if not source_pair or str(selected or "direct") == "direct":
-        return no_update, no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update, no_update
     key = str(source_pair).upper().strip()
     if key not in {"EURSEK", "USDSEK"}:
-        return no_update, no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update, no_update
     probs = default_ecn_trade_size_probabilities(key)
-    return probs[0], probs[1], probs[2], probs[3]
+    source_A = 3.0 if key == "USDSEK" else no_update
+    return source_A, probs[0], probs[1], probs[2], probs[3]
 
 
 @app.callback(
@@ -2278,7 +2308,7 @@ def render_ecn_100k_residual(p1m, p750k, p500k, p250k):
     Input("ecn-flow-source-add", "n_clicks"),
     Input("ecn-flow-source-remove-selected", "n_clicks"),
     Input("ecn-flow-edit-pair", "value"), Input("ecn-flow-edit-cross-pair", "value"),
-    Input("ecn-flow-edit-cross-mid", "value"), Input("ecn-flow-edit-spread", "value"),
+    Input("ecn-flow-edit-cross-mid", "value"),
     Input("ecn-flow-edit-A", "value"), Input("ecn-flow-edit-k", "value"),
     Input("ecn-flow-edit-p1m", "value"), Input("ecn-flow-edit-p750k", "value"),
     Input("ecn-flow-edit-p500k", "value"), Input("ecn-flow-edit-p250k", "value"),
@@ -2287,7 +2317,7 @@ def render_ecn_100k_residual(p1m, p750k, p500k, p250k):
     State("ecn-direct-size-probs-store", "data"),
     prevent_initial_call=True,
 )
-def update_ecn_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, spread, A, k,
+def update_ecn_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, A, k,
                                   p1m, p750k, p500k, p250k, target_pair, selected, data,
                                   direct_A, direct_k, direct_size_probs):
     out = deepcopy(data or [])
@@ -2324,7 +2354,7 @@ def update_ecn_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, sp
 
     if selected.startswith("extra-"):
         idx = int(selected.split("-", 1)[1])
-        if 0 <= idx < len(out) and all(x is not None for x in (spread, A, k)):
+        if 0 <= idx < len(out) and all(x is not None for x in (A, k)):
             src = out[idx]
             chosen_pair = str(pair) if pair else None
             derived_cross = _derive_cross_pair(target_pair, chosen_pair)
@@ -2339,15 +2369,13 @@ def update_ecn_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, sp
                 raise ValueError(f"No default mid available for cross {chosen_cross}")
             if chosen_mid is not None and chosen_mid <= 0.0:
                 raise ValueError("Cross mid must be positive")
-            if float(spread) <= 0.0:
-                raise ValueError("Source spread must be positive")
             if float(A) < 0.0:
                 raise ValueError("ECN A must be nonnegative")
             if float(k) <= 0.0:
                 raise ValueError("ECN k must be positive")
 
             src.update({"name": chosen_pair or "Select FX pair", "pair": chosen_pair, "crossPair": chosen_cross})
-            src["mapping"] = {"type": "crossed", "crossMid": chosen_mid, "sourceSpreadPips": float(spread)}
+            src["mapping"] = {"type": "crossed", "crossMid": chosen_mid}
             src["flow"] = {"A": float(A), "k": float(k)}
             src["tradeSizeProbabilities"] = probs
             src.pop("meanTradeSize", None)
@@ -2424,24 +2452,25 @@ def solve_model(_clicks, *values):
 
 @app.callback(
     Output("m-converged", "children"), Output("m-iterations", "children"), Output("m-rho", "children"), Output("m-residual", "children"),
-    Output("value-chart", "figure"), Output("residual-chart", "figure"), Output("value-change-chart", "figure"), Output("internalization-chart", "figure"),
+    Output("value-chart", "figure"), Output("residual-chart", "figure"), Output("value-change-chart", "figure"), Output("markout-resolvent-change-chart", "figure"), Output("internalization-chart", "figure"),
     Output("tier-select", "options"), Output("tier-select", "value"), Output("ladder-q", "options"), Output("ladder-q", "value"),
     Input("solution-store", "data"), Input("config-store", "data"),
 )
 def render_solution(solution, cfg):
     if not solution or not cfg:
-        return "—", "—", "—", "—", go.Figure(), go.Figure(), go.Figure(), go.Figure(), [], None, [], None
+        return "—", "—", "—", "—", go.Figure(), go.Figure(), go.Figure(), go.Figure(), go.Figure(), [], None, [], None
     fig = go.Figure(go.Scatter(x=solution["qGrid"], y=solution["value"], mode="lines+markers", name="h(q)"))
     fig.update_layout(title="Continuation value h(q)", xaxis_title="Inventory q [EUR M]", yaxis_title="h(q)", template="trinity_dark")
     residual_fig = convergence_figure(solution.get("bellmanResidual", []), "Bellman residual", "max |R(q) - ρ|")
     value_change_fig = convergence_figure(solution.get("valueChange", []), "Value-function change", "max |Δh|")
-    internal_fig = internalization_figure(cfg)
+    markout_change_fig = convergence_figure(solution.get("markoutResolventChange", []), "Markout resolvent change", "max |Δr_tau(q)|")
+    internal_fig = markout_exposure_figure(solution)
     opts = [{"label": t["name"], "value": i} for i, t in enumerate(solution["tiers"])]
     qopts = [{"label": f"{float(q):g}M", "value": float(q)} for q in solution["qGrid"]]
     q0 = min((float(q) for q in solution["qGrid"]), key=abs) if qopts else None
     return (
         "Yes" if solution["converged"] else "No", str(solution["iterations"]),
-        f"{solution['averageReward']:.6g}", f"{solution['residual']:.3g}", fig, residual_fig, value_change_fig, internal_fig,
+        f"{solution['averageReward']:.6g}", f"{solution['residual']:.3g}", fig, residual_fig, value_change_fig, markout_change_fig, internal_fig,
         opts, (0 if opts else None), qopts, q0,
     )
 
@@ -2533,10 +2562,9 @@ def expected_internalization_times(solution: dict[str, Any] | None, cfg: dict[st
         delta_scale = 1.0
         if mapping_type == "crossed":
             cross_mid = float(mapping.get("crossMid", 0.0))
-            source_spread = float(mapping.get("sourceSpreadPips", 0.0))
-            if cross_mid <= 0.0 or source_spread <= 0.0:
-                raise ValueError("Crossed RFQ source requires positive cross mid and source spread")
-            delta_scale = float(cfg["spreadPips"]) / (cross_mid * source_spread)
+            if cross_mid <= 0.0:
+                raise ValueError("Crossed RFQ source requires positive cross mid")
+            delta_scale = 1.0
         elif mapping_type == "affine":
             delta_scale = float(mapping.get("deltaScale", 1.0))
         elif mapping_type != "identity":

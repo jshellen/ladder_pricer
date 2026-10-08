@@ -229,38 +229,34 @@ class LogisticFlowCurve:
 
 @dataclass
 class SaturatingMarkoutModel:
-    """Positive adverse-selection cost with saturating time impact.
+    """Size-independent adverse-selection price shock with exponential saturation.
 
-    m(z, t) = impact_scale * z**size_exponent * (1 - exp(-t / tau))
+    The UI/config supplies one empirical curve in EUR per EURm traded.  At the
+    model boundary it is converted to an equivalent price move, so the
+    reference implementation stores only the eventual price move here:
 
-    ``impact_scale`` is the eventual markout of a unit-size trade in price
-    units, ``size_exponent`` controls how total price impact grows with trade
-    size. Both ``t`` and ``tau`` are expressed in minutes, matching the internalization-time model.
+        m(t) = asymptotic_price_move * (1 - exp(-t / tau)).
+
+    RFQ size does not scale the per-EURm markout.
     """
 
-    impact_scale: float = 1.0 / 10_000.0
-    size_exponent: float = 0.5
+    asymptotic_price_move: float = 1.0 / 10_000.0
     tau: float = 0.5  # minutes
 
     def __post_init__(self) -> None:
-        if self.impact_scale < 0.0:
-            raise ValueError("impact_scale must be nonnegative")
-        if self.size_exponent < 0.0:
-            raise ValueError("size_exponent must be nonnegative")
+        if self.asymptotic_price_move < 0.0:
+            raise ValueError("asymptotic_price_move must be nonnegative")
         if self.tau <= 0.0:
             raise ValueError("tau must be positive")
 
-    def asymptotic_markout(self, z: float) -> float:
-        z = float(z)
-        if z <= 0.0:
-            raise ValueError("z must be positive")
-        return self.impact_scale * z ** self.size_exponent
+    def asymptotic_markout(self) -> float:
+        return self.asymptotic_price_move
 
-    def expected_markout(self, z: float, t: float) -> float:
+    def expected_markout(self, t: float) -> float:
         t = float(t)
         if t <= 0.0:
             return 0.0
-        return self.asymptotic_markout(z) * (-math.expm1(-t / self.tau))
+        return self.asymptotic_price_move * (-math.expm1(-t / self.tau))
 
 
 @dataclass
@@ -517,7 +513,7 @@ class MDPTier:
         return self.flow_curve.arrival_rate(delta, z)
 
     def expected_markout(self, z: float, t: float) -> float:
-        return self.markout_model.expected_markout(z, t)
+        return self.markout_model.expected_markout(t)
 
     def is_admissible(self, q: float, z: float, side: Side | str) -> bool:
         return True
@@ -884,6 +880,7 @@ class HJBLadderSolver:
         self.grid_meta_ = SolverGridMeta()
         self.solve_q_grid_: list[float] = []
         self.hard_inventory_limit_: float = 0.0
+        self._markout_exposure_by_tau: dict[float, np.ndarray] = {}
         self.config.validate()
 
     def _max_inventory_jump(self) -> float:
@@ -958,8 +955,21 @@ class HJBLadderSolver:
         self.grid_meta_ = build_solver_grid_meta(self.solve_q_grid_)
         self.initialize_policy_shapes()
 
-    def mdp_fill_payoff(self, lam: float, z: float, d: float, mu: float, dh: float) -> float:
-        return lam * (z * self.config.spread * (0.5 - d) - z * mu + dh)
+    def _rfq_markout_inventory_pnl(self, tier: MDPTier, side: Side, z: float, inventory_after_branch: float) -> float:
+        if not tier.use_markout:
+            return 0.0
+        tau = float(tier.markout_model.tau)
+        exposure = self._markout_exposure_by_tau.get(tau)
+        if exposure is None:
+            # Used only while seeding the initial stabilizing policy.  The
+            # exogenous internalization-time closure is intentionally gone.
+            return 0.0
+        direction = 1.0 if side is Side.Bid else -1.0
+        effective_q = _interp_linear_bounded(self.solve_q_grid_, exposure, inventory_after_branch)
+        return (-direction) * tier.markout_model.asymptotic_markout() * effective_q
+
+    def mdp_fill_payoff(self, lam: float, z: float, d: float, markout_inventory_pnl: float, dh: float) -> float:
+        return lam * (z * self.config.spread * (0.5 - d) + markout_inventory_pnl + dh)
 
     @staticmethod
     def _ladder_gaps(row: Sequence[float]) -> list[float]:
@@ -1078,9 +1088,10 @@ class HJBLadderSolver:
                 # calculations skip the transition entirely.
                 row.append(tier.delta_min)
                 continue
-            tau = self.internalization_time.value(q_next)
-            mu = tier.markout_model.expected_markout(z, tau) if tier.use_markout else 0.0
-            additive = -z * mu + _interp_linear_bounded(self.solve_q_grid_, h, q_next) - hq
+            win_markout_pnl = self._rfq_markout_inventory_pnl(tier, side, z, q_next)
+            loss_markout_pnl = self._rfq_markout_inventory_pnl(tier, side, z, q)
+            additive = (win_markout_pnl - loss_markout_pnl
+                        + _interp_linear_bounded(self.solve_q_grid_, h, q_next) - hq)
             d = tier.flow_curve.optimal_delta(z, self.config.spread, additive)
             row.append(min(max(d, lo), hi))
         return row
@@ -1111,13 +1122,18 @@ class HJBLadderSolver:
         hq = _interp_linear_bounded(self.solve_q_grid_, h, q)
         total = 0.0
         for d, z in zip(row, tier.sizes_):
+            rfq_rate = tier.flow_curve.rfq_arrival_rate(z)
+            loss_markout_pnl = self._rfq_markout_inventory_pnl(tier, side, z, q)
             if not self._mdp_transition_admissible(q, z, side):
+                total += rfq_rate * loss_markout_pnl
                 continue
             q_next = q + direction * z
-            tau = self.internalization_time.value(q_next)
-            mu = tier.markout_model.expected_markout(z, tau) if tier.use_markout else 0.0
+            win_rate = tier.flow_curve.arrival_rate(d, z)
+            loss_rate = max(0.0, rfq_rate - win_rate)
+            win_markout_pnl = self._rfq_markout_inventory_pnl(tier, side, z, q_next)
             dh = _interp_linear_bounded(self.solve_q_grid_, h, q_next) - hq
-            total += self.mdp_fill_payoff(tier.flow_curve.arrival_rate(d, z), z, d, mu, dh)
+            total += self.mdp_fill_payoff(win_rate, z, d, win_markout_pnl, dh)
+            total += loss_rate * loss_markout_pnl
         return total
 
     def _choose_howard_safe_row(
@@ -1319,7 +1335,7 @@ class HJBLadderSolver:
         L[row, i1] += rate * w1
         L[row, row] -= rate
 
-    def fixed_policy_affine_operator(self) -> tuple[np.ndarray, np.ndarray]:
+    def fixed_policy_affine_operator(self, include_markout: bool = True) -> tuple[np.ndarray, np.ndarray]:
         n = self.grid_meta_.nq
         c = np.zeros(n, dtype=float)
         L = np.zeros((n, n), dtype=float)
@@ -1333,15 +1349,26 @@ class HJBLadderSolver:
                     (Side.Ask, -1.0, tier.policy.ask[i]),
                 ]:
                     for j, z in enumerate(tier.sizes_):
+                        rfq_rate = tier.flow_curve.rfq_arrival_rate(z)
+                        loss_markout = (
+                            self._rfq_markout_inventory_pnl(tier, side, z, q)
+                            if include_markout else 0.0
+                        )
                         if not self._mdp_transition_admissible(q, z, side):
+                            c[i] += rfq_rate * loss_markout
                             continue
                         d = row[j]
-                        lam = tier.flow_curve.arrival_rate(d, z)
+                        win_rate = tier.flow_curve.arrival_rate(d, z)
+                        loss_rate = max(0.0, rfq_rate - win_rate)
                         q_next = q + direction * z
-                        tau = self.internalization_time.value(q_next)
-                        mu = tier.markout_model.expected_markout(z, tau) if tier.use_markout else 0.0
-                        c[i] += lam * (z * self.config.spread * (0.5 - d) - z * mu)
-                        self._add_transition(L, i, q_next, lam)
+                        win_markout = (
+                            self._rfq_markout_inventory_pnl(tier, side, z, q_next)
+                            if include_markout else 0.0
+                        )
+                        c[i] += win_rate * (
+                            z * self.config.spread * (0.5 - d) + win_markout
+                        ) + loss_rate * loss_markout
+                        self._add_transition(L, i, q_next, win_rate)
 
             if self.dark_pool is not None:
                 venue = self.dark_pool
@@ -1358,6 +1385,24 @@ class HJBLadderSolver:
                         c[i] -= rate * fee * k
                         self._add_transition(L, i, q + direction * k, rate)
         return c, L
+
+    def _compute_markout_resolvent(self) -> dict[float, np.ndarray]:
+        # L acts on functions of inventory.  For each exponential markout
+        # kernel beta exp(-beta t), solve
+        #   r_tau = beta (beta I - L)^(-1) q.
+        _, L = self.fixed_policy_affine_operator(include_markout=False)
+        q = np.asarray(self.solve_q_grid_, dtype=float)
+        out: dict[float, np.ndarray] = {}
+        taus = sorted({float(tier.markout_model.tau) for tier in self.mdp_tiers if tier.use_markout})
+        for tau in taus:
+            beta = 1.0 / tau
+            A = beta * np.eye(len(q), dtype=float) - L
+            try:
+                x = np.linalg.solve(A, q)
+            except np.linalg.LinAlgError as exc:
+                raise RuntimeError("markout resolvent produced a singular linear system") from exc
+            out[tau] = beta * x
+        return out
 
     def evaluate_current_policy(self) -> tuple[np.ndarray, float]:
         c, L = self.fixed_policy_affine_operator()
@@ -1387,13 +1432,21 @@ class HJBLadderSolver:
         hq = _interp_linear_bounded(self.solve_q_grid_, h, q)
         total = 0.0
         for j, z in enumerate(tier.sizes_):
+            rfq_rate = tier.flow_curve.rfq_arrival_rate(z)
+            loss_markout_pnl = self._rfq_markout_inventory_pnl(tier, s, z, q)
             if not self._mdp_transition_admissible(q, z, s):
+                total += rfq_rate * loss_markout_pnl
                 continue
             d = row[j]
             q_next = q + direction * z
-            mu = tier.markout_model.expected_markout(z, self.internalization_time.value(q_next)) if tier.use_markout else 0.0
-            total += self.mdp_fill_payoff(tier.flow_curve.arrival_rate(d, z), z, d, mu,
-                                          _interp_linear_bounded(self.solve_q_grid_, h, q_next) - hq)
+            win_rate = tier.flow_curve.arrival_rate(d, z)
+            loss_rate = max(0.0, rfq_rate - win_rate)
+            win_markout_pnl = self._rfq_markout_inventory_pnl(tier, s, z, q_next)
+            total += self.mdp_fill_payoff(
+                win_rate, z, d, win_markout_pnl,
+                _interp_linear_bounded(self.solve_q_grid_, h, q_next) - hq
+            )
+            total += loss_rate * loss_markout_pnl
         return total
 
     def dark_pool_bellman_contribution(self, venue: DarkPoolVenue, q: float, q_index: int,
@@ -1584,7 +1637,7 @@ class HJBLadderSolver:
                             tau = float(tier.markout_model.tau)
                             # Same signed remaining future price move inserted
                             # by simulate_pnl after a fill.
-                            impact_jump = -direction * tier.markout_model.asymptotic_markout(z)
+                            impact_jump = -direction * tier.markout_model.asymptotic_markout()
                             add_impact_jump(i, q_next, lam, tau, impact_jump)
 
             if self.dark_pool is not None:
@@ -1787,7 +1840,7 @@ class HJBLadderSolver:
                             tau = float(tier.markout_model.tau)
                             impact_var = tau_to_var[tau]
                             shift[impact_var] = (
-                                -direction * tier.markout_model.asymptotic_markout(z)
+                                -direction * tier.markout_model.asymptotic_markout()
                             )
                         events.append((q + direction * z, float(rate), shift))
 
@@ -2211,7 +2264,7 @@ class HJBLadderSolver:
                     q += direction * z
                     if tier.use_markout:
                         tau = float(tier.markout_model.tau)
-                        adverse_total_move = -direction * tier.markout_model.asymptotic_markout(z)
+                        adverse_total_move = -direction * tier.markout_model.asymptotic_markout()
                         impacts[tau] = impacts.get(tau, 0.0) + adverse_total_move
                     if path is not None:
                         path.fills.append(MonteCarloFillEvent(
@@ -2299,24 +2352,36 @@ class HJBLadderSolver:
         diag = SolverDiagnostics()
         rho = 0.0
 
+        self._markout_exposure_by_tau = self._compute_markout_resolvent()
+
         # Internal safety guard only, not a solver/meta parameter exposed to users.
         for it in range(1, 257):
             h_prev = h.copy()
             h, rho = self.evaluate_current_policy()
             policy_before = self._policy_vector()
+            old_markout = {tau: values.copy() for tau, values in self._markout_exposure_by_tau.items()}
             self.update_policies(h)
             policy_after = self._policy_vector()
             policy_change = (
                 float(np.max(np.abs(policy_after - policy_before)))
                 if policy_after.size else 0.0
             )
+            self._markout_exposure_by_tau = self._compute_markout_resolvent()
+            markout_change = 0.0
+            for tau, values in self._markout_exposure_by_tau.items():
+                if tau in old_markout:
+                    markout_change = max(markout_change, float(np.max(np.abs(values - old_markout[tau]))))
+                else:
+                    markout_change = math.inf
             rhs = self.bellman_rhs(h)
             residual = float(np.max(np.abs(rhs - rho)))
             max_h_change = float(np.max(np.abs(h - h_prev)))
             diag.record_iteration(it, max_h_change, residual)
+            markout_scale = max(1.0, *(float(np.max(np.abs(v))) for v in self._markout_exposure_by_tau.values()))
             if (
                 residual <= self._machine_convergence_scale(rho, rhs)
                 and policy_change <= self._machine_policy_scale(policy_after)
+                and markout_change <= math.sqrt(np.finfo(float).eps) * markout_scale
             ):
                 diag.converged = True
                 break

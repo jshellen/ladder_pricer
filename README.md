@@ -62,21 +62,23 @@ config["tiers"][0]["flowSources"] = [
         "mapping": {
             "type": "crossed",
             "crossMid": 1.18,          # EURUSD: USD per EUR
-            "sourceSpreadPips": 18.0, # USDSEK full customer spread
         },
     },
 ]
 ```
 
-For a crossed source the target EURSEK delta is converted to the source-pair delta by
+For a crossed source the source quote is obtained by crossing the target quote itself.
+Because both mid and spread are scaled by the same FX cross, normalized spread improvement
+is invariant:
 
 ```text
-source_delta = 0.5 + delta_scale * (target_delta - 0.5)
-delta_scale  = target_spread / (cross_mid * source_spread)
+source_delta = target_delta
+source_size  = cross_mid * target_size
 ```
 
-and a target EUR-equivalent size `z` is evaluated on the source hit-ratio curve at
-`source_size = cross_mid * z`. The calibrated exogenous intensity curve itself defines the
+For example, a 25% EURSEK delta implies a 25% USDSEK delta when USDSEK is formed as
+`EURSEK / EURUSD`. The cross mid is still needed for base-currency size conversion.
+The calibrated exogenous intensity curve itself defines the
 RFQ-size distribution. Customer RFQ sizes are independent of the pricing-control knots:
 by default Monte Carlo evaluates the curve on a 1M grid from the smallest to the largest
 pricing size, normalizes those values into probabilities, and samples the requested size
@@ -112,11 +114,11 @@ The application has three main work areas:
 ### Policy
 
 - convergence diagnostics;
-- continuation value `h(q)` and internalization-time overview;
+- continuation value `h(q)`, policy-implied markout-exposure resolvent, and convergence diagnostics;
 - Streamlit-style Tier Diagnostics presented as a single vertical stack of collapsible sections;
 - diagnostic order: tier parameters → exogenous RFQ arrival intensity → won-trade intensity → win probabilities → implied win probabilities → markouts → quotes vs inventory → bid surface → ask surface → volume premium / ladder table;
 - consistent side colors throughout diagnostics: **bid = blue**, **ask = red**;
-- each tier exposes a configurable **Fee [pips]**. The fill edge is `size * (spread * (0.5 - delta) - fee)`, so fees directly influence the solved quote ladder as well as realized/analytical PnL.
+- each tier exposes a configurable **Fee [EUR / EURm traded]**.  The Python/native boundary converts this real-world fee convention to the model's internal quote-price units at the configured reference spot: `fee_price = fee_EUR_per_EURm * spot / 1e6`.  The fill edge remains `size * (spread * (0.5 - delta) - fee_price)`, so fees directly influence the solved quote ladder as well as realized/analytical PnL. The config/native interface accepts trading fees only in EUR/EURm; there is no pips fee fallback.
 
 ### Passive ECN hedge
 
@@ -133,13 +135,14 @@ The first four probabilities are configured explicitly and the 100k probability 
 optimizer still chooses only one master target-pair delta `d`. For a crossed source,
 
 ```text
-d_source   = 0.5 + alpha * (d_target - 0.5)
-alpha      = target_spread / (cross_mid * source_spread)
+d_source   = d_target
 sourceSize = cross_mid * targetSize
 ```
 
-so EURSEK can be the master quote while USDSEK and GBPSEK inherit economically equivalent
-quotes derived through EURUSD and EURGBP. If `V_s` is the source-pair parent trade size and
+so EURSEK can be the master quote while USDSEK and GBPSEK inherit the same normalized
+spread-improvement delta through EURUSD and EURGBP. There is no independently configured
+source-pair spread: its theoretical spread is implied by crossing the EURSEK quote. If `V_s`
+is the source-pair parent trade size and
 `c_s = sourceSizePerTarget`, the target-equivalent executed size is
 
 ```text
@@ -152,7 +155,7 @@ so a posted 1M target quote can fill only at the mapped/capped discrete pillar s
 1M. The HJB sums each source's capped discrete size distribution when evaluating continuation
 value, spread capture and fees. Monte Carlo samples the same distribution directly. Source
 `s` still has parent trade intensity `A_s`, independent price reach `X_s ~ Exp(k_s)`, and the
-quote is hit when `X_s >= alpha_s * (0.5-d_target)`. Retained paths record the source parent
+quote is hit when `X_s >= (0.5-d_target)`. Retained paths record the source parent
 trade size and realized target fill size for ECN arrivals.
 
 The optimizer evaluates `NONE` plus a 0.01 grid between configurable `minDelta` and `maxDelta`,
@@ -162,7 +165,7 @@ are hedge-only: positive inventory may only post an ask, negative inventory may 
 bid, flat inventory posts nothing, and the posted size itself must be risk reducing so no
 realized partial or full fill can cross through zero and create opposite-side risk. A realized
 passive ECN fill of size `v` at target delta `d` earns
-`v * (spread * (0.5-d) - maker fee)` before continuation-value effects.
+`v * (spread * (0.5-d) - maker_fee_price)` before continuation-value effects. The dashboard configures the maker fee in **EUR / EURm traded** and converts it at the reference spot before entering the HJB.
 
 ### Monte Carlo
 
@@ -317,10 +320,10 @@ The Dash application now carries the full diagnostic plot set from the previous 
 
 - continuation value `h(q)`
 - Howard Bellman-residual and value-change convergence histories
-- internalization time vs inventory
+- policy-implied exponentially weighted inventory exposure vs inventory
 - tier flow curves and logistic hit-ratio curves
 - implied hit ratios under the solved policy
-- saturating markout curves by size
+- one size-independent saturating markout curve per tier in EUR / EURm traded
 - quotes vs inventory across all rungs
 - bid and ask 3D quote surfaces
 - volume-premium ladder at a selected inventory
@@ -340,7 +343,7 @@ Dash control values are converted to the numerical model by component ID in
 `python/trinity/ui_config.py`. The model configuration no longer depends on the
 positional ordering of callback states, so adding or reordering UI controls does
 not silently shift tier parameters. The regression tests in
-`tests/test_ui_config.py` cover the markout checkbox / impact-parameter mapping and tier-fee mapping.
+`tests/test_ui_config.py` cover the EUR/EURm markout mapping, markout enable flag, and tier-fee mapping.
 
 ### Dark-pool diagnostics layout
 
@@ -358,7 +361,7 @@ The Policy → Dark pool tab mirrors the Streamlit-style diagnostic layout: plot
 
 ### Passive ECN exponential flow
 
-Each passive ECN source has its own parent trade intensity `A_s` and reach distribution `X_s ~ Exp(k_s)`. Direct sources use the master delta unchanged. Crossed sources use the same affine FX mapping as Tier flow sources, so their target-delta fill contribution is `A_s exp(-k_s alpha_s (0.5-d))`. The total ECN fill intensity is the sum across sources. The default direct EURSEK source remains A=4.0 trades/min per side, k=8.4, with a 0.00-to-0.50 master-delta grid in 0.01 increments.
+Each passive ECN source has its own parent trade intensity `A_s` and reach distribution `X_s ~ Exp(k_s)`. Direct and crossed sources use the same master normalized delta, so each source contributes `A_s exp(-k_s (0.5-d))`. Cross mids are used only for source-base/target-base size conversion. The total ECN fill intensity is the sum across sources. The default direct EURSEK source remains A=4.0 trades/min per side, k=8.4, with a 0.00-to-0.50 master-delta grid in 0.01 increments.
 
 
 ## Dark pool model
@@ -428,8 +431,9 @@ exactly halfway between the current 3M and 5M prices. In the code the equivalent
 interpolated; because execution price is affine in `delta` for a fixed side and reference
 spot, this is mathematically identical to interpolating the price itself.
 
-The sampled **actual RFQ size** drives win probability, cash, inventory, markout, retained
-RFQ events, and the population hit-ratio aggregates.  Hence the realized hit-ratio chart can
+The sampled **actual RFQ size** drives win probability, cash, inventory, retained
+RFQ events, and the population hit-ratio aggregates. Markout is an RFQ information shock
+whose per-EURm amplitude is size-independent under the current empirical specification.  Hence the realized hit-ratio chart can
 show 4M, 6M, 7M, etc. even though those sizes are not explicit pricing knots.
 
 The HJB continues to store the control policy at the pricing knots. Its existing pricing-knot
@@ -443,6 +447,42 @@ size before normalization / win sampling. For compatibility, configs produced by
 Once an RFQ arrives, only a won RFQ changes inventory and cash. The RFQ markout shock is
 applied on every RFQ, including lost RFQs; for a won RFQ, inventory/cash are updated before
 the markout is applied.
+
+The HJB uses the same information-event interpretation, but no longer prices markout with an
+exogenous internalization-time curve.  For a fixed Howard policy `pi`, let `L_pi` be the
+inventory generator implied by won RFQs, dark-pool fills and passive ECN fills.  For every
+unique exponential markout time constant `tau`, with `beta = 1/tau`, the solver computes
+
+`r_tau = beta * (beta I - L_pi)^(-1) q`.
+
+`r_tau(q)` is the policy-implied exponentially weighted future inventory actually exposed
+while a markout shock develops. The UI/config stores the empirical curve directly as
+`M_inf` in EUR / EURm traded and `tau` in minutes. At the C++ boundary the asymptote is
+converted once to the solver's price units as
+
+`markout_price = M_inf * spot / 1e6`.
+
+There is no RFQ-size exponent: the normalized markout curve is the same for every RFQ size.
+For side direction `dir` (`+1` on Bid, `-1` on Ask), current inventory `q`, and
+`q_next = q + dir*z`, the signed markout values are
+
+`J_loss = -dir * markout_price * r_tau(q)`
+
+`J_win  = -dir * markout_price * r_tau(q_next)`.
+
+The win branch receives
+
+`z * (spread * (0.5-delta) - fee_price) + J_win + h(q_next) - h(q)`, where `fee_price = fee_EUR_per_EURm * spot / 1e6`,
+
+while the loss branch receives `J_loss`.  The full Tier contribution is the exogenous RFQ
+rate times `p_win * G_win + (1-p_win) * G_loss`.  At a hard inventory limit the win
+probability is zero, but the loss/information branch remains active.
+
+Howard iteration provides the fixed point naturally: each fixed policy produces `L_pi` and
+therefore its own markout resolvent; policy evaluation and improvement use that resolvent,
+then the new policy produces a new generator/resolvent.  The legacy polynomial
+`tau_internalization(q)` inputs remain in the config/UI only as a comparison benchmark and
+are not used by the production HJB markout payoff.
 
 
 ### Temporary FX reference mids

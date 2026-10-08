@@ -28,6 +28,37 @@ double optional_number(const py::dict& object, const char* key, double fallback)
     return object.contains(k) ? py::cast<double>(object[k]) : fallback;
 }
 
+
+double eur_per_eurm_to_price_units(double eur_per_eurm, double reference_spot,
+                                      const char* label) {
+    if (!(reference_spot > 0.0) || !std::isfinite(reference_spot)) {
+        throw std::invalid_argument("reference spot must be positive when converting EUR / EURm values");
+    }
+    if (eur_per_eurm < 0.0 || !std::isfinite(eur_per_eurm)) {
+        throw std::invalid_argument(std::string(label) + " in EUR / EURm must be finite and nonnegative");
+    }
+    // EUR/EURm is a relative PnL of eur_per_eurm / 1e6.  Multiplying by
+    // the reference spot converts it to the solver's quote-price units.
+    return eur_per_eurm * reference_spot / 1'000'000.0;
+}
+
+double fee_price_units(const py::dict& object, const char* eur_per_eurm_key,
+                       double reference_spot) {
+    const py::str eur_key(eur_per_eurm_key);
+    if (!object.contains(eur_key)) {
+        throw std::invalid_argument(
+            std::string("missing trading fee field '") + eur_per_eurm_key
+            + "' (all trading fees must be supplied in EUR / EURm traded)");
+    }
+
+    const double fee_eur_per_eurm = py::cast<double>(object[eur_key]);
+    return eur_per_eurm_to_price_units(fee_eur_per_eurm, reference_spot, "trading fee");
+}
+
+double fee_eur_per_eurm(double fee_price, double reference_spot) {
+    return fee_price * 1'000'000.0 / reference_spot;
+}
+
 bool boolean(const py::dict& object, const char* key) {
     return py::cast<bool>(object[py::str(key)]);
 }
@@ -158,11 +189,13 @@ AggregatedFlow build_tier_flow(const py::dict& tier, double target_spread_pips) 
                 // defaults above
             } else if (type == "crossed") {
                 const double cross_mid = number(mapping, "crossMid");
-                const double source_spread_pips = number(mapping, "sourceSpreadPips");
-                if (cross_mid <= 0.0 || source_spread_pips <= 0.0) {
-                    throw std::invalid_argument("crossed flow mapping requires positive crossMid and sourceSpreadPips");
+                if (cross_mid <= 0.0) {
+                    throw std::invalid_argument("crossed flow mapping requires positive crossMid");
                 }
-                delta_scale = target_spread_pips / (cross_mid * source_spread_pips);
+                // The source quote is obtained by crossing the target quote.
+                // Both mid and spread scale by the same cross, so normalized
+                // delta is invariant: d_source == d_target.
+                delta_scale = 1.0;
                 source_size_per_target = cross_mid;
             } else if (type == "affine") {
                 delta_scale = number(mapping, "deltaScale");
@@ -178,14 +211,14 @@ AggregatedFlow build_tier_flow(const py::dict& tier, double target_spread_pips) 
     return AggregatedFlow(std::move(sources));
 }
 
-std::optional<DarkPool> build_dark_pool(const py::dict& cfg) {
+std::optional<DarkPool> build_dark_pool(const py::dict& cfg, double reference_spot) {
     if (!boolean(cfg, "enabled")) return std::nullopt;
 
     std::shared_ptr<ArrivalDistribution> arrivals = std::make_shared<ZeroInflatedPoissonArrival>(
         number(cfg, "lambda"), number(cfg, "mu"), number(cfg, "p0"));
 
     return DarkPool(
-        std::move(arrivals), number(cfg, "feePips") / 10000.0,
+        std::move(arrivals), fee_price_units(cfg, "feeEurPerEurM", reference_spot),
         numbers(cfg[py::str("postedSizes")]));
 }
 
@@ -225,11 +258,12 @@ AggregatedECNFlow build_ecn_flow(const py::dict& cfg, double target_spread_pips)
                 // defaults above
             } else if (type == "crossed") {
                 const double cross_mid = number(mapping, "crossMid");
-                const double source_spread_pips = number(mapping, "sourceSpreadPips");
-                if (cross_mid <= 0.0 || source_spread_pips <= 0.0) {
-                    throw std::invalid_argument("crossed ECN flow mapping requires positive crossMid and sourceSpreadPips");
+                if (cross_mid <= 0.0) {
+                    throw std::invalid_argument("crossed ECN flow mapping requires positive crossMid");
                 }
-                delta_scale = target_spread_pips / (cross_mid * source_spread_pips);
+                // Same normalized quote delta after crossing; cross mid only
+                // converts source-base trade sizes into target-base inventory.
+                delta_scale = 1.0;
                 source_size_per_target = cross_mid;
             } else if (type == "affine") {
                 delta_scale = number(mapping, "deltaScale");
@@ -253,15 +287,16 @@ AggregatedECNFlow build_ecn_flow(const py::dict& cfg, double target_spread_pips)
     return AggregatedECNFlow(std::move(sources));
 }
 
-std::optional<PassiveECN> build_passive_ecn(const py::dict& cfg, double target_spread_pips) {
+std::optional<PassiveECN> build_passive_ecn(const py::dict& cfg, double target_spread_pips, double reference_spot) {
     if (!boolean(cfg, "enabled")) return std::nullopt;
     return PassiveECN(
         numbers(cfg[py::str("deltas")]),
         build_ecn_flow(cfg, target_spread_pips),
-        number(cfg, "quoteSize"), number(cfg, "makerFeePips") / 10000.0);
+        number(cfg, "quoteSize"), fee_price_units(cfg, "makerFeeEurPerEurM", reference_spot));
 }
 
 PricingProblem build_problem(const py::dict& cfg, std::optional<double> gamma_override = std::nullopt) {
+    const double reference_spot = number(cfg, "spot");
     std::vector<Tier> tiers;
     const py::list tier_cfgs = py::cast<py::list>(cfg[py::str("tiers")]);
     for (const py::handle item : tier_cfgs) {
@@ -271,10 +306,12 @@ PricingProblem build_problem(const py::dict& cfg, std::optional<double> gamma_ov
         tiers.emplace_back(
             text(tier, "name"), numbers(tier[py::str("sizes")]),
             build_tier_flow(tier, number(cfg, "spreadPips")),
-            SaturatingMarkout(number(markout, "impactScalePips") / 10000.0,
-                              number(markout, "sizeExponent"), number(markout, "tauMinutes")),
+            SaturatingMarkout(
+                eur_per_eurm_to_price_units(
+                    number(markout, "asymptoticEurPerEurM"), reference_spot, "markout"),
+                number(markout, "tauMinutes")),
             boolean(tier, "useMarkout"), number(tier, "deltaMin"), number(tier, "deltaMax"),
-            optional_number(tier, "feePips", 0.0) / 10000.0,
+            fee_price_units(tier, "feeEurPerEurM", reference_spot),
             optional_number(tier, "rfqSizeStep", 1.0));
     }
     if (tiers.empty() && !boolean(py::cast<py::dict>(cfg[py::str("darkPool")]), "enabled")
@@ -292,8 +329,8 @@ PricingProblem build_problem(const py::dict& cfg, std::optional<double> gamma_ov
         QuadraticPenalty(gamma, sigma),
         InternalizationTime(number(internal, "tau0"), number(internal, "tau1"), number(internal, "tau2")),
         std::move(tiers),
-        build_dark_pool(py::cast<py::dict>(cfg[py::str("darkPool")])),
-        build_passive_ecn(py::cast<py::dict>(cfg[py::str("passiveEcn")]), number(cfg, "spreadPips")));
+        build_dark_pool(py::cast<py::dict>(cfg[py::str("darkPool")]), reference_spot),
+        build_passive_ecn(py::cast<py::dict>(cfg[py::str("passiveEcn")]), number(cfg, "spreadPips"), reference_spot));
 }
 
 py::list matrix_value(const std::vector<std::vector<double>>& matrix) {
@@ -302,7 +339,7 @@ py::list matrix_value(const std::vector<std::vector<double>>& matrix) {
     return rows;
 }
 
-py::dict solution_value(const Solution& solution, const PricingProblem& problem) {
+py::dict solution_value(const Solution& solution, const PricingProblem& problem, double reference_spot) {
     py::dict out;
     out["qGrid"] = solution.q_grid;
     out["value"] = solution.value;
@@ -313,6 +350,17 @@ py::dict solution_value(const Solution& solution, const PricingProblem& problem)
     out["residual"] = solution.diagnostics.reward_upper_bound - solution.diagnostics.reward_lower_bound;
     out["valueChange"] = solution.diagnostics.value_change;
     out["bellmanResidual"] = solution.diagnostics.bellman_residual;
+    out["markoutResolventChange"] = solution.diagnostics.markout_resolvent_change;
+
+    py::list markout_exposure;
+    for (const auto& curve : solution.markout_exposure) {
+        py::dict item;
+        item["tauMinutes"] = curve.tau_minutes;
+        item["qGrid"] = solution.q_grid;
+        item["effectiveInventory"] = curve.effective_inventory;
+        markout_exposure.append(std::move(item));
+    }
+    out["markoutExposure"] = std::move(markout_exposure);
 
     py::list tier_values;
     for (std::size_t k = 0; k < solution.tier_policies.size(); ++k) {
@@ -321,7 +369,7 @@ py::dict solution_value(const Solution& solution, const PricingProblem& problem)
         tier["sizes"] = solution.tier_policies[k].sizes;
         tier["bid"] = matrix_value(solution.tier_policies[k].bid);
         tier["ask"] = matrix_value(solution.tier_policies[k].ask);
-        tier["feePips"] = problem.tiers()[k].fee() * 10000.0;
+        tier["feeEurPerEurM"] = fee_eur_per_eurm(problem.tiers()[k].fee(), reference_spot);
         tier_values.append(std::move(tier));
     }
     out["tiers"] = std::move(tier_values);
@@ -337,7 +385,7 @@ py::dict solution_value(const Solution& solution, const PricingProblem& problem)
         dark["postedSizes"] = problem.dark_pool()->posted_sizes();
         dark["intensity"] = problem.dark_pool()->arrivals(Side::Bid).arrival_intensity();
         dark["distribution"] = problem.dark_pool()->arrivals(Side::Bid).name();
-        dark["feePips"] = problem.dark_pool()->fee(Side::Bid) * 10000.0;
+        dark["feeEurPerEurM"] = fee_eur_per_eurm(problem.dark_pool()->fee(Side::Bid), reference_spot);
         out["darkPool"] = std::move(dark);
     } else {
         out["darkPool"] = py::none();
@@ -381,7 +429,7 @@ py::dict solution_value(const Solution& solution, const PricingProblem& problem)
         }
         ecn["flowSources"] = std::move(source_values);
         ecn["quoteSize"] = venue.quote_size();
-        ecn["makerFeePips"] = venue.maker_fee() * 10000.0;
+        ecn["makerFeeEurPerEurM"] = fee_eur_per_eurm(venue.maker_fee(), reference_spot);
         out["passiveEcn"] = std::move(ecn);
     } else {
         out["passiveEcn"] = py::none();
@@ -570,7 +618,7 @@ public:
             py::gil_scoped_release release;
             solution_ = HowardSolver(problem_).solve();
         }
-        return solution_value(*solution_, problem_);
+        return solution_value(*solution_, problem_, reference_spot_);
     }
 
     py::dict statistics(double horizon_minutes, double initial_inventory = 0.0) {
@@ -675,7 +723,7 @@ private:
 
 PYBIND11_MODULE(_native, module) {
     module.doc() = "C++ Howard pricing engine";
-    module.attr("ECN_PARAMETERIZATION_VERSION") = 10;
+    module.attr("ECN_PARAMETERIZATION_VERSION") = 11;
     py::class_<ladder_pricer::python::Engine>(module, "Engine")
         .def(py::init<py::dict>())
         .def("solve", &ladder_pricer::python::Engine::solve)

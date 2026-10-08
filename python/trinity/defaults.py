@@ -126,7 +126,7 @@ _DEFAULT_CONFIG = {
     "spreadPips": 20.0,
     "spotDrift": 0.0,
     "sigmaPips": 20.0,
-    "gamma": 0.1,
+    "gamma": 0.75,
     "grid": {
         "mode": "uniform",
         "maxAbs": 20.0,
@@ -144,9 +144,9 @@ _DEFAULT_CONFIG = {
             # this curve on the full RFQ-size support (1M steps by default),
             # independently of the pricing-size knots below.
             "flow": {"A0": 0.0155, "theta": 0.144, "beta": 0.0857, "steepness": 8.42, "shift": 0.52, "volumeShift": 0.026},
-            "markout": {"impactScalePips": 1.0, "sizeExponent": 0.5, "tauMinutes": 0.5},
+            "markout": {"asymptoticEurPerEurM": 8.695652173913043, "tauMinutes": 0.5},
             "useMarkout": True,
-            "feePips": 0.0,
+            "feeEurPerEurM": 3.0,
             "deltaMin": -10.0,
             "deltaMax": 100.0,
         },
@@ -156,9 +156,9 @@ _DEFAULT_CONFIG = {
             "sizes": [1, 2, 3, 5, 10, 20],
             "rfqSizeStep": 1.0,
             "flow": {"A0": 0.0232, "theta": 0.303, "beta": 0.122, "steepness": 2.86, "shift": 0.48, "volumeShift": 0.020},
-            "markout": {"impactScalePips": 1.0, "sizeExponent": 0.5, "tauMinutes": 0.5},
+            "markout": {"asymptoticEurPerEurM": 8.695652173913043, "tauMinutes": 0.5},
             "useMarkout": True,
-            "feePips": 0.0,
+            "feeEurPerEurM": 3.0,
             "deltaMin": -10.0,
             "deltaMax": 100.0,
         },
@@ -168,9 +168,9 @@ _DEFAULT_CONFIG = {
             "sizes": [1],
             "rfqSizeStep": 1.0,
             "flow": {"A0": 1.0, "theta": 0.144, "beta": 0.0857, "steepness": 20.0, "shift": 0.52, "volumeShift": 0.026},
-            "markout": {"impactScalePips": 4.0, "sizeExponent": 0.5, "tauMinutes": 0.10},
+            "markout": {"asymptoticEurPerEurM": 34.78260869565217, "tauMinutes": 0.10},
             "useMarkout": True,
-            "feePips": 0.0,
+            "feeEurPerEurM": 3.0,
             "deltaMin": -10.0,
             "deltaMax": 100.0,
         },
@@ -180,11 +180,11 @@ _DEFAULT_CONFIG = {
         # Symmetric zero-inflated Poisson fill-size model. lambda is the raw
         # arrival intensity per side, mu controls positive fill size, and p0 is
         # the zero-fill mass. Dark-pool orders are hedge-only and may not cross
-        # through flat. feePips is applied symmetrically to buy and sell fills.
+        # through flat. feeEurPerEurM is applied symmetrically to buy and sell fills.
         "lambda": 0.0012,
         "mu": 2.9,
         "p0": 0.7172,
-        "feePips": 0.0,
+        "feeEurPerEurM": 0.0,
         "postedSizes": [1, 2, 3, 4, 5],
     },
     "passiveEcn": {
@@ -206,7 +206,7 @@ _DEFAULT_CONFIG = {
         # residual 1 - sum(other probabilities).
         "tradeSizeProbabilities": list(ECN_TRADE_SIZE_PROBABILITIES),
         "quoteSize": 1.0,
-        "makerFeePips": 3.0,
+        "makerFeeEurPerEurM": 3.0,  # EUR per EURm traded
     },
 }
 

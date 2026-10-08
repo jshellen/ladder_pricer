@@ -124,18 +124,18 @@ private:
 
 class SaturatingMarkout {
 public:
-    SaturatingMarkout(double impact_scale, double size_exponent, double tau_minutes);
+    // asymptotic_price_move is the eventual signed-price-move magnitude
+    // corresponding to the empirical EUR/EURm markout curve after the
+    // config-boundary conversion. It is intentionally independent of RFQ size.
+    SaturatingMarkout(double asymptotic_price_move, double tau_minutes);
 
-    double asymptotic(double size) const;
-    double expected(double size, double minutes) const;
+    double asymptotic() const noexcept { return asymptotic_price_move_; }
+    double expected(double minutes) const;
 
-    double impact_scale() const noexcept { return impact_scale_; }
-    double size_exponent() const noexcept { return size_exponent_; }
     double tau_minutes() const noexcept { return tau_minutes_; }
 
 private:
-    double impact_scale_;
-    double size_exponent_;
+    double asymptotic_price_move_;
     double tau_minutes_;
 };
 
@@ -296,9 +296,9 @@ public:
     }
     double sample_trade_size(std::mt19937_64& rng) const;
 
-    // Map the target-pair master delta into the source-pair quote.  The same
-    // affine convention is used by customer Tier flow sources:
-    // d_source = 0.5 + alpha * (d_target - 0.5).
+    // Map the target-pair master delta into the source-pair quote. Crossed
+    // sources use delta_scale=1 because crossing scales mid and spread equally;
+    // affine mappings remain available for explicit non-cross transformations.
     double implied_delta(double target_delta) const noexcept;
     double arrival_rate(double target_delta) const;
 
@@ -423,6 +423,20 @@ private:
     std::optional<PassiveECN> passive_ecn_;
 };
 
+struct MarkoutExposureCurve {
+    double tau_minutes = 0.0;
+    // Policy-implied exponentially weighted future inventory
+    // r_tau(q) = beta E_q[int_0^inf exp(-beta t) Q_t dt], beta=1/tau.
+    // Values are defined on PricingProblem::grid().states().
+    std::vector<double> effective_inventory;
+};
+
+struct MarkoutResolvent {
+    std::vector<MarkoutExposureCurve> curves;
+
+    const std::vector<double>* effective_inventory(double tau_minutes) const noexcept;
+};
+
 struct SolverDiagnostics {
     bool converged = false;
     int iterations = 0;
@@ -431,6 +445,7 @@ struct SolverDiagnostics {
     double reward_upper_bound = 0.0;
     std::vector<double> value_change;
     std::vector<double> bellman_residual;
+    std::vector<double> markout_resolvent_change;
 };
 
 struct Solution {
@@ -450,21 +465,29 @@ struct Solution {
     double average_reward = 0.0;
     double hard_inventory_limit = 0.0;
     SolverDiagnostics diagnostics;
+    // Final self-consistent policy-implied markout exposure curves, sliced to
+    // q_grid for diagnostics/UI.
+    std::vector<MarkoutExposureCurve> markout_exposure;
 };
 
 class BellmanModel {
 public:
-    explicit BellmanModel(const PricingProblem& problem) : problem_(problem) {}
+    explicit BellmanModel(const PricingProblem& problem,
+                          const MarkoutResolvent* markout = nullptr)
+        : problem_(problem), markout_(markout) {}
 
     std::vector<double> rhs(const std::vector<double>& value, const Policy& policy) const;
 
 private:
     const PricingProblem& problem_;
+    const MarkoutResolvent* markout_;
 };
 
 class PolicyBuilder {
 public:
-    explicit PolicyBuilder(const PricingProblem& problem) : problem_(problem) {}
+    explicit PolicyBuilder(const PricingProblem& problem,
+                           const MarkoutResolvent* markout = nullptr)
+        : problem_(problem), markout_(markout) {}
 
     Policy initial_policy() const;
     Policy improve(const std::vector<double>& value, const Policy& previous) const;
@@ -504,6 +527,7 @@ private:
     PassiveECNPolicy improve_passive_ecn(const std::vector<double>& value) const;
 
     const PricingProblem& problem_;
+    const MarkoutResolvent* markout_;
 };
 
 
