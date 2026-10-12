@@ -78,12 +78,15 @@ source_size  = cross_mid * target_size
 
 For example, a 25% EURSEK delta implies a 25% USDSEK delta when USDSEK is formed as
 `EURSEK / EURUSD`. The cross mid is still needed for base-currency size conversion.
-The calibrated exogenous intensity curve itself defines the
-RFQ-size distribution. Customer RFQ sizes are independent of the pricing-control knots:
-by default Monte Carlo evaluates the curve on a 1M grid from the smallest to the largest
-pricing size, normalizes those values into probabilities, and samples the requested size
-from that full support.  Quotes for customer sizes between pricing knots are obtained by
-linear interpolation of the neighboring prices.
+Customer RFQ sizes are now represented by a discrete exogenous distribution that is
+independent of the pricing-control knots. Each flow source owns a pooled bid+ask total
+request rate `Lambda_s` and a source-currency size PMF `{z_{s,k}, p_{s,k}}`; one-sided
+atom intensity is `0.5 * Lambda_s * p_{s,k}`. Legacy `A0/theta/beta` configurations are
+frozen onto the RFQ integration grid at the native boundary to produce the same object.
+The HJB, pricing-knot optimizer and Monte Carlo all consume that common distribution.
+Quotes for customer sizes between pricing knots are obtained by linear interpolation of
+the neighboring prices. Adding an internal pricing knot therefore does not create a new
+RFQ event or change the exogenous request rate.
 
 Because several transformed logistic curves no longer have the single-curve Lambert-W
 optimum, aggregated tiers use a bounded one-dimensional numerical quote optimization.
@@ -181,6 +184,9 @@ passive ECN fill of size `v` at target delta `d` earns
   shares of all trades or all executed volume by tier/venue and side;
 - realized RFQ hit ratios pool wins and RFQ requests over every simulated path for
   each RFQ size, rather than relying on the small retained-path sample;
+- RFQ Monte Carlo validation compares the all-path empirical size frequencies and
+  hit probabilities against the same discrete RFQ distribution and interpolated pricing
+  policy used by the native simulator;
 - fill tape.
 
 ## Monte Carlo market clock
@@ -377,6 +383,27 @@ The HJB/analytics use the equivalent transition rates implied by this same cappe
 mechanism. The previous geometric fill-size model has been removed.
 
 
+## RFQ distribution refactor — step 1
+
+The native data model now supports a source-level empirical RFQ calibration that is
+**independent of pricing knots**:
+
+```text
+Lambda_s                       pooled bid+ask RFQs / min
+{z_s,k, p_s,k}                 source-base size PMF, sum p_s,k = 1
+lambda_side,s,k = 0.5*Lambda_s*p_s,k
+```
+
+`DiscreteRfqDistribution` is attached to a `FlowSource` as separate calibration metadata.
+The Python/native config boundary accepts the optional fields `totalRfqRate`, `rfqSizes`,
+and `rfqProbabilities` together.  The legacy `A0/theta/beta` arrival curve remains the
+active HJB/Monte Carlo path in **step 1**, so existing solver behaviour is intentionally
+unchanged.  Later refactor steps will switch HJB evaluation and Monte Carlo sampling to
+this explicit distribution.
+
+A native regression test verifies that changing the configured pricing/RFQ knot support
+does not mutate the calibrated `Lambda_s` or `{z_s,k,p_s,k}` object.
+
 ## Customer RFQs in Monte Carlo
 
 The **exogenous RFQ-arrival intensity curve itself defines the RFQ-size density**. For each
@@ -493,3 +520,100 @@ orientations (for example `USDEUR` from `EURUSD`). This is intentionally a
 temporary market-data boundary: a production deployment should replace the
 default lookup with the bank's/database market-data source while leaving the
 flow-source and HJB interfaces unchanged.
+
+## RFQ refactor — step 2
+
+The fixed-policy HJB evaluation is now separated from the pricing-knot grid.
+Each customer flow source owns a discrete exogenous RFQ distribution with pooled
+bid+ask rate `Lambda_s`, source-currency sizes `z_{s,k}` and probabilities
+`p_{s,k}`.  The one-sided atom rate is
+
+`lambda_side(s,k) = 0.5 * Lambda_s * p_{s,k}`.
+
+For each RFQ atom, the source size is mapped into target EURSEK inventory size,
+the target quote delta is linearly interpolated from the pricing knots, and the
+win/loss payoff is evaluated at that realized RFQ size.  Thus fixed-policy HJB
+evaluation sums over RFQ atoms, not pricing knots.
+
+For legacy `A0/theta/beta` configs, the native boundary freezes the old curve
+onto the `rfqSizeStep` grid between the minimum and maximum pricing size.  This
+distribution-support grid deliberately does not union internal pricing knots,
+so adding an internal pricing knot no longer creates an exogenous RFQ event in
+HJB evaluation.
+
+The pricing-knot optimizer itself is intentionally unchanged in step 2 and is
+still the legacy rung-by-rung optimizer.  Monte Carlo is also intentionally
+unchanged until its dedicated refactor step.  Step 3 will replace policy
+improvement with distribution-aware coordinate optimization over the pricing
+knots.
+
+
+## RFQ refactor — step 3
+
+Pricing-knot policy improvement now uses coordinate optimization against the
+full discrete RFQ-size distribution introduced in steps 1–2. Pricing knots are
+control points only; realized RFQ sizes are priced by linear interpolation of
+the knot curve. For one coordinate, all other knots are held fixed and the
+full expected RFQ Hamiltonian is maximized with respect to that knot. Sweeps
+are repeated until no coordinate improves (with a small hard iteration cap;
+Howard itself remains the outer fixed-point iteration).
+
+The implementation precomputes all delta-independent RFQ payoff terms for each
+(q, volatility, tier, side) state. A coordinate evaluation therefore touches
+only RFQ atoms whose interpolated quote depends on that knot. This keeps the
+new optimizer practical with the stochastic-volatility joint state.
+
+Monte Carlo still uses the legacy RFQ-size sampling path in step 3. It will be
+switched to the same Lambda + discrete-size distribution in step 4.
+
+## RFQ refactor — step 4
+
+Monte Carlo now uses the same per-source discrete RFQ distribution as the HJB
+and the step-3 pricing-knot optimizer.  A source has pooled bid+ask rate
+`Lambda_s`; each RFQ first chooses side with probability 1/2, then samples a
+source-currency size `z_{s,k}` with probability `p_{s,k}`.  The requested size
+is mapped to target inventory units for crossed sources and its quote is
+obtained by linear interpolation of the pricing-knot policy before the existing
+win-probability model is applied.
+
+Pricing knots therefore no longer create Monte Carlo RFQ events.  A pricing
+knot absent from the RFQ distribution receives zero RFQ requests, while an RFQ
+size between pricing knots is sampled normally and receives an interpolated
+quote.  Population RFQ validation uses the same atom rates and interpolated
+policy as the native simulator.
+
+## RFQ refactor — step 5
+
+The active Tier / customer-flow UI and Python config now expose the RFQ model
+directly as three independent source-level inputs:
+
+- `totalRfqRate`: pooled bid+ask RFQ rate [RFQ/min]
+- `rfqSizes`: discrete request sizes in source-base-currency millions
+- `rfqProbabilities`: probability mass for those sizes, summing to one
+
+Legacy `A0`, `theta`, `beta` and `rfqSizeStep` are no longer active UI/config
+parameters.  The default Tier-1 and Tier-2 distributions are numerical discrete
+equivalents of the previous legacy calibrations, so this UI/config cleanup does
+not intentionally change the calibrated RFQ economics.  The native boundary
+continues to accept legacy configs for backward compatibility.
+
+All active diagnostics and closed-form customer-flow analytics now consume the
+same explicit RFQ atoms and interpolate the pricing policy at the realized RFQ
+size.  Changing, adding or removing pricing knots does not mutate
+`totalRfqRate`, `rfqSizes`, or `rfqProbabilities`.
+
+## Flow-source calibration diagnostics (2026-10-09)
+
+The Tier and passive-ECN `Configure flow sources` dialogs now act as the calibration workspace for the currently selected currency pair.
+
+Customer Tier flow-source dialog:
+- edits pooled bid+ask `totalRfqRate`, explicit discrete `rfqSizes` / `rfqProbabilities`, and win-probability calibration for the selected direct or crossed pair;
+- visualizes the selected pair's RFQ size PMF (including pooled rate contribution), `p(win | delta, size)` heatmap, and the Tier RFQ markout curve;
+- the markout diagnostic is explicitly labelled as Tier-level/shared because the current HJB does not yet have source-specific customer markout curves.
+
+Passive ECN flow-source dialog:
+- edits each selected pair's `A`, `k`, and five-point parent-trade-size PMF;
+- visualizes that pair's trade-size PMF and both absolute fill intensity `lambda(d)` and relative intensity `lambda(d)/A`;
+- the Markouts expander states that passive ECN currently has no separate markout process in the HJB rather than displaying a synthetic curve.
+
+The diagnostics are tied to the pair-card selection and update from the live editor controls; no solve is required to inspect calibration changes.

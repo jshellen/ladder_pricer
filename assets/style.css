@@ -379,3 +379,9 @@ input[type="checkbox"] { accent-color: var(--accent); }
   font-size:13px;
 }
 .status.running { color:#d29922; border-color:#6b5522; }
+
+/* Flow-source calibration diagnostics live inside the source selector popup. */
+.flow-source-modal-card { width:min(1180px, 97vw); }
+.flow-source-modal-diagnostics { display:flex; flex-direction:column; gap:10px; margin-top:4px; }
+.flow-source-modal-diagnostics .diagnostic-expander { background:#0f161f; }
+.flow-source-modal-diagnostics .diagnostic-expander-body { padding-top:10px; }

@@ -35,60 +35,83 @@ private:
     double operational_limit_ = 0.0;
 };
 
-class LogisticFlow {
+class DiscreteRfqDistribution {
 public:
-    LogisticFlow(double a0, double theta, double beta, double shift,
-                 double steepness, double volume_shift);
+    // total_rfq_rate is the pooled bid+ask RFQ arrival rate [RFQ/min].
+    // sizes are expressed in the flow source base currency (EURm, USDm, ...).
+    DiscreteRfqDistribution(double total_rfq_rate,
+                            std::vector<double> source_sizes,
+                            std::vector<double> probabilities);
 
-    // A0 is the scale of the calibrated exogenous RFQ-arrival intensity
-    // curve for one customer side.  For source-currency size z,
-    // lambda_RFQ(z) = A0 * z^(-theta-beta*z).  FlowSource uses this same curve
-    // both as the HJB size-specific exogenous intensity and, after
-    // normalization across configured RFQ rungs, as the Monte Carlo size PMF.
-    double size_weight(double size) const;
-    double rfq_arrival_rate(double size) const;
-    double center(double size) const;
-    // Probability that our quote wins a customer RFQ.
-    double hit_ratio(double delta, double size) const;
-    double win_probability(double delta, double size) const { return hit_ratio(delta, size); }
-    double optimal_delta(double size, double spread, double additive_value) const;
-
-    double a0() const noexcept { return a0_; }
-    double theta() const noexcept { return theta_; }
-    double beta() const noexcept { return beta_; }
-    double shift() const noexcept { return shift_; }
-    double steepness() const noexcept { return steepness_; }
-    double volume_shift() const noexcept { return volume_shift_; }
+    double total_rfq_rate() const noexcept { return total_rfq_rate_; }
+    const std::vector<double>& source_sizes() const noexcept { return source_sizes_; }
+    const std::vector<double>& probabilities() const noexcept { return probabilities_; }
+    double one_side_arrival_rate(std::size_t atom) const;
 
 private:
-    static double lambert_w_exp(double log_argument);
+    double total_rfq_rate_ = 0.0;
+    std::vector<double> source_sizes_;
+    std::vector<double> probabilities_;
+};
 
-    double a0_;
-    double theta_;
-    double beta_;
+struct RfqAtom {
+    double target_size = 0.0;
+    double one_side_arrival_rate = 0.0;
+};
+
+// RFQ win probability only. Exogenous RFQ arrival rates live in DiscreteRfqDistribution.
+class LogisticWinProbability {
+public:
+    LogisticWinProbability(double shift, double steepness, double volume_shift);
+    double win_probability(double delta, double size) const;
+    double center(double size) const;
+    double steepness() const noexcept { return steepness_; }
+    double shift() const noexcept { return shift_; }
+    double volume_shift() const noexcept { return volume_shift_; }
+    double optimal_delta(double size, double spread, double additive_value) const;
+private:
+    static double lambert_w_exp(double log_argument);
     double shift_;
     double steepness_;
     double volume_shift_;
 };
 
+// Explicit conversion between the target-inventory currency and a flow source.
+struct FXMapping {
+    double delta_scale = 1.0;
+    double source_size_per_target = 1.0;
+    FXMapping(double delta_scale_ = 1.0, double size_scale_ = 1.0);
+    double implied_delta(double target_delta) const noexcept {
+        return 0.5 + delta_scale * (target_delta - 0.5);
+    }
+    double target_reach(double source_reach) const noexcept {
+        return source_reach / delta_scale;
+    }
+    double source_size(double target_size) const noexcept {
+        return target_size * source_size_per_target;
+    }
+    double target_size(double source_size_) const noexcept {
+        return source_size_ / source_size_per_target;
+    }
+};
 
 class FlowSource {
 public:
-    FlowSource(std::string name, LogisticFlow flow,
-               double delta_scale = 1.0, double source_size_per_target = 1.0);
-
+    // Preferred API: all three components are independent and required.
+    FlowSource(std::string name, DiscreteRfqDistribution distribution,
+               LogisticWinProbability win_model, FXMapping mapping = {});
     const std::string& name() const noexcept { return name_; }
-    const LogisticFlow& flow() const noexcept { return flow_; }
-    double delta_scale() const noexcept { return delta_scale_; }
-    double source_size_per_target() const noexcept { return source_size_per_target_; }
-
+    const LogisticWinProbability& win_model() const noexcept { return win_model_; }
+    const FXMapping& mapping() const noexcept { return mapping_; }
+    double delta_scale() const noexcept { return mapping_.delta_scale; }
+    double source_size_per_target() const noexcept { return mapping_.source_size_per_target; }
+    const DiscreteRfqDistribution& rfq_distribution() const noexcept { return distribution_; }
+    std::vector<RfqAtom> rfq_atoms() const;
     double implied_delta(double target_delta) const noexcept;
     double source_size(double target_size) const noexcept;
-    void configure_target_sizes(const std::vector<double>& target_sizes);
-    const std::vector<double>& target_sizes() const noexcept { return target_sizes_; }
-    const std::vector<double>& size_probabilities() const noexcept { return size_probabilities_; }
-    double total_rfq_rate() const noexcept { return total_rfq_rate_; }
+    double total_rfq_rate() const noexcept;
     std::size_t sample_target_size_index(std::mt19937_64& rng) const;
+    double sample_rfq_target_size(std::mt19937_64& rng) const;
     double rfq_arrival_rate(double target_size) const;
     double win_probability(double target_delta, double target_size) const;
     double arrival_rate(double target_delta, double target_size) const;
@@ -97,21 +120,16 @@ public:
 
 private:
     std::string name_;
-    LogisticFlow flow_;
-    double delta_scale_;
-    double source_size_per_target_;
-    std::vector<double> target_sizes_;
-    std::vector<double> size_probabilities_;
-    double total_rfq_rate_ = 0.0;
+    LogisticWinProbability win_model_;
+    FXMapping mapping_;
+    DiscreteRfqDistribution distribution_;
 };
 
 class AggregatedFlow {
 public:
-    explicit AggregatedFlow(LogisticFlow direct_flow);
     explicit AggregatedFlow(std::vector<FlowSource> sources);
 
     const std::vector<FlowSource>& sources() const noexcept { return sources_; }
-    void configure_target_sizes(const std::vector<double>& target_sizes);
     double rfq_arrival_rate(double target_size) const;
     double win_probability(double target_delta, double target_size) const;
     double arrival_rate(double target_delta, double target_size) const;
@@ -190,10 +208,6 @@ private:
 
 class Tier {
 public:
-    Tier(std::string name, std::vector<double> sizes, LogisticFlow flow,
-         SaturatingMarkout markout, bool use_markout,
-         double delta_min, double delta_max, double fee = 0.0,
-         double rfq_size_step = 1.0);
     Tier(std::string name, std::vector<double> sizes, AggregatedFlow flow,
          SaturatingMarkout markout, bool use_markout,
          double delta_min, double delta_max, double fee = 0.0,
@@ -293,26 +307,20 @@ class ECNFlowSource {
 public:
     // ECN parent trade sizes are discrete source-base currency pillars:
     // 1.00M, 0.75M, 0.50M, 0.25M and 0.10M.
-    ECNFlowSource(std::string name, ExponentialFlow flow,
-                  double delta_scale = 1.0, double source_size_per_target = 1.0);
-    ECNFlowSource(std::string name, ExponentialFlow flow,
-                  double delta_scale, double source_size_per_target,
+    // Explicit source-size distribution and shared FX mapping.
+    ECNFlowSource(std::string name, ExponentialFlow flow, FXMapping mapping,
                   std::vector<double> trade_size_probabilities);
-    // Backward-compatible constructor: discretize an exponential parent-size
-    // model onto the fixed pillars using midpoint bins.
-    ECNFlowSource(std::string name, ExponentialFlow flow,
-                  double delta_scale, double source_size_per_target,
-                  double legacy_mean_trade_size);
 
     const std::string& name() const noexcept { return name_; }
     const ExponentialFlow& flow() const noexcept { return flow_; }
-    double delta_scale() const noexcept { return delta_scale_; }
-    double source_size_per_target() const noexcept { return source_size_per_target_; }
+    const FXMapping& mapping() const noexcept { return mapping_; }
+    double delta_scale() const noexcept { return mapping_.delta_scale; }
+    double source_size_per_target() const noexcept { return mapping_.source_size_per_target; }
     const std::vector<double>& trade_sizes() const noexcept { return trade_sizes_; }
     const std::vector<double>& trade_size_probabilities() const noexcept { return trade_size_probabilities_; }
     double mean_trade_size() const noexcept;
     double mean_target_trade_size() const noexcept {
-        return mean_trade_size() / source_size_per_target_;
+        return mapping_.target_size(mean_trade_size());
     }
     double sample_trade_size(std::mt19937_64& rng) const;
 
@@ -339,15 +347,13 @@ public:
 private:
     std::string name_;
     ExponentialFlow flow_;
-    double delta_scale_;
-    double source_size_per_target_;
+    FXMapping mapping_;
     std::vector<double> trade_sizes_;
     std::vector<double> trade_size_probabilities_;
 };
 
 class AggregatedECNFlow {
 public:
-    explicit AggregatedECNFlow(ExponentialFlow direct_flow);
     explicit AggregatedECNFlow(std::vector<ECNFlowSource> sources);
 
     const std::vector<ECNFlowSource>& sources() const noexcept { return sources_; }
@@ -359,8 +365,6 @@ private:
 
 class PassiveECN {
 public:
-    PassiveECN(std::vector<double> deltas, ExponentialFlow flow,
-               double quote_size, double maker_fee);
     PassiveECN(std::vector<double> deltas, AggregatedECNFlow flow,
                double quote_size, double maker_fee);
 
@@ -477,6 +481,11 @@ struct SolverDiagnostics {
     std::vector<double> value_change;
     std::vector<double> bellman_residual;
     std::vector<double> markout_resolvent_change;
+    // Final fixed-policy Bellman residual after operational constraints are snapped.
+    double final_bellman_residual = 0.0;
+    double worst_inventory = 0.0;
+    std::size_t worst_volatility_index = 0;
+    std::vector<double> final_bellman_residual_by_state; // [volatility][inventory]
 };
 
 struct Solution {
@@ -511,6 +520,8 @@ struct Solution {
     std::vector<MarkoutExposureCurve> markout_exposure;
     // Full operational exposure surfaces flattened as [vol][q] inside each curve.
     std::vector<MarkoutExposureCurve> markout_exposure_joint;
+    // Full hidden-grid resolvent retained for solver-level regression tests.
+    MarkoutResolvent markout_resolvent_solve;
 };
 
 class BellmanModel {
@@ -537,6 +548,9 @@ public:
     Policy snap_operational_constraints(const Policy& policy) const;
 
 private:
+    // Regression-only access to the production coordinate optimizer and its bounds.
+    friend void validate_single_pricing_knot(const PolicyBuilder&, const Tier&,
+        const std::vector<double>&, double, Side, std::size_t, double);
     struct LadderBounds {
         std::vector<double> min_gaps;
         std::vector<double> max_gaps;
@@ -552,6 +566,15 @@ private:
     std::vector<double> project_ladder(const Tier& tier,
                                        const std::vector<double>& row,
                                        const LadderBounds& bounds) const;
+    std::vector<double> coordinate_optimize_ladder(
+        const Tier& tier, const std::vector<double>& value,
+        double inventory, Side side,
+        const std::vector<double>& seed,
+        const LadderBounds& bounds = {}) const;
+    std::pair<double, double> coordinate_bounds(
+        const Tier& tier, std::size_t rung,
+        const std::vector<double>& row,
+        const LadderBounds& bounds) const;
     double ladder_hamiltonian(const Tier& tier, const std::vector<double>& value,
                               double inventory, Side side,
                               const std::vector<double>& row) const;

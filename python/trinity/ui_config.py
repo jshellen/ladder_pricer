@@ -16,6 +16,25 @@ def parse_numbers(raw: Any) -> list[float]:
     return values
 
 
+def _rfq_distribution(values: Mapping[str, Any], prefix: str) -> tuple[float, list[float], list[float]]:
+    total_rate = _number(values, f"{prefix}-rfq-rate")
+    if total_rate < 0.0:
+        raise ValueError("Total RFQ rate must be nonnegative")
+    sizes = parse_numbers(values.get(f"{prefix}-rfq-sizes", ""))
+    probabilities = parse_numbers(values.get(f"{prefix}-rfq-probs", ""))
+    if len(sizes) != len(probabilities):
+        raise ValueError("RFQ sizes and probabilities must have the same length")
+    if any(z <= 0.0 for z in sizes):
+        raise ValueError("RFQ sizes must be positive")
+    if any(b <= a for a, b in zip(sizes, sizes[1:])):
+        raise ValueError("RFQ sizes must be strictly increasing")
+    if any(p < 0.0 for p in probabilities):
+        raise ValueError("RFQ probabilities must be nonnegative")
+    if abs(sum(probabilities) - 1.0) > 1e-9:
+        raise ValueError("RFQ probabilities must sum to 1")
+    return total_rate, sizes, probabilities
+
+
 def _number(values: Mapping[str, Any], key: str) -> float:
     value = values.get(key)
     if isinstance(value, (list, tuple, dict, set)):
@@ -78,10 +97,11 @@ def build_config(values: Mapping[str, Any]) -> dict[str, Any]:
     for i in range(3):
         p = f"t{i}"
         sizes = parse_numbers(values.get(f"{p}-sizes", ""))
+        total_rfq_rate, rfq_sizes, rfq_probabilities = _rfq_distribution(values, p)
         flow = {
-            "A0": _number(values, f"{p}-A0"),
-            "theta": _number(values, f"{p}-theta"),
-            "beta": _number(values, f"{p}-beta"),
+            "totalRfqRate": total_rfq_rate,
+            "rfqSizes": rfq_sizes,
+            "rfqProbabilities": rfq_probabilities,
             "steepness": _number(values, f"{p}-steep"),
             "shift": _number(values, f"{p}-shift"),
             "volumeShift": _number(values, f"{p}-vshift"),
@@ -90,7 +110,6 @@ def build_config(values: Mapping[str, Any]) -> dict[str, Any]:
             "enabled": checked(values.get(f"{p}-enabled")),
             "name": str(values.get(f"{p}-name", f"Tier {i + 1}")),
             "sizes": sizes,
-            "rfqSizeStep": _number(values, f"{p}-rfq-size-step") if values.get(f"{p}-rfq-size-step") is not None else 1.0,
             "flow": flow,
             "markout": {
                 "asymptoticEurPerEurM": _number(values, f"{p}-markout-level"),

@@ -60,6 +60,29 @@ def default_fx_mid(pair: str | None) -> float | None:
     return 1.0 / float(value)
 
 
+
+# Customer RFQ request-size distributions are calibrated independently of
+# pricing knots. totalRfqRate is the pooled bid+ask request rate [RFQ/min];
+# rfqSizes are source-base-currency notionals in millions and probabilities
+# sum to one. These defaults are the exact discrete 1M-grid equivalents of
+# the pre-refactor A0/theta/beta calibrations, so Step 5 changes configuration
+# representation rather than baseline economics.
+DEFAULT_RFQ_SIZES_1_TO_20 = [float(x) for x in range(1, 21)]
+TIER1_RFQ_PROBABILITIES = [
+    0.21887176643980527, 0.1758915120548416, 0.14086931659796414, 0.11145689474702523,
+    0.08710225837745503, 0.06729930665560926, 0.05146610610223016, 0.0389929676799421,
+    0.029293520883484213, 0.021836837534594877, 0.01616249159390996, 0.0118838633720731,
+    0.008684355862944412, 0.006309905987122827, 0.004560025677193113, 0.003278741254971594,
+    0.002346194782902506, 0.0016712719948773097, 0.0011853721953480028, 0.000837290205705274,
+]
+TIER2_RFQ_PROBABILITIES = [
+    0.3136701863886962, 0.21468902039849305, 0.15041083512168163, 0.104771651299432,
+    0.07216284188024215, 0.049100588546606073, 0.03301374631116151, 0.021949323966710118,
+    0.01444040874095255, 0.009407478663408483, 0.00607270626461731, 0.003886511706966847,
+    0.002467369826774755, 0.0015545681378698554, 0.0009724574021369573, 0.0006042027270333202,
+    0.0003729891132545595, 0.00022884806873664417, 0.00013959184708587386, 8.467358814014033e-05,
+]
+
 ECN_TRADE_SIZES = [1.0, 0.75, 0.50, 0.25, 0.10]
 
 # Generic fallback retained for ECN source pairs without a pair-specific
@@ -132,11 +155,11 @@ _DEFAULT_CONFIG = {
         "enabled": True,
         "initialState": 2,
         "sigmaStatesPips": [
-            5.564350602789851,
-            8.09499559995027,
-            10.171908058405807,
-            12.522750248149373,
-            17.379256199566484,
+            5,
+            10,
+            20,
+            30,
+            35 ,
         ],
         "generatorPerMinute": [
             [-0.04620107444359171, 0.031005372217958557, 0.011511895625479662, 0.0029163468917881813, 0.0007674597083653108],
@@ -158,12 +181,12 @@ _DEFAULT_CONFIG = {
             "enabled": True,
             "name": "Tier 1",
             "sizes": [1, 2, 3, 5, 10, 20],
-            "rfqSizeStep": 1.0,
-            # One-sided exogenous RFQ-arrival intensity curve:
-            # lambda_RFQ(z) = A0 * z^(-theta-beta*z).  Monte Carlo evaluates
-            # this curve on the full RFQ-size support (1M steps by default),
-            # independently of the pricing-size knots below.
-            "flow": {"A0": 0.0155, "theta": 0.144, "beta": 0.0857, "steepness": 8.42, "shift": 0.52, "volumeShift": 0.026},
+            "flow": {
+                "totalRfqRate": 0.1416354448280368,
+                "rfqSizes": list(DEFAULT_RFQ_SIZES_1_TO_20),
+                "rfqProbabilities": list(TIER1_RFQ_PROBABILITIES),
+                "steepness": 8.42, "shift": 0.52, "volumeShift": 0.026,
+            },
             "markout": {"asymptoticEurPerEurM": 8.695652173913043, "tauMinutes": 0.5},
             "useMarkout": True,
             "feeEurPerEurM": 3.0,
@@ -174,8 +197,12 @@ _DEFAULT_CONFIG = {
             "enabled": True,
             "name": "Tier 2",
             "sizes": [1, 2, 3, 5, 10, 20],
-            "rfqSizeStep": 1.0,
-            "flow": {"A0": 0.0232, "theta": 0.303, "beta": 0.122, "steepness": 2.86, "shift": 0.48, "volumeShift": 0.020},
+            "flow": {
+                "totalRfqRate": 0.1479260765398395,
+                "rfqSizes": list(DEFAULT_RFQ_SIZES_1_TO_20),
+                "rfqProbabilities": list(TIER2_RFQ_PROBABILITIES),
+                "steepness": 2.86, "shift": 0.48, "volumeShift": 0.020,
+            },
             "markout": {"asymptoticEurPerEurM": 8.695652173913043, "tauMinutes": 0.5},
             "useMarkout": True,
             "feeEurPerEurM": 3.0,
@@ -186,8 +213,12 @@ _DEFAULT_CONFIG = {
             "enabled": False,
             "name": "Tier 3",
             "sizes": [1],
-            "rfqSizeStep": 1.0,
-            "flow": {"A0": 1.0, "theta": 0.144, "beta": 0.0857, "steepness": 20.0, "shift": 0.52, "volumeShift": 0.026},
+            "flow": {
+                "totalRfqRate": 2.0,
+                "rfqSizes": [1.0],
+                "rfqProbabilities": [1.0],
+                "steepness": 20.0, "shift": 0.52, "volumeShift": 0.026,
+            },
             "markout": {"asymptoticEurPerEurM": 34.78260869565217, "tauMinutes": 0.10},
             "useMarkout": True,
             "feeEurPerEurM": 3.0,

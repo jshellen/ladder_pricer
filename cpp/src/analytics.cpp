@@ -181,24 +181,28 @@ PnlStatistics PnlAnalytics::statistics(double horizon, double sigma_legacy, doub
                 const auto& policy=tier_policies[k];
                 for(Side side:{Side::Bid,Side::Ask}){
                     const double dir=direction(side); const auto& deltas=row(policy,side,i);
-                    for(double z:tier.rfq_sizes()){
-                        const double rfq_rate=tier.flow().rfq_arrival_rate(z);
-                        if(rfq_rate<=0.0) continue;
-                        const bool admissible=problem_.grid().admissible(q,dir*z);
-                        const double delta=interpolate_size_row(tier.sizes(),deltas,z);
-                        const double win_rate=admissible?tier.flow().arrival_rate(delta,z):0.0;
-                        const double loss_rate=std::max(0.0,rfq_rate-win_rate);
+                    for(const auto& source:tier.flow().sources()){
+                        for(const auto& atom:source.rfq_atoms()){
+                            const double z=atom.target_size;
+                            const double rfq_rate=atom.one_side_arrival_rate;
+                            if(rfq_rate<=0.0) continue;
+                            const bool admissible=problem_.grid().admissible(q,dir*z);
+                            const double delta=interpolate_size_row(tier.sizes(),deltas,z);
+                            const double win_rate=admissible
+                                ? rfq_rate*source.win_probability(delta,z) : 0.0;
+                            const double loss_rate=std::max(0.0,rfq_rate-win_rate);
 
-                        if(win_rate>0.0){
-                            std::vector<double> shift(nvars,0.0);
-                            shift[static_cast<std::size_t>(pnlvar)]=z*(problem_.spread()*(0.5-delta)-tier.fee());
-                            if(tier.use_markout()) shift[static_cast<std::size_t>(tau_to_var[tier.markout().tau_minutes()])]=-dir*tier.markout().asymptotic();
-                            events.push_back({q+dir*z,win_rate,std::move(shift)});
-                        }
-                        if(loss_rate>0.0 && tier.use_markout()){
-                            std::vector<double> shift(nvars,0.0);
-                            shift[static_cast<std::size_t>(tau_to_var[tier.markout().tau_minutes()])]=-dir*tier.markout().asymptotic();
-                            events.push_back({q,loss_rate,std::move(shift)});
+                            if(win_rate>0.0){
+                                std::vector<double> shift(nvars,0.0);
+                                shift[static_cast<std::size_t>(pnlvar)]=z*(problem_.spread()*(0.5-delta)-tier.fee());
+                                if(tier.use_markout()) shift[static_cast<std::size_t>(tau_to_var[tier.markout().tau_minutes()])]=-dir*tier.markout().asymptotic();
+                                events.push_back({q+dir*z,win_rate,std::move(shift)});
+                            }
+                            if(loss_rate>0.0 && tier.use_markout()){
+                                std::vector<double> shift(nvars,0.0);
+                                shift[static_cast<std::size_t>(tau_to_var[tier.markout().tau_minutes()])]=-dir*tier.markout().asymptotic();
+                                events.push_back({q,loss_rate,std::move(shift)});
+                            }
                         }
                     }
                 }

@@ -433,8 +433,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                     ? solution_.solve_tier_policies_by_volatility.at(vol_state).at(chosen->tier)
                     : solution_.solve_tier_policies.at(chosen->tier);
                 const auto& source = tier.flow().sources().at(chosen->flow_source);
-                const std::size_t size_idx = source.sample_target_size_index(event_rng);
-                const double rfq_size = source.target_sizes().at(size_idx);
+                const double rfq_size = source.sample_rfq_target_size(event_rng);
                 const double rfq_delta = policy_delta_for_size(policy, rfq_side, rfq_size, q);
                 const bool admissible = problem_.grid().admissible(q, dir * rfq_size);
                 const double p_win = admissible

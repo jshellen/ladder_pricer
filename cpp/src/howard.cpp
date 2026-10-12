@@ -34,6 +34,21 @@ Weights interpolation_weights(const std::vector<double>& grid, double q) {
     return {left, right, 1.0 - wr, wr};
 }
 
+double interpolate_size_row(const std::vector<double>& sizes,
+                            const std::vector<double>& values,
+                            double z) {
+    if (sizes.size() != values.size() || sizes.empty()) {
+        throw std::invalid_argument("pricing-size row has inconsistent dimensions");
+    }
+    if (z <= sizes.front() + kTolerance) return values.front();
+    if (z >= sizes.back() - kTolerance) return values.back();
+    auto upper = std::upper_bound(sizes.begin(), sizes.end(), z);
+    const auto right = static_cast<std::size_t>(std::distance(sizes.begin(), upper));
+    const auto left = right - 1;
+    const double w = (z - sizes[left]) / (sizes[right] - sizes[left]);
+    return (1.0 - w) * values[left] + w * values[right];
+}
+
 std::size_t joint_index(std::size_t vol, std::size_t qi, std::size_t nq) {
     return vol * nq + qi;
 }
@@ -96,6 +111,38 @@ double rfq_markout_inventory_pnl(const PricingProblem& problem, const Tier& tier
     const double effective_q = interpolate_joint(*exposure, problem.grid().states(), vol,
                                                  inventory_after_branch);
     return (-direction(side)) * tier.markout().asymptotic() * effective_q;
+}
+
+// Evaluate the fixed-policy Bellman equation in one place.  The same
+// residual is used for stopping Howard iteration and for final diagnostics.
+struct BellmanResidual {
+    std::vector<double> by_state;
+    double maximum = 0.0;
+    double rhs_scale = 1.0;
+    std::size_t worst_index = 0;
+};
+
+BellmanResidual bellman_residual(const std::vector<double>& reward,
+                                 const DenseMatrix& generator,
+                                 const std::vector<double>& value,
+                                 double average_reward) {
+    BellmanResidual result;
+    result.by_state.reserve(value.size());
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        double rhs = reward[i];
+        for (std::size_t j = 0; j < value.size(); ++j) {
+            rhs += generator(i, j) * value[j];
+        }
+        const double signed_error = rhs - average_reward;
+        const double error = std::abs(signed_error);
+        result.by_state.push_back(signed_error);
+        if (error > result.maximum) {
+            result.maximum = error;
+            result.worst_index = i;
+        }
+        result.rhs_scale = std::max(result.rhs_scale, std::abs(rhs));
+    }
+    return result;
 }
 
 double max_abs(const std::vector<double>& x) {
@@ -222,115 +269,174 @@ double policy_slice_change(const Policy& lhs, const Policy& rhs) {
 
 }  // namespace
 
-HowardSolver::AffineOperator HowardSolver::fixed_policy_operator(
-        const JointPolicy& policy, const MarkoutResolvent* markout) const {
-    const auto& grid = problem_.grid();
-    const auto& states = grid.states();
+HowardSolver::AffineOperator HowardSolver::assemble_operator(
+        const JointPolicy& policy, const MarkoutResolvent* markout,
+        bool with_reward, bool with_generator) const {
+    const auto& states = problem_.grid().states();
     const auto& volatility = problem_.volatility();
-    const auto& q_sigma = volatility.generator();
     const std::size_t nq = states.size();
     const std::size_t nv = volatility.state_count();
     if (policy.size() != nv) throw std::invalid_argument("joint policy volatility dimension mismatch");
     const std::size_t n = nq * nv;
-    AffineOperator op{std::vector<double>(n, 0.0), DenseMatrix(n, n)};
+    AffineOperator op{with_reward ? std::vector<double>(n, 0.0) : std::vector<double>{},
+                      with_generator ? DenseMatrix(n, n) : DenseMatrix{},
+                      with_reward, with_generator};
 
     for (std::size_t v = 0; v < nv; ++v) {
         const auto& p_slice = policy[v];
         for (std::size_t i = 0; i < nq; ++i) {
             const std::size_t from = joint_index(v, i, nq);
             const double q = states[i];
-            op.reward[from] = -problem_.penalty().value(q, volatility.sigma(v))
-                            + problem_.spot_drift() * q;
-
-            for (std::size_t k = 0; k < problem_.tiers().size(); ++k) {
-                const auto& tier = problem_.tiers()[k];
-                const auto& p = p_slice.tiers[k];
-                for (Side side : {Side::Bid, Side::Ask}) {
-                    const double dir = direction(side);
-                    const auto& deltas = row(p, side, i);
-                    for (std::size_t j = 0; j < tier.sizes().size(); ++j) {
-                        const double z = tier.sizes()[j];
-                        const double dq = dir * z;
-                        const double rfq_rate = tier.flow().rfq_arrival_rate(z);
-                        const double loss_markout_pnl =
-                            rfq_markout_inventory_pnl(problem_, tier, side, v, q, markout);
-
-                        if (!grid.admissible(q, dq)) {
-                            op.reward[from] += rfq_rate * loss_markout_pnl;
-                            continue;
-                        }
-
-                        const double delta = deltas[j];
-                        const double win_rate = tier.flow().arrival_rate(delta, z);
-                        const double loss_rate = std::max(0.0, rfq_rate - win_rate);
-                        const double q_next = q + dq;
-                        const double win_markout_pnl =
-                            rfq_markout_inventory_pnl(problem_, tier, side, v, q_next, markout);
-                        op.reward[from] += win_rate *
-                            (z * (problem_.spread() * (0.5 - delta) - tier.fee())
-                             + win_markout_pnl)
-                            + loss_rate * loss_markout_pnl;
-                        add_inventory_transition(op.generator, states, v, i, q_next, win_rate);
-                    }
-                }
+            if (with_reward) {
+                op.reward[from] = -problem_.penalty().value(q, volatility.sigma(v))
+                                + problem_.spot_drift() * q;
             }
 
-            if (problem_.dark_pool() && p_slice.dark_pool) {
-                const auto& venue = *problem_.dark_pool();
-                const auto& p = *p_slice.dark_pool;
-                for (Side side : {Side::Bid, Side::Ask}) {
-                    const bool active = side == Side::Bid ? p.bid_active[i] : p.ask_active[i];
-                    const double posted = side == Side::Bid ? p.bid_size[i] : p.ask_size[i];
-                    if (!active || posted <= 0.0 || !venue.risk_reducing(q, side, posted)) continue;
-                    const int u = static_cast<int>(std::llround(posted));
-                    const double dir = direction(side);
-                    for (const auto& [fill, rate] : venue.arrivals(side).fill_rates(u)) {
-                        op.reward[from] -= rate * venue.fee(side) * fill;
-                        add_inventory_transition(op.generator, states, v, i, q + dir * fill, rate);
-                    }
-                }
-            }
-
-            if (problem_.passive_ecn() && p_slice.passive_ecn) {
-                const auto& venue = *problem_.passive_ecn();
-                const auto& p = *p_slice.passive_ecn;
-                const double z = venue.quote_size();
-                for (Side side : {Side::Bid, Side::Ask}) {
-                    const bool active = side == Side::Bid ? p.bid_active[i] : p.ask_active[i];
-                    const double delta = side == Side::Bid ? p.bid_delta[i] : p.ask_delta[i];
-                    if (!active) continue;
-                    const double dir = direction(side);
-                    const auto breaks = fill_breakpoints(states, i, dir, z);
-                    for (const auto& source : venue.flow().sources()) {
-                        const double hit_rate = source.arrival_rate(delta);
-                        if (hit_rate <= 0.0) continue;
-                        for (const auto& [fill, probability] : source.fill_components(z, breaks)) {
-                            const double rate = hit_rate * probability;
-                            if (rate <= 0.0) continue;
-                            op.reward[from] += rate * fill *
-                                (problem_.spread() * (0.5 - delta) - venue.maker_fee());
-                            add_inventory_transition(op.generator, states, v, i, q + dir * fill, rate);
-                        }
-                    }
-                }
-            }
-
-            // Exogenous volatility-state transitions keep inventory unchanged.
-            for (std::size_t u = 0; u < nv; ++u) {
-                if (u == v) continue;
-                const double rate = q_sigma[v][u];
-                if (rate <= 0.0) continue;
-                op.generator(from, joint_index(u, i, nq)) += rate;
-                op.generator(from, from) -= rate;
-            }
+            add_rfq_contributions(op, p_slice, v, i, markout);
+            add_darkpool_contributions(op, p_slice, v, i);
+            add_ecn_contributions(op, p_slice, v, i);
+            add_volatility_transitions(op, v, i);
         }
     }
     return op;
 }
 
-MarkoutResolvent HowardSolver::markout_resolvent(const JointPolicy& policy) const {
-    const auto generator_op = fixed_policy_operator(policy, nullptr);
-    const auto& L = generator_op.generator;
+DenseMatrix HowardSolver::build_generator(const JointPolicy& policy) const {
+    return assemble_operator(policy, nullptr, false, true).generator;
+}
+
+std::vector<double> HowardSolver::build_reward(
+        const JointPolicy& policy, const MarkoutResolvent& markout) const {
+    return assemble_operator(policy, &markout, true, false).reward;
+}
+
+void HowardSolver::add_rfq_contributions(
+        AffineOperator& op, const Policy& p_slice, std::size_t v, std::size_t i, const MarkoutResolvent* markout) const {
+    const auto& grid = problem_.grid();
+    const auto& states = problem_.grid().states();
+    const std::size_t nq = states.size();
+    const std::size_t from = joint_index(v, i, nq);
+    const double q = states[i];
+
+    for (std::size_t k = 0; k < problem_.tiers().size(); ++k) {
+        const auto& tier = problem_.tiers()[k];
+        const auto& p = p_slice.tiers[k];
+        for (Side side : {Side::Bid, Side::Ask}) {
+            const double dir = direction(side);
+            const auto& deltas = row(p, side, i);
+            const double loss_markout_pnl = op.with_reward
+                ? rfq_markout_inventory_pnl(problem_, tier, side, v, q, markout) : 0.0;
+            for (const auto& source : tier.flow().sources()) {
+                for (const auto& atom : source.rfq_atoms()) {
+                    const double z = atom.target_size;
+                    const double rfq_rate = atom.one_side_arrival_rate;
+                    if (rfq_rate <= 0.0) continue;
+                    const double dq = dir * z;
+    
+                    if (!grid.admissible(q, dq)) {
+                        if (op.with_reward) op.reward[from] += rfq_rate * loss_markout_pnl;
+                        continue;
+                    }
+    
+                    const double delta =
+                        interpolate_size_row(tier.sizes(), deltas, z);
+                    const double win_rate =
+                        rfq_rate * source.win_probability(delta, z);
+                    const double loss_rate = std::max(0.0, rfq_rate - win_rate);
+                    const double q_next = q + dq;
+                    if (op.with_reward) {
+                        const double win_markout_pnl = rfq_markout_inventory_pnl(
+                            problem_, tier, side, v, q_next, markout);
+                        op.reward[from] += win_rate *
+                            (z * (problem_.spread() * (0.5 - delta) - tier.fee())
+                             + win_markout_pnl)
+                            + loss_rate * loss_markout_pnl;
+                    }
+                    if (op.with_generator) add_inventory_transition(
+                        op.generator, states, v, i, q_next, win_rate);
+                }
+            }
+        }
+    }
+}
+
+void HowardSolver::add_darkpool_contributions(
+        AffineOperator& op, const Policy& p_slice, std::size_t v, std::size_t i) const {
+    const auto& states = problem_.grid().states();
+    const std::size_t nq = states.size();
+    const std::size_t from = joint_index(v, i, nq);
+    const double q = states[i];
+
+    if (problem_.dark_pool() && p_slice.dark_pool) {
+        const auto& venue = *problem_.dark_pool();
+        const auto& p = *p_slice.dark_pool;
+        for (Side side : {Side::Bid, Side::Ask}) {
+            const bool active = side == Side::Bid ? p.bid_active[i] : p.ask_active[i];
+            const double posted = side == Side::Bid ? p.bid_size[i] : p.ask_size[i];
+            if (!active || posted <= 0.0 || !venue.risk_reducing(q, side, posted)) continue;
+            const int u = static_cast<int>(std::llround(posted));
+            const double dir = direction(side);
+            for (const auto& [fill, rate] : venue.arrivals(side).fill_rates(u)) {
+                if (op.with_reward) op.reward[from] -= rate * venue.fee(side) * fill;
+                if (op.with_generator) add_inventory_transition(op.generator, states, v, i, q + dir * fill, rate);
+            }
+        }
+    }
+}
+
+void HowardSolver::add_ecn_contributions(
+        AffineOperator& op, const Policy& p_slice, std::size_t v, std::size_t i) const {
+    const auto& states = problem_.grid().states();
+    const std::size_t nq = states.size();
+    const std::size_t from = joint_index(v, i, nq);
+    const double q = states[i];
+
+    if (problem_.passive_ecn() && p_slice.passive_ecn) {
+        const auto& venue = *problem_.passive_ecn();
+        const auto& p = *p_slice.passive_ecn;
+        const double z = venue.quote_size();
+        for (Side side : {Side::Bid, Side::Ask}) {
+            const bool active = side == Side::Bid ? p.bid_active[i] : p.ask_active[i];
+            const double delta = side == Side::Bid ? p.bid_delta[i] : p.ask_delta[i];
+            if (!active) continue;
+            const double dir = direction(side);
+            const auto breaks = fill_breakpoints(states, i, dir, z);
+            for (const auto& source : venue.flow().sources()) {
+                const double hit_rate = source.arrival_rate(delta);
+                if (hit_rate <= 0.0) continue;
+                for (const auto& [fill, probability] : source.fill_components(z, breaks)) {
+                    const double rate = hit_rate * probability;
+                    if (rate <= 0.0) continue;
+                    if (op.with_reward) op.reward[from] += rate * fill *
+                        (problem_.spread() * (0.5 - delta) - venue.maker_fee());
+                    if (op.with_generator) add_inventory_transition(op.generator, states, v, i, q + dir * fill, rate);
+                }
+            }
+        }
+    }
+}
+
+void HowardSolver::add_volatility_transitions(
+        AffineOperator& op, std::size_t v, std::size_t i) const {
+    if (!op.with_generator) return;
+    const auto& states = problem_.grid().states();
+    const std::size_t nq = states.size();
+    const std::size_t from = joint_index(v, i, nq);
+    const auto& q_sigma = problem_.volatility().generator();
+    const std::size_t nv = problem_.volatility().state_count();
+
+    // Exogenous volatility-state transitions keep inventory unchanged.
+    for (std::size_t u = 0; u < nv; ++u) {
+        if (u == v) continue;
+        const double rate = q_sigma[v][u];
+        if (rate <= 0.0) continue;
+        op.generator(from, joint_index(u, i, nq)) += rate;
+        op.generator(from, from) -= rate;
+    }
+}
+
+
+MarkoutResolvent HowardSolver::markout_resolvent(const DenseMatrix& L) const {
     const auto& q_states = problem_.grid().states();
     const std::size_t nq = q_states.size();
     const std::size_t nv = problem_.volatility().state_count();
@@ -370,16 +476,15 @@ MarkoutResolvent HowardSolver::markout_resolvent(const JointPolicy& policy) cons
 }
 
 std::pair<std::vector<double>, double> HowardSolver::evaluate_policy(
-        const JointPolicy& policy, const MarkoutResolvent& markout) const {
-    const auto op = fixed_policy_operator(policy, &markout);
-    const std::size_t n = op.reward.size();
+        const DenseMatrix& generator, const std::vector<double>& reward) const {
+    const std::size_t n = reward.size();
     DenseMatrix A(n + 1, n + 1);
     std::vector<double> b(n + 1, 0.0);
 
     for (std::size_t i = 0; i < n; ++i) {
-        for (std::size_t j = 0; j < n; ++j) A(i, j) = op.generator(i, j);
+        for (std::size_t j = 0; j < n; ++j) A(i, j) = generator(i, j);
         A(i, n) = -1.0;
-        b[i] = -op.reward[i];
+        b[i] = -reward[i];
     }
     const std::size_t ref = joint_index(problem_.volatility().initial_state(),
                                         problem_.grid().zero_index(),
@@ -439,19 +544,19 @@ double HowardSolver::policy_scale(const JointPolicy& policy) {
     return out;
 }
 
-Solution HowardSolver::solve() const {
+HowardSolver::IterationResult HowardSolver::solve_policy_iteration() const {
     const auto& grid = problem_.grid();
-    const auto& states = grid.states();
-    const auto& op_indices = grid.operational_indices();
     const auto& volatility = problem_.volatility();
-    const std::size_t nq = states.size();
+    const std::size_t nq = grid.states().size();
     const std::size_t nv = volatility.state_count();
     const double sqrt_eps = std::sqrt(std::numeric_limits<double>::epsilon());
 
     PolicyBuilder initial_builder(problem_);
     const Policy seed = initial_builder.initial_policy();
     JointPolicy policy(nv, seed);
-    MarkoutResolvent markout = markout_resolvent(policy);
+    DenseMatrix generator = build_generator(policy);
+    MarkoutResolvent markout = markout_resolvent(generator);
+    std::vector<double> reward = build_reward(policy, markout);
     std::vector<double> h(nq * nv, 0.0);
     double rho = 0.0;
 
@@ -459,27 +564,22 @@ Solution HowardSolver::solve() const {
     constexpr int kMaximumIterations = 256;
     for (int iteration = 1; iteration <= kMaximumIterations; ++iteration) {
         const auto h_previous = h;
-        std::tie(h, rho) = evaluate_policy(policy, markout);
+        std::tie(h, rho) = evaluate_policy(generator, reward);
 
         JointPolicy improved = improve_policy(h, policy, markout);
         const double p_change = policy_change(improved, policy);
-        MarkoutResolvent improved_markout = markout_resolvent(improved);
+        DenseMatrix improved_generator = build_generator(improved);
+        MarkoutResolvent improved_markout = markout_resolvent(improved_generator);
         const double m_change = markout_change(improved_markout, markout);
+        auto improved_reward = build_reward(improved, improved_markout);
 
-        const auto op = fixed_policy_operator(improved, &improved_markout);
-        double residual = 0.0;
-        double rhs_scale = 1.0;
-        for (std::size_t i = 0; i < h.size(); ++i) {
-            double rhs = op.reward[i];
-            for (std::size_t j = 0; j < h.size(); ++j) rhs += op.generator(i, j) * h[j];
-            residual = std::max(residual, std::abs(rhs - rho));
-            rhs_scale = std::max(rhs_scale, std::abs(rhs));
-        }
+        const auto bellman = bellman_residual(improved_reward, improved_generator, h, rho);
+        const double residual = bellman.maximum;
         double h_change = 0.0;
         for (std::size_t i = 0; i < h.size(); ++i) {
             h_change = std::max(h_change, std::abs(h[i] - h_previous[i]));
         }
-        const double scale = std::max({1.0, std::abs(rho), rhs_scale});
+        const double scale = std::max({1.0, std::abs(rho), bellman.rhs_scale});
         const double residual_tol = sqrt_eps * scale;
         const double policy_tol = sqrt_eps * policy_scale(improved);
         const double markout_tol = sqrt_eps * markout_scale(improved_markout);
@@ -494,6 +594,8 @@ Solution HowardSolver::solve() const {
 
         policy = std::move(improved);
         markout = std::move(improved_markout);
+        generator = std::move(improved_generator);
+        reward = std::move(improved_reward);
 
         if (residual <= residual_tol && p_change <= policy_tol && m_change <= markout_tol) {
             diagnostics.converged = true;
@@ -501,21 +603,38 @@ Solution HowardSolver::solve() const {
         }
     }
 
+    return {std::move(policy), std::move(markout), std::move(diagnostics)};
+}
+
+Solution HowardSolver::build_solution(IterationResult result) const {
+    const auto& grid = problem_.grid();
+    const auto& states = grid.states();
+    const auto& op_indices = grid.operational_indices();
+    const auto& volatility = problem_.volatility();
+    const std::size_t nq = states.size();
+    const std::size_t nv = volatility.state_count();
+    auto& policy = result.policy;
+    auto& diagnostics = result.diagnostics;
+    auto markout = std::move(result.markout);
+    std::vector<double> h;
+    double rho = 0.0;
     // Apply operational constraints independently in every volatility state.
     for (std::size_t v = 0; v < nv; ++v) {
         const auto m_slice = slice_markout(markout, v, nq);
         PolicyBuilder final_builder(problem_, &m_slice);
         policy[v] = final_builder.snap_operational_constraints(policy[v]);
     }
-    markout = markout_resolvent(policy);
-    std::tie(h, rho) = evaluate_policy(policy, markout);
-    const auto final_op = fixed_policy_operator(policy, &markout);
-    double residual = 0.0;
-    for (std::size_t i = 0; i < h.size(); ++i) {
-        double rhs = final_op.reward[i];
-        for (std::size_t j = 0; j < h.size(); ++j) rhs += final_op.generator(i, j) * h[j];
-        residual = std::max(residual, std::abs(rhs - rho));
-    }
+    const auto final_generator = build_generator(policy);
+    markout = markout_resolvent(final_generator);
+    const auto final_reward = build_reward(policy, markout);
+    std::tie(h, rho) = evaluate_policy(final_generator, final_reward);
+    auto final_bellman = bellman_residual(final_reward, final_generator, h, rho);
+    const double residual = final_bellman.maximum;
+    const std::size_t worst_index = final_bellman.worst_index;
+    diagnostics.final_bellman_residual_by_state = std::move(final_bellman.by_state);
+    diagnostics.final_bellman_residual = residual;
+    diagnostics.worst_inventory = states[worst_index % nq];
+    diagnostics.worst_volatility_index = worst_index / nq;
     diagnostics.average_reward = rho;
     diagnostics.reward_lower_bound = rho - residual;
     diagnostics.reward_upper_bound = rho + residual;
@@ -574,6 +693,8 @@ Solution HowardSolver::solve() const {
     solution.solve_dark_pool_policy = solution.solve_dark_pool_policies_by_volatility[v0];
     solution.solve_passive_ecn_policy = solution.solve_passive_ecn_policies_by_volatility[v0];
 
+    solution.markout_resolvent_solve = markout;
+
     // Keep a full operational [vol][q] markout surface and a legacy initial-vol slice.
     for (const auto& curve : markout.curves) {
         MarkoutExposureCurve joint_curve;
@@ -592,6 +713,10 @@ Solution HowardSolver::solve() const {
         solution.markout_exposure.push_back(std::move(initial_curve));
     }
     return solution;
+}
+
+Solution HowardSolver::solve() const {
+    return build_solution(solve_policy_iteration());
 }
 
 }  // namespace ladder_pricer

@@ -304,13 +304,26 @@ def diagnostic_expander(title: str, children, open_: bool = False):
 
 
 
-def _default_cross_flow_source(index: int = 0, target_pair: str | None = None) -> dict[str, Any]:
+def _default_cross_flow_source(
+    index: int = 0, target_pair: str | None = None, template_flow: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    # New crossed sources start from the direct source's calibrated request-size
+    # distribution and win-probability curve. The user can then replace them
+    # with source-pair-specific calibration in the editor.
+    flow = deepcopy(template_flow) if template_flow else {
+        "totalRfqRate": 0.10,
+        "rfqSizes": [1.0],
+        "rfqProbabilities": [1.0],
+        "steepness": 8.42,
+        "shift": 0.52,
+        "volumeShift": 0.026,
+    }
     return {
         "name": "Select FX pair",
         "pair": None,
         "crossPair": None,
         "mapping": {"type": "crossed", "crossMid": None},
-        "flow": {"A0": 0.01, "theta": 0.144, "beta": 0.0857, "steepness": 8.42, "shift": 0.52, "volumeShift": 0.026},
+        "flow": flow,
     }
 
 
@@ -323,23 +336,11 @@ def _direct_flow_source(flow: dict[str, Any], target_pair: str) -> dict[str, Any
     }
 
 
-def _legacy_ecn_size_probabilities(mean_trade_size: float = 1.0) -> list[float]:
-    """Map the former exponential size model onto the five fixed pillars."""
-    mu = float(mean_trade_size)
-    if mu <= 0.0:
-        raise ValueError("ECN legacy mean trade size must be positive")
-    s0175 = math.exp(-0.175 / mu)
-    s0375 = math.exp(-0.375 / mu)
-    s0625 = math.exp(-0.625 / mu)
-    s0875 = math.exp(-0.875 / mu)
-    return [s0875, s0625 - s0875, s0375 - s0625, s0175 - s0375, 1.0 - s0175]
-
-
 def _ecn_size_probabilities(source: dict[str, Any] | None) -> list[float]:
     source = source or {}
     raw = source.get("tradeSizeProbabilities")
     if raw is None:
-        return _legacy_ecn_size_probabilities(float(source.get("meanTradeSize", 1.0)))
+        raise ValueError("ECN flow source requires explicit tradeSizeProbabilities")
     probs = [float(x) for x in raw]
     if len(probs) != 5:
         raise ValueError("ECN trade-size probabilities must contain five entries")
@@ -406,6 +407,156 @@ def _dropdown_field(label: str, component_id: str, value: str | None, options: l
     ], className="field")
 
 
+
+def _empty_diagnostic_figure(message: str, title: str = "") -> go.Figure:
+    fig = go.Figure()
+    fig.add_annotation(text=message, showarrow=False, x=0.5, y=0.5, xref="paper", yref="paper")
+    fig.update_layout(title=title, template="trinity_dark", xaxis=dict(visible=False), yaxis=dict(visible=False))
+    return fig
+
+
+def flow_source_distribution_figure(source: dict[str, Any]) -> go.Figure:
+    """Selected customer source's empirical RFQ-size PMF in source currency."""
+    flow = source.get("flow", {})
+    label = str(source.get("pair") or source.get("name") or "RFQ source")
+    try:
+        _validate_explicit_rfq_flow(flow, label)
+        sizes = np.asarray(flow["rfqSizes"], dtype=float)
+        probs = np.asarray(flow["rfqProbabilities"], dtype=float)
+        total = float(flow["totalRfqRate"])
+    except Exception as exc:
+        return _empty_diagnostic_figure(f"Invalid RFQ distribution · {exc}", f"RFQ size distribution · {label}")
+    fig = go.Figure(go.Bar(
+        x=sizes, y=probs,
+        customdata=total * probs,
+        hovertemplate=(
+            "RFQ size=%{x:g}M<br>Probability=%{y:.2%}"
+            "<br>Pooled arrival contribution=%{customdata:.6f} /min<extra></extra>"
+        ),
+        name="Size probability",
+    ))
+    fig.update_layout(
+        title=f"RFQ size distribution · {label} · total rate {total:.6g}/min (bid + ask)",
+        xaxis_title=f"RFQ size [{label[:3] if len(label) >= 3 else 'source'} M]",
+        yaxis_title="Probability mass",
+        yaxis_tickformat=".0%",
+        template="trinity_dark",
+        bargap=0.18,
+    )
+    return fig
+
+
+def flow_source_hit_ratio_figure(source: dict[str, Any], target_spread_pips: float) -> go.Figure:
+    """Selected source's p_win(delta,z) surface using source-size atoms."""
+    flow = source.get("flow", {})
+    label = str(source.get("pair") or source.get("name") or "RFQ source")
+    try:
+        _validate_explicit_rfq_flow(flow, label)
+        source_sizes = np.asarray(flow["rfqSizes"], dtype=float)
+        scale = _source_size_scale(source)
+        if scale <= 0.0:
+            raise ValueError("source size scale must be positive")
+        target_sizes = source_sizes / scale
+        delta_grid = np.linspace(-1.0, 1.0, 241)
+        surface = np.asarray([
+            _source_hit_ratio(source, delta_grid, float(target_z), float(target_spread_pips))
+            for target_z in target_sizes
+        ], dtype=float)
+    except Exception as exc:
+        return _empty_diagnostic_figure(f"Hit-ratio diagnostic unavailable · {exc}", f"Hit ratios · {label}")
+    fig = go.Figure(go.Heatmap(
+        x=delta_grid,
+        y=source_sizes,
+        z=surface,
+        zmin=0.0,
+        zmax=1.0,
+        colorbar=dict(title="p(win)"),
+        hovertemplate="δ=%{x:.3f}<br>RFQ size=%{y:g}M<br>p(win)=%{z:.1%}<extra></extra>",
+    ))
+    fig.update_layout(
+        title=f"Win probability p(win | δ, z) · {label}",
+        xaxis_title="Target-pair price-improvement delta δ",
+        yaxis_title="RFQ size [source CCY M]",
+        template="trinity_dark",
+    )
+    return fig
+
+
+def flow_source_markout_figure(markout_enabled: bool, asymptotic: float, tau_minutes: float, source_label: str) -> go.Figure:
+    """Tier-level RFQ markout shown in the context of the selected source."""
+    t = np.linspace(0.0, 15.0, 301)
+    if not markout_enabled:
+        values = np.zeros_like(t)
+    else:
+        tau = max(float(tau_minutes), 1e-15)
+        values = float(asymptotic) * (1.0 - np.exp(-t / tau))
+    fig = go.Figure(go.Scatter(x=t, y=values, mode="lines", name="Tier markout"))
+    fig.update_layout(
+        title=f"RFQ markout · {source_label}",
+        xaxis_title="Time after RFQ [min]",
+        yaxis_title="Adverse markout [EUR / EURm traded]",
+        template="trinity_dark",
+    )
+    return fig
+
+
+def ecn_flow_source_distribution_figure(source: dict[str, Any]) -> go.Figure:
+    label = str(source.get("pair") or source.get("name") or "ECN source")
+    try:
+        probs = np.asarray(_ecn_size_probabilities(source), dtype=float)
+    except Exception as exc:
+        return _empty_diagnostic_figure(f"Invalid ECN size distribution · {exc}", f"ECN trade-size distribution · {label}")
+    sizes = np.asarray([1.0, 0.75, 0.50, 0.25, 0.10], dtype=float)
+    order = np.argsort(sizes)
+    fig = go.Figure(go.Bar(
+        x=sizes[order], y=probs[order],
+        hovertemplate="Parent trade size=%{x:g}M<br>Probability=%{y:.2%}<extra></extra>",
+        name="Trade-size probability",
+    ))
+    fig.update_layout(
+        title=f"ECN parent trade-size distribution · {label}",
+        xaxis_title="Parent trade size [source CCY M]",
+        yaxis_title="Probability mass",
+        yaxis_tickformat=".0%",
+        template="trinity_dark",
+        bargap=0.18,
+    )
+    return fig
+
+
+def ecn_flow_source_intensity_figure(source: dict[str, Any], min_delta: float, max_delta: float) -> go.Figure:
+    label = str(source.get("pair") or source.get("name") or "ECN source")
+    try:
+        flow = source.get("flow", {})
+        A = float(flow.get("A", 0.0))
+        k = float(flow.get("k", 0.0))
+        if A < 0.0 or k <= 0.0:
+            raise ValueError("A must be nonnegative and k positive")
+        mapping = source.get("mapping", {}) or {}
+        source_model = {
+            "A": A,
+            "k": k,
+            "alpha": 1.0 if str(mapping.get("type", "identity")) != "affine" else float(mapping.get("deltaScale", 1.0)),
+        }
+        lo, hi = float(min_delta), float(max_delta)
+        grid = np.linspace(lo, hi, 241)
+        absolute = np.asarray(_ecn_source_arrival_rate(source_model, grid), dtype=float)
+        relative = absolute / A if A > 0.0 else np.zeros_like(absolute)
+    except Exception as exc:
+        return _empty_diagnostic_figure(f"ECN fill-curve diagnostic unavailable · {exc}", f"ECN fill curve · {label}")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=grid, y=absolute, mode="lines", name="Fill intensity λ(d)"))
+    fig.add_trace(go.Scatter(x=grid, y=relative, mode="lines", name="Relative λ(d)/A", yaxis="y2"))
+    fig.update_layout(
+        title=f"ECN fill curve · {label} · A(mid)={A:.6g}/min/side, k={k:.4g}",
+        xaxis_title="Target-pair price-improvement delta d (0 = touch, 0.5 = mid)",
+        yaxis=dict(title="Fill intensity [trades/min/side]"),
+        yaxis2=dict(title="Relative intensity", overlaying="y", side="right", rangemode="tozero"),
+        template="trinity_dark",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
+    )
+    return fig
+
 def flow_source_settings_editor(source_key: str, source: dict[str, Any], target_pair: str):
     flow = source.get("flow", {})
     mapping = source.get("mapping", {})
@@ -449,13 +600,17 @@ def flow_source_settings_editor(source_key: str, source: dict[str, Any], target_
         header,
         *source_fields,
         html.Div(
-            "The exogenous RFQ-arrival curve λ(z)=A0·z^(-θ-βz) defines both the size-specific arrival intensities and the RFQ-size distribution. Monte Carlo samples from the full RFQ-size grid between the smallest and largest pricing knots; prices between knots are linearly interpolated.",
+            "RFQ arrivals are calibrated independently of pricing knots. Total RFQ rate is the pooled bid+ask request rate for this source. RFQ sizes and probabilities are in the source pair's base currency; probabilities must sum to 1. Quotes at RFQ sizes between pricing knots are linearly interpolated.",
             className="muted-note modal-note",
         ),
+        html.Div("Exogenous RFQ distribution", className="subhead"),
         html.Div([
-            number_input("A0 · exogenous intensity scale", "flow-edit-A0", float(flow.get("A0", 0.01)), "any"),
-            number_input("Size θ", "flow-edit-theta", float(flow.get("theta", 0.144)), "any"),
-            number_input("Size β", "flow-edit-beta", float(flow.get("beta", 0.0857)), "any"),
+            number_input("Total RFQ rate · bid + ask [RFQ/min]", "flow-edit-rfq-rate", float(flow.get("totalRfqRate", 0.0)), "any"),
+            text_input("RFQ sizes [source CCY M]", "flow-edit-rfq-sizes", ", ".join(str(x) for x in flow.get("rfqSizes", [1.0]))),
+            text_input("RFQ probabilities", "flow-edit-rfq-probs", ", ".join(str(x) for x in flow.get("rfqProbabilities", [1.0]))),
+        ], className="grid-2 flow-calibration-grid"),
+        html.Div("Win probability calibration", className="subhead"),
+        html.Div([
             number_input("Steepness", "flow-edit-steep", float(flow.get("steepness", 8.42)), "any"),
             number_input("Shift", "flow-edit-shift", float(flow.get("shift", 0.52)), "any"),
             number_input("Volume shift", "flow-edit-vshift", float(flow.get("volumeShift", 0.026)), "any"),
@@ -543,16 +698,15 @@ def tier_panel(index: int, tier: dict[str, Any], open_: bool = False):
         checkbox("Enabled", f"{p}-enabled", tier["enabled"]),
         text_input("Name", f"{p}-name", tier["name"]),
         text_input("Pricing sizes [EUR M]", f"{p}-sizes", ", ".join(str(x) for x in tier["sizes"])),
-        number_input("RFQ size step [EUR M]", f"{p}-rfq-size-step", float(tier.get("rfqSizeStep", 1.0)), "any"),
         html.Div([
             html.Button("Configure flow sources", id={"type": "open-flow-sources", "tier": index}, className="secondary-button compact-button", n_clicks=0),
         ], className="flow-source-config-line"),
-        # Keep the original direct-flow inputs mounted for backward-compatible config
-        # construction.  Their values are synchronized from the modal editor.
+        # Keep the direct source calibration mounted so the modal can edit it
+        # without coupling RFQ distributions to pricing knots.
         html.Div([
-            number_input("A0", f"{p}-A0", tier["flow"].get("A0", 0.0), "any"),
-            number_input("Theta", f"{p}-theta", tier["flow"]["theta"], "any"),
-            number_input("Beta", f"{p}-beta", tier["flow"]["beta"], "any"),
+            number_input("Total RFQ rate", f"{p}-rfq-rate", tier["flow"]["totalRfqRate"], "any"),
+            text_input("RFQ sizes", f"{p}-rfq-sizes", ", ".join(str(x) for x in tier["flow"]["rfqSizes"])),
+            text_input("RFQ probabilities", f"{p}-rfq-probs", ", ".join(str(x) for x in tier["flow"]["rfqProbabilities"])),
             number_input("Steepness", f"{p}-steep", tier["flow"]["steepness"], "any"),
             number_input("Shift", f"{p}-shift", tier["flow"]["shift"], "any"),
             number_input("Volume shift", f"{p}-vshift", tier["flow"]["volumeShift"], "any"),
@@ -612,6 +766,27 @@ def _logistic(x: np.ndarray | float) -> np.ndarray | float:
     return float(out) if out.ndim == 0 else out
 
 
+def _validate_explicit_rfq_flow(flow: dict[str, Any], label: str = "RFQ flow") -> None:
+    try:
+        total_rate = float(flow["totalRfqRate"])
+        sizes = [float(x) for x in flow["rfqSizes"]]
+        probabilities = [float(x) for x in flow["rfqProbabilities"]]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} requires total RFQ rate, RFQ sizes and probabilities") from exc
+    if not math.isfinite(total_rate) or total_rate < 0.0:
+        raise ValueError(f"{label} total RFQ rate must be finite and nonnegative")
+    if not sizes or len(sizes) != len(probabilities):
+        raise ValueError(f"{label} RFQ sizes and probabilities must have the same non-zero length")
+    if any((not math.isfinite(z) or z <= 0.0) for z in sizes):
+        raise ValueError(f"{label} RFQ sizes must be finite and positive")
+    if any(b <= a for a, b in zip(sizes, sizes[1:])):
+        raise ValueError(f"{label} RFQ sizes must be strictly increasing")
+    if any((not math.isfinite(p) or p < 0.0) for p in probabilities):
+        raise ValueError(f"{label} RFQ probabilities must be finite and nonnegative")
+    if not math.isclose(sum(probabilities), 1.0, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError(f"{label} RFQ probabilities must sum to 1")
+
+
 def _source_size_scale(source: dict[str, Any]) -> float:
     mapping = source.get("mapping", {}) or {}
     mapping_type = str(mapping.get("type", "identity"))
@@ -629,77 +804,79 @@ def _tier_flow_sources(tier: dict[str, Any]) -> list[dict[str, Any]]:
     return [{"name": tier.get("name", "direct"), "flow": tier["flow"], "mapping": {"type": "identity"}}]
 
 
-def _rfq_size_grid(tier: dict[str, Any]) -> np.ndarray:
-    """Customer RFQ sizes, independent of the pricing-control knots."""
-    pricing = np.asarray(tier["sizes"], dtype=float)
-    if pricing.size == 0 or np.any(pricing <= 0.0):
-        raise ValueError("Pricing sizes must be positive")
-    step = float(tier.get("rfqSizeStep", 1.0))
-    if not np.isfinite(step) or step <= 0.0:
-        raise ValueError("RFQ size step must be positive")
-    lo, hi = float(pricing[0]), float(pricing[-1])
-    regular = np.arange(lo, hi + 0.5 * step, step, dtype=float)
-    regular = regular[regular <= hi + 1e-12]
-    values = np.unique(np.round(np.concatenate([regular, pricing, [hi]]), 12))
-    return values[(values >= lo - 1e-12) & (values <= hi + 1e-12)]
+def _source_rfq_distribution_atoms(
+    tier: dict[str, Any], source: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return target-size atoms and one-sided arrival rates used by HJB/MC.
 
-
-def _source_curve_at_sizes(tier: dict[str, Any], source: dict[str, Any], target_sizes) -> np.ndarray:
-    """Unnormalised RFQ-size density implied by the calibrated arrival curve."""
-    sizes = np.asarray(target_sizes, dtype=float) * _source_size_scale(source)
+    Step-5 dashboard configs are explicit: exogenous request-size distributions
+    no longer depend on pricing knots or an A0/theta/beta curve.
+    """
+    del tier  # pricing knots are intentionally irrelevant to the RFQ distribution
     flow = source["flow"]
-    exponent = -float(flow["theta"]) - float(flow["beta"]) * sizes
-    weights = np.power(sizes, exponent)
-    if np.any(~np.isfinite(weights)) or np.any(weights < 0.0):
-        raise ValueError("RFQ arrival-intensity curve must be finite and nonnegative")
-    return weights
+    _validate_explicit_rfq_flow(flow, str(source.get("name") or "RFQ flow"))
+    source_sizes = np.asarray(flow["rfqSizes"], dtype=float)
+    probabilities = np.asarray(flow["rfqProbabilities"], dtype=float)
+    scale = _source_size_scale(source)
+    return source_sizes / scale, 0.5 * float(flow["totalRfqRate"]) * probabilities
 
 
-def _source_curve_shape(tier: dict[str, Any], source: dict[str, Any]) -> np.ndarray:
-    weights = _source_curve_at_sizes(tier, source, _rfq_size_grid(tier))
-    if float(np.sum(weights)) <= 0.0:
-        raise ValueError("RFQ arrival-intensity curve must have positive mass")
-    return weights
+def _tier_rfq_distribution_sizes(tier: dict[str, Any]) -> np.ndarray:
+    supports = [
+        _source_rfq_distribution_atoms(tier, source)[0]
+        for source in _tier_flow_sources(tier)
+    ]
+    if not supports:
+        return np.asarray([], dtype=float)
+    return np.unique(np.round(np.concatenate(supports), 12))
 
 
-def _source_a0(tier: dict[str, Any], source: dict[str, Any]) -> float:
-    flow = source["flow"]
-    if "A0" in flow:
-        return float(flow["A0"])
-    if "totalRfqRate" in flow:
-        # Compatibility with the short-lived total-rate config format.  Recover
-        # the original one-sided curve scale on the *full* RFQ size support.
-        shape_mass = float(np.sum(_source_curve_shape(tier, source)))
-        return float(flow["totalRfqRate"]) / (2.0 * shape_mass)
-    raise ValueError("RFQ flow requires A0")
+def _distribution_activity(tier: dict[str, Any], z: float) -> float:
+    total = 0.0
+    for source in _tier_flow_sources(tier):
+        sizes, rates = _source_rfq_distribution_atoms(tier, source)
+        matches = np.isclose(sizes, float(z), rtol=0.0, atol=1e-10)
+        total += float(np.sum(rates[matches]))
+    return total
 
 
-def _source_size_distribution(tier: dict[str, Any], source: dict[str, Any]) -> np.ndarray:
-    # There is no independent RFQ-size calibration: the exogenous arrival
-    # intensity curve itself is the density.  Normalize it on the full customer
-    # RFQ grid, not only on the pricing-control knots.
-    weights = _source_curve_shape(tier, source)
-    return weights / float(np.sum(weights))
+def _distribution_hit_ratio(
+    tier: dict[str, Any], delta, z: float, target_spread_pips: float,
+):
+    numerator = np.zeros_like(np.asarray(delta, dtype=float), dtype=float)
+    denominator = 0.0
+    for source in _tier_flow_sources(tier):
+        sizes, rates = _source_rfq_distribution_atoms(tier, source)
+        matches = np.isclose(sizes, float(z), rtol=0.0, atol=1e-10)
+        rate = float(np.sum(rates[matches]))
+        if rate <= 0.0:
+            continue
+        numerator = numerator + rate * np.asarray(
+            _source_hit_ratio(source, delta, z, target_spread_pips), dtype=float
+        )
+        denominator += rate
+    result = numerator / denominator if denominator > 0.0 else np.zeros_like(numerator)
+    return float(result) if result.ndim == 0 else result
 
 
-def _source_rfq_rates_per_side(tier: dict[str, Any], source: dict[str, Any]) -> np.ndarray:
-    return _source_a0(tier, source) * _source_curve_shape(tier, source)
-
-
-def _source_rfq_rate_at(tier: dict[str, Any], source: dict[str, Any], z: float) -> float:
-    shape = float(_source_curve_at_sizes(tier, source, [float(z)])[0])
-    return _source_a0(tier, source) * shape
-
-
-def _source_total_rfq_rate(tier: dict[str, Any], source: dict[str, Any]) -> float:
-    # One pooled source clock across bid and ask customer RFQs.
-    return 2.0 * float(np.sum(_source_rfq_rates_per_side(tier, source)))
+def _policy_delta_series_for_size(tier_sol: dict[str, Any], side: str, z: float) -> np.ndarray:
+    pricing_sizes = np.asarray(tier_sol["sizes"], dtype=float)
+    matrix = np.asarray(tier_sol[side], dtype=float)
+    if pricing_sizes.size == 0 or matrix.ndim != 2:
+        return np.asarray([], dtype=float)
+    if z <= float(pricing_sizes[0]) + 1e-12:
+        return matrix[:, 0]
+    if z >= float(pricing_sizes[-1]) - 1e-12:
+        return matrix[:, -1]
+    right = int(np.searchsorted(pricing_sizes, float(z), side="right"))
+    left = right - 1
+    w = (float(z) - float(pricing_sizes[left])) / float(pricing_sizes[right] - pricing_sizes[left])
+    return (1.0 - w) * matrix[:, left] + w * matrix[:, right]
 
 
 def _activity(tier: dict[str, Any], z: float) -> float:
-    """One-sided exogenous RFQ arrival intensity at target size z."""
-    return sum(_source_rfq_rate_at(tier, source, float(z))
-               for source in _tier_flow_sources(tier))
+    """One-sided exogenous RFQ arrival intensity at a discrete target-size atom."""
+    return _distribution_activity(tier, float(z))
 
 
 def _delta50(tier: dict[str, Any], z: float) -> float:
@@ -735,16 +912,7 @@ def _source_hit_ratio(source: dict[str, Any], target_delta, target_size: float, 
 
 
 def _hit_ratio(tier: dict[str, Any], delta, z: float, target_spread_pips: float):
-    numerator = np.zeros_like(np.asarray(delta, dtype=float), dtype=float)
-    denominator = 0.0
-    for source in _tier_flow_sources(tier):
-        rate = _source_rfq_rate_at(tier, source, float(z))
-        numerator = numerator + rate * np.asarray(
-            _source_hit_ratio(source, delta, z, target_spread_pips), dtype=float
-        )
-        denominator += rate
-    result = numerator / denominator if denominator > 0.0 else np.zeros_like(numerator)
-    return float(result) if result.ndim == 0 else result
+    return _distribution_hit_ratio(tier, delta, float(z), target_spread_pips)
 
 
 def _arrival_rate(tier: dict[str, Any], delta, z: float, target_spread_pips: float):
@@ -792,14 +960,14 @@ def _simple_table(columns: list[str], rows: list[list[Any]]) -> html.Table:
 def flow_curve_figure(tier: dict[str, Any], target_spread_pips: float) -> go.Figure:
     grid = np.linspace(-1.0, 1.0, 160)
     fig = go.Figure()
-    for z in tier["sizes"]:
+    for z in _tier_rfq_distribution_sizes(tier):
         fig.add_trace(go.Scatter(x=grid, y=_arrival_rate(tier, grid, float(z), target_spread_pips), mode="lines", name=f"{float(z):g}M"))
     fig.update_layout(title=f"Won-trade intensity per side · {tier['name']}", xaxis_title="δ", yaxis_title="Won trades [1/min]", template="trinity_dark")
     return fig
 
 
 def exogenous_arrival_figure(tier: dict[str, Any]) -> go.Figure:
-    sizes = _rfq_size_grid(tier)
+    sizes = _tier_rfq_distribution_sizes(tier)
     rates = np.asarray([_activity(tier, float(z)) for z in sizes], dtype=float)
     fig = go.Figure(go.Scatter(x=sizes, y=rates, mode="lines+markers", name="RFQ arrivals"))
     fig.update_layout(
@@ -814,7 +982,7 @@ def exogenous_arrival_figure(tier: dict[str, Any]) -> go.Figure:
 def hit_ratio_figure(tier: dict[str, Any], target_spread_pips: float) -> go.Figure:
     grid = np.linspace(-1.0, 1.0, 160)
     fig = go.Figure()
-    for z in tier["sizes"]:
+    for z in _tier_rfq_distribution_sizes(tier):
         fig.add_trace(go.Scatter(x=grid, y=_hit_ratio(tier, grid, float(z), target_spread_pips), mode="lines", name=f"{float(z):g}M"))
     fig.update_layout(title=f"Win probabilities p_win(δ,z) · {tier['name']}", xaxis_title="δ", yaxis_title="Win probability", yaxis_range=[0,1], template="trinity_dark")
     return fig
@@ -865,8 +1033,8 @@ def mc_rfq_validation_figures(
         float(row.get("size", 0.0)): int(row.get("requests", 0))
         for row in size_rows
     }
-    rfq_sizes = np.asarray(_rfq_size_grid(tier), dtype=float)
-    model_arrivals = np.asarray([_activity(tier, float(z)) for z in rfq_sizes], dtype=float)
+    rfq_sizes = np.asarray(_tier_rfq_distribution_sizes(tier), dtype=float)
+    model_arrivals = np.asarray([_distribution_activity(tier, float(z)) for z in rfq_sizes], dtype=float)
     n_paths = len(mc.get("pnlBase", []))
     exposure = 2.0 * float(n_paths) * SESSION_HORIZON
     mc_arrivals = np.asarray([
@@ -901,7 +1069,7 @@ def mc_rfq_validation_figures(
         row for row in mc.get("rfqDeltaAggregates", [])
         if str(row.get("tier", "")) == tier_name
     ]
-    for j, z in enumerate(pricing_sizes):
+    for j, z in enumerate(rfq_sizes):
         color = SIZE_COLORS[j % len(SIZE_COLORS)]
         rows = sorted(
             [row for row in delta_rows if abs(float(row.get("size", 0.0)) - z) <= 1e-9],
@@ -910,8 +1078,8 @@ def mc_rfq_validation_figures(
 
         # Plot the model only over the quote-delta domain actually reachable by
         # this rung's HJB policy (plus a small visual margin).
-        bid_policy = np.asarray([row[j] for row in tier_sol["bid"]], dtype=float)
-        ask_policy = np.asarray([row[j] for row in tier_sol["ask"]], dtype=float)
+        bid_policy = _policy_delta_series_for_size(tier_sol, "bid", float(z))
+        ask_policy = _policy_delta_series_for_size(tier_sol, "ask", float(z))
         policy_domain = np.concatenate([bid_policy, ask_policy])
         lo = float(np.nanmin(policy_domain)) if policy_domain.size else -1.0
         hi = float(np.nanmax(policy_domain)) if policy_domain.size else 1.0
@@ -921,7 +1089,7 @@ def mc_rfq_validation_figures(
         pad = max(0.02, 0.05 * max(hi - lo, 0.1))
         grid = np.linspace(lo - pad, hi + pad, 180)
         win_fig.add_trace(go.Scatter(
-            x=grid, y=_hit_ratio(tier, grid, z, spread_pips), mode="lines",
+            x=grid, y=_distribution_hit_ratio(tier, grid, float(z), spread_pips), mode="lines",
             name=f"{z:g}M · model", legendgroup=f"mc-win-{j}",
             line=dict(color=color, width=2),
         ))
@@ -959,11 +1127,11 @@ def mc_rfq_validation_figures(
     ]
     q_min = float(np.min(q_grid)) if q_grid.size else 0.0
     q_max = float(np.max(q_grid)) if q_grid.size else 0.0
-    for j, z in enumerate(pricing_sizes):
+    for j, z in enumerate(rfq_sizes):
         dash = SIZE_DASHES[j % len(SIZE_DASHES)]
         for side, color, direction in (("bid", BID_COLOR, 1.0), ("ask", ASK_COLOR, -1.0)):
-            policy = np.asarray([row[j] for row in tier_sol[side]], dtype=float)
-            model_p = np.asarray(_hit_ratio(tier, policy, z, spread_pips), dtype=float)
+            policy = _policy_delta_series_for_size(tier_sol, side, float(z))
+            model_p = np.asarray(_distribution_hit_ratio(tier, policy, float(z), spread_pips), dtype=float)
             admissible = (q_grid + direction * z >= q_min - 1e-10) & (q_grid + direction * z <= q_max + 1e-10)
             model_p = np.where(admissible, model_p, 0.0)
             label_side = side.capitalize()
@@ -1087,9 +1255,12 @@ def ladder_figure(solution: dict[str, Any], cfg: dict[str, Any], tier_index: int
 
 def flow_parameter_table(tier: dict[str, Any]) -> html.Table:
     rows=[]
-    one_side_total = sum(0.5 * _source_total_rfq_rate(tier, source) for source in _tier_flow_sources(tier))
+    one_side_total = sum(
+        float(np.sum(_source_rfq_distribution_atoms(tier, source)[1]))
+        for source in _tier_flow_sources(tier)
+    )
     pricing = np.asarray(tier["sizes"], dtype=float)
-    for z in _rfq_size_grid(tier):
+    for z in _tier_rfq_distribution_sizes(tier):
         rate = _activity(tier, float(z))
         size_share = rate / one_side_total if one_side_total > 0.0 else 0.0
         is_knot = bool(np.any(np.isclose(pricing, float(z), rtol=0.0, atol=1e-12)))
@@ -1260,6 +1431,38 @@ def markout_figure(tier: dict[str, Any]) -> go.Figure:
         uirevision="tier-markout-eur-per-eurm",
     )
     return fig
+
+def final_bellman_residual_figure(solution: dict[str, Any]) -> go.Figure:
+    """Signed final policy-evaluation residual versus inventory, one trace per volatility state.
+
+    The C++ diagnostic is flattened as [volatility state][inventory state].
+    """
+    fig = go.Figure()
+    q = np.asarray(solution.get("qGrid", []), dtype=float) if solution else np.asarray([])
+    residuals = np.asarray(solution.get("finalBellmanResidualByState", []), dtype=float) if solution else np.asarray([])
+    sigmas = np.asarray(solution.get("volatilityStatesPips", []), dtype=float) if solution else np.asarray([])
+    if q.size and residuals.size and residuals.size % q.size == 0:
+        n_states = residuals.size // q.size
+        reshaped = residuals.reshape(n_states, q.size)
+        for i, values in enumerate(reshaped):
+            label = f"σ={sigmas[i]:.2f} pips/√min" if i < sigmas.size else f"Volatility state {i}"
+            fig.add_trace(go.Scatter(x=q, y=values, mode="lines", name=label,
+                                     hovertemplate="q=%{x:.2f}M<br>Residual=%{y:.6g}<extra>" + label + "</extra>"))
+        fig.add_hline(y=0, line_dash="dot", line_color="gray")
+        worst_flat = int(np.argmax(np.abs(residuals)))
+        worst_state, worst_q_idx = divmod(worst_flat, q.size)
+        fig.add_trace(go.Scatter(x=[q[worst_q_idx]], y=[reshaped[worst_state, worst_q_idx]],
+                                 mode="markers", name="Largest absolute residual",
+                                 marker={"symbol": "x", "size": 11, "color": "#e78b37"},
+                                 hovertemplate="Worst: q=%{x:.2f}M<br>Residual=%{y:.6g}<extra></extra>"))
+    else:
+        fig.add_annotation(text="Final state-wise Bellman residual unavailable", showarrow=False)
+    fig.update_layout(title="Final signed Bellman residual by inventory",
+                      xaxis_title="Inventory q [EUR M]",
+                      yaxis_title="R(q, σ) − ρ", template="trinity_dark",
+                      uirevision="final-bellman-residual-by-inventory")
+    return fig
+
 
 def convergence_figure(values, title: str, ytitle: str) -> go.Figure:
     fig=go.Figure()
@@ -1767,7 +1970,8 @@ policy_tab = html.Div([
             diagnostic_expander("Continuation value h(q)", graph("value-chart"), open_=True),
             diagnostic_expander("Value surface by volatility", graph("value-volatility-heatmap")),
             diagnostic_expander("Policy-implied markout exposure (resolvent)", graph("internalization-chart")),
-            diagnostic_expander("Bellman residual", graph("residual-chart")),
+            diagnostic_expander("Bellman residual by inventory", graph("final-residual-inventory-chart")),
+            diagnostic_expander("Bellman residual convergence", graph("residual-chart")),
             diagnostic_expander("Value-function change", graph("value-change-chart")),
             diagnostic_expander("Markout resolvent change", graph("markout-resolvent-change-chart")),
         ], className="subtab-inner diagnostics-stack"), className="dash-tab", selected_className="dash-tab dash-tab-selected"),
@@ -1952,6 +2156,14 @@ app.layout = html.Div([
             html.Div([
                 html.Div(id="flow-source-cards", className="flow-pair-cards"),
                 html.Div(id="flow-source-settings"),
+                html.Div([
+                    diagnostic_expander("RFQ size distribution", graph("flow-source-rfq-distribution-chart", 340), open_=True),
+                    diagnostic_expander("Hit ratios", graph("flow-source-hit-ratio-chart", 380)),
+                    diagnostic_expander("Markouts", [
+                        html.Div("RFQ markout is currently calibrated at Tier level and shared by all flow sources in this Tier.", className="muted-note modal-note"),
+                        graph("flow-source-markout-chart", 340),
+                    ]),
+                ], className="flow-source-modal-diagnostics"),
             ], id="flow-source-editor", className="flow-source-editor"),
             html.Div([
                 html.Button("+ Add FX pair", id="flow-source-add", className="secondary-button", n_clicks=0),
@@ -1975,6 +2187,14 @@ app.layout = html.Div([
             html.Div([
                 html.Div(id="ecn-flow-source-cards", className="flow-pair-cards"),
                 html.Div(id="ecn-flow-source-settings"),
+                html.Div([
+                    diagnostic_expander("ECN trade-size distribution", graph("ecn-flow-source-size-distribution-chart", 340), open_=True),
+                    diagnostic_expander("Fill intensity / relative hit curve", graph("ecn-flow-source-hit-curve-chart", 360)),
+                    diagnostic_expander("Markouts", html.Div(
+                        "Passive ECN does not currently have a separate markout process in the HJB. The model uses execution edge, maker fee and inventory continuation value; no ECN markout curve is being hidden or approximated here.",
+                        className="muted-note modal-note",
+                    )),
+                ], className="flow-source-modal-diagnostics"),
             ], className="flow-source-editor"),
             html.Div([
                 html.Button("+ Add FX pair", id="ecn-flow-source-add", className="secondary-button", n_clicks=0),
@@ -2033,7 +2253,7 @@ CONFIG_FIELDS = [
 for i in range(3):
     p = f"t{i}"
     for suffix in (
-        "enabled", "name", "sizes", "rfq-size-step", "A0", "theta", "beta", "steep", "shift", "vshift",
+        "enabled", "name", "sizes", "rfq-rate", "rfq-sizes", "rfq-probs", "steep", "shift", "vshift",
         "fee", "markout-enabled", "markout-level", "markout-tau", "dmin", "dmax",
     ):
         CONFIG_FIELDS.append((f"{p}-{suffix}", State(f"{p}-{suffix}", "value")))
@@ -2153,7 +2373,7 @@ def render_flow_source_cards(tier_index, target_pair, selected, data):
     Input("flow-target-pair", "value"),
     Input("flow-source-selected-store", "data"),
     State("extra-flow-sources-store", "data"),
-    *[State(f"t{i}-{suffix}", "value") for i in range(3) for suffix in ("A0", "theta", "beta", "steep", "shift", "vshift")],
+    *[State(f"t{i}-{suffix}", "value") for i in range(3) for suffix in ("rfq-rate", "rfq-sizes", "rfq-probs", "steep", "shift", "vshift")],
 )
 def render_flow_source_settings(tier_index, target_pair, selected, data, *direct_values):
     """Render the settings form only when its identity changes.
@@ -2175,8 +2395,16 @@ def render_flow_source_settings(tier_index, target_pair, selected, data, *direct
     selected = selected or "direct"
     offset = ti * 6
     vals = direct_values[offset:offset + 6]
+    try:
+        direct_rfq_sizes = parse_numbers(vals[1])
+        direct_rfq_probabilities = parse_numbers(vals[2])
+    except (TypeError, ValueError):
+        direct_rfq_sizes = [1.0]
+        direct_rfq_probabilities = [1.0]
     direct_flow = {
-        "A0": vals[0], "theta": vals[1], "beta": vals[2],
+        "totalRfqRate": vals[0],
+        "rfqSizes": direct_rfq_sizes,
+        "rfqProbabilities": direct_rfq_probabilities,
         "steepness": vals[3], "shift": vals[4], "volumeShift": vals[5],
     }
 
@@ -2195,7 +2423,7 @@ def render_flow_source_settings(tier_index, target_pair, selected, data, *direct
 
 @app.callback(
     Output("flow-edit-cross-pair", "value"),
-    Input("flow-edit-pair", "value"),
+    Input("flow-edit-pair", "value", allow_optional=True),
     State("flow-target-pair", "value"),
     prevent_initial_call=True,
 )
@@ -2208,7 +2436,7 @@ def derive_flow_source_cross_pair(source_pair, target_pair):
 
 @app.callback(
     Output("flow-edit-cross-mid", "value"),
-    Input("flow-edit-cross-pair", "value"),
+    Input("flow-edit-cross-pair", "value", allow_optional=True),
     prevent_initial_call=True,
 )
 def populate_flow_source_cross_mid(cross_pair):
@@ -2220,20 +2448,20 @@ def populate_flow_source_cross_mid(cross_pair):
 @app.callback(
     Output("extra-flow-sources-store", "data"),
     Output("flow-source-selected-store", "data", allow_duplicate=True),
-    Output("t0-A0", "value"), Output("t0-theta", "value"), Output("t0-beta", "value"), Output("t0-steep", "value"), Output("t0-shift", "value"), Output("t0-vshift", "value"),
-    Output("t1-A0", "value"), Output("t1-theta", "value"), Output("t1-beta", "value"), Output("t1-steep", "value"), Output("t1-shift", "value"), Output("t1-vshift", "value"),
-    Output("t2-A0", "value"), Output("t2-theta", "value"), Output("t2-beta", "value"), Output("t2-steep", "value"), Output("t2-shift", "value"), Output("t2-vshift", "value"),
+    Output("t0-rfq-rate", "value"), Output("t0-rfq-sizes", "value"), Output("t0-rfq-probs", "value"), Output("t0-steep", "value"), Output("t0-shift", "value"), Output("t0-vshift", "value"),
+    Output("t1-rfq-rate", "value"), Output("t1-rfq-sizes", "value"), Output("t1-rfq-probs", "value"), Output("t1-steep", "value"), Output("t1-shift", "value"), Output("t1-vshift", "value"),
+    Output("t2-rfq-rate", "value"), Output("t2-rfq-sizes", "value"), Output("t2-rfq-probs", "value"), Output("t2-steep", "value"), Output("t2-shift", "value"), Output("t2-vshift", "value"),
     Input("flow-source-add", "n_clicks"),
-    Input("flow-source-remove-selected", "n_clicks"),
-    Input("flow-edit-pair", "value"), Input("flow-edit-cross-pair", "value"),
-    Input("flow-edit-cross-mid", "value"),
-    Input("flow-edit-A0", "value"), Input("flow-edit-theta", "value"), Input("flow-edit-beta", "value"),
-    Input("flow-edit-steep", "value"), Input("flow-edit-shift", "value"), Input("flow-edit-vshift", "value"),
+    Input("flow-source-remove-selected", "n_clicks", allow_optional=True),
+    Input("flow-edit-pair", "value", allow_optional=True), Input("flow-edit-cross-pair", "value", allow_optional=True),
+    Input("flow-edit-cross-mid", "value", allow_optional=True),
+    Input("flow-edit-rfq-rate", "value", allow_optional=True), Input("flow-edit-rfq-sizes", "value", allow_optional=True), Input("flow-edit-rfq-probs", "value", allow_optional=True),
+    Input("flow-edit-steep", "value", allow_optional=True), Input("flow-edit-shift", "value", allow_optional=True), Input("flow-edit-vshift", "value", allow_optional=True),
     State("flow-source-tier-store", "data"), State("flow-target-pair", "value"), State("flow-source-selected-store", "data"), State("extra-flow-sources-store", "data"),
-    *[State(f"t{i}-{suffix}", "value") for i in range(3) for suffix in ("A0", "theta", "beta", "steep", "shift", "vshift")],
+    *[State(f"t{i}-{suffix}", "value") for i in range(3) for suffix in ("rfq-rate", "rfq-sizes", "rfq-probs", "steep", "shift", "vshift")],
     prevent_initial_call=True,
 )
-def update_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, A0, theta, beta, steep, shift, vshift,
+def update_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, rfq_rate, rfq_sizes, rfq_probs, steep, shift, vshift,
                               tier_index, target_pair, selected, data, *direct_values):
     if tier_index is None:
         return (no_update,) * 20
@@ -2251,7 +2479,20 @@ def update_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, A0, th
             return (no_update,) * 20
         if not target_pair:
             return out, selected, *direct
-        out.setdefault(key, []).append(_default_cross_flow_source(len(out.get(key, [])), target_pair))
+        offset = ti * 6
+        current = direct[offset:offset + 6]
+        try:
+            template_flow = {
+                "totalRfqRate": float(current[0]),
+                "rfqSizes": parse_numbers(current[1]),
+                "rfqProbabilities": parse_numbers(current[2]),
+                "steepness": float(current[3]),
+                "shift": float(current[4]),
+                "volumeShift": float(current[5]),
+            }
+        except (TypeError, ValueError):
+            template_flow = None
+        out.setdefault(key, []).append(_default_cross_flow_source(len(out.get(key, [])), target_pair, template_flow))
         new_selected = f"extra-{len(out[key]) - 1}"
         return out, new_selected, *direct
 
@@ -2268,14 +2509,14 @@ def update_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, A0, th
         return out, "direct", *direct
 
     if selected == "direct":
-        if all(x is not None for x in (A0, theta, beta, steep, shift, vshift)):
+        if all(x is not None for x in (rfq_rate, rfq_sizes, rfq_probs, steep, shift, vshift)):
             offset = ti * 6
-            direct[offset:offset + 6] = [float(A0), float(theta), float(beta), float(steep), float(shift), float(vshift)]
+            direct[offset:offset + 6] = [float(rfq_rate), str(rfq_sizes), str(rfq_probs), float(steep), float(shift), float(vshift)]
         return out, no_update, *direct
 
     if selected.startswith("extra-"):
         idx = int(selected.split("-", 1)[1])
-        if 0 <= idx < len(out.get(key, [])) and all(x is not None for x in (A0, theta, beta, steep, shift, vshift)):
+        if 0 <= idx < len(out.get(key, [])) and all(x is not None for x in (rfq_rate, rfq_sizes, rfq_probs, steep, shift, vshift)):
             src = out[key][idx]
             chosen_pair = str(pair) if pair else None
             derived_cross = _derive_cross_pair(target_pair, chosen_pair)
@@ -2293,12 +2534,107 @@ def update_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, A0, th
                 raise ValueError(f"No default mid available for cross {chosen_cross}")
             if chosen_mid is not None and chosen_mid <= 0.0:
                 raise ValueError("Cross mid must be positive")
+            parsed_sizes = parse_numbers(rfq_sizes)
+            parsed_probabilities = parse_numbers(rfq_probs)
             src.update({"name": chosen_pair or "Select FX pair", "pair": chosen_pair, "crossPair": chosen_cross})
             src["mapping"] = {"type": "crossed", "crossMid": chosen_mid}
-            src["flow"] = {"A0": float(A0), "theta": float(theta), "beta": float(beta), "steepness": float(steep), "shift": float(shift), "volumeShift": float(vshift)}
+            src["flow"] = {
+                "totalRfqRate": float(rfq_rate),
+                "rfqSizes": parsed_sizes,
+                "rfqProbabilities": parsed_probabilities,
+                "steepness": float(steep), "shift": float(shift), "volumeShift": float(vshift),
+            }
         return out, no_update, *direct
 
     return out, no_update, *direct
+
+
+
+@app.callback(
+    Output("flow-source-rfq-distribution-chart", "figure"),
+    Output("flow-source-hit-ratio-chart", "figure"),
+    Output("flow-source-markout-chart", "figure"),
+    Input("flow-source-selected-store", "data"),
+    Input("flow-edit-pair", "value", allow_optional=True), Input("flow-edit-cross-mid", "value", allow_optional=True),
+    Input("flow-edit-rfq-rate", "value", allow_optional=True), Input("flow-edit-rfq-sizes", "value", allow_optional=True), Input("flow-edit-rfq-probs", "value", allow_optional=True),
+    Input("flow-edit-steep", "value", allow_optional=True), Input("flow-edit-shift", "value", allow_optional=True), Input("flow-edit-vshift", "value", allow_optional=True),
+    Input("spread", "value"), Input("flow-source-tier-store", "data"),
+    Input("t0-markout-enabled", "value"), Input("t0-markout-level", "value"), Input("t0-markout-tau", "value"),
+    Input("t1-markout-enabled", "value"), Input("t1-markout-level", "value"), Input("t1-markout-tau", "value"),
+    Input("t2-markout-enabled", "value"), Input("t2-markout-level", "value"), Input("t2-markout-tau", "value"),
+    prevent_initial_call=True,
+)
+def render_selected_flow_source_diagnostics(selected, pair, cross_mid, rfq_rate, rfq_sizes, rfq_probs,
+                                            steep, shift, vshift, spread_pips, tier_index,
+                                            t0_enabled, t0_level, t0_tau,
+                                            t1_enabled, t1_level, t1_tau,
+                                            t2_enabled, t2_level, t2_tau):
+    label = str(pair or "RFQ source")
+    try:
+        source = {
+            "name": label,
+            "pair": label,
+            "mapping": {"type": "identity"} if str(selected or "direct") == "direct" else {
+                "type": "crossed", "crossMid": float(cross_mid) if cross_mid is not None else 1.0,
+            },
+            "flow": {
+                "totalRfqRate": float(rfq_rate),
+                "rfqSizes": parse_numbers(rfq_sizes),
+                "rfqProbabilities": parse_numbers(rfq_probs),
+                "steepness": float(steep), "shift": float(shift), "volumeShift": float(vshift),
+            },
+        }
+        dist_fig = flow_source_distribution_figure(source)
+        hit_fig = flow_source_hit_ratio_figure(source, float(spread_pips or 0.0))
+    except Exception as exc:
+        dist_fig = _empty_diagnostic_figure(f"RFQ distribution unavailable · {exc}", f"RFQ size distribution · {label}")
+        hit_fig = _empty_diagnostic_figure(f"Hit ratios unavailable · {exc}", f"Hit ratios · {label}")
+
+    markouts = [
+        ("on" in (t0_enabled or []), t0_level, t0_tau),
+        ("on" in (t1_enabled or []), t1_level, t1_tau),
+        ("on" in (t2_enabled or []), t2_level, t2_tau),
+    ]
+    try:
+        idx = int(tier_index or 0)
+        enabled, level, tau = markouts[idx]
+        markout_fig = flow_source_markout_figure(bool(enabled), float(level), float(tau), label)
+    except Exception as exc:
+        markout_fig = _empty_diagnostic_figure(f"Markout diagnostic unavailable · {exc}", f"RFQ markout · {label}")
+    return dist_fig, hit_fig, markout_fig
+
+
+@app.callback(
+    Output("ecn-flow-source-size-distribution-chart", "figure"),
+    Output("ecn-flow-source-hit-curve-chart", "figure"),
+    Input("ecn-flow-source-selected-store", "data"),
+    Input("ecn-flow-edit-pair", "value", allow_optional=True), Input("ecn-flow-edit-cross-mid", "value", allow_optional=True),
+    Input("ecn-flow-edit-A", "value", allow_optional=True), Input("ecn-flow-edit-k", "value", allow_optional=True),
+    Input("ecn-flow-edit-p1m", "value", allow_optional=True), Input("ecn-flow-edit-p750k", "value", allow_optional=True),
+    Input("ecn-flow-edit-p500k", "value", allow_optional=True), Input("ecn-flow-edit-p250k", "value", allow_optional=True),
+    Input("ecn-dmin", "value"), Input("ecn-dmax", "value"),
+    prevent_initial_call=True,
+)
+def render_selected_ecn_flow_source_diagnostics(selected, pair, cross_mid, A, k,
+                                                 p1m, p750k, p500k, p250k, min_delta, max_delta):
+    label = str(pair or "ECN source")
+    try:
+        probs = _ecn_size_probabilities_from_four(p1m, p750k, p500k, p250k)
+        source = {
+            "name": label,
+            "pair": label,
+            "mapping": {"type": "identity"} if str(selected or "direct") == "direct" else {
+                "type": "crossed", "crossMid": float(cross_mid) if cross_mid is not None else 1.0,
+            },
+            "flow": {"A": float(A), "k": float(k)},
+            "tradeSizeProbabilities": probs,
+        }
+        dist_fig = ecn_flow_source_distribution_figure(source)
+        hit_fig = ecn_flow_source_intensity_figure(source, float(min_delta), float(max_delta))
+    except Exception as exc:
+        dist_fig = _empty_diagnostic_figure(f"ECN size distribution unavailable · {exc}", f"ECN size distribution · {label}")
+        hit_fig = _empty_diagnostic_figure(f"ECN fill curve unavailable · {exc}", f"ECN fill curve · {label}")
+    return dist_fig, hit_fig
 
 
 @app.callback(
@@ -2405,7 +2741,7 @@ def render_ecn_flow_source_settings(target_pair, selected, data, direct_A, direc
     Output("ecn-flow-edit-p750k", "value"),
     Output("ecn-flow-edit-p500k", "value"),
     Output("ecn-flow-edit-p250k", "value"),
-    Input("ecn-flow-edit-pair", "value"),
+    Input("ecn-flow-edit-pair", "value", allow_optional=True),
     State("ecn-flow-source-selected-store", "data"),
     prevent_initial_call=True,
 )
@@ -2425,7 +2761,7 @@ def populate_ecn_trade_size_defaults(source_pair, selected):
 
 @app.callback(
     Output("ecn-flow-edit-cross-pair", "value"),
-    Input("ecn-flow-edit-pair", "value"),
+    Input("ecn-flow-edit-pair", "value", allow_optional=True),
     State("flow-target-pair", "value"),
     prevent_initial_call=True,
 )
@@ -2437,7 +2773,7 @@ def derive_ecn_flow_source_cross_pair(source_pair, target_pair):
 
 @app.callback(
     Output("ecn-flow-edit-cross-mid", "value"),
-    Input("ecn-flow-edit-cross-pair", "value"),
+    Input("ecn-flow-edit-cross-pair", "value", allow_optional=True),
     prevent_initial_call=True,
 )
 def populate_ecn_flow_source_cross_mid(cross_pair):
@@ -2447,8 +2783,8 @@ def populate_ecn_flow_source_cross_mid(cross_pair):
 
 @app.callback(
     Output("ecn-flow-edit-p100k-note", "children"),
-    Input("ecn-flow-edit-p1m", "value"), Input("ecn-flow-edit-p750k", "value"),
-    Input("ecn-flow-edit-p500k", "value"), Input("ecn-flow-edit-p250k", "value"),
+    Input("ecn-flow-edit-p1m", "value", allow_optional=True), Input("ecn-flow-edit-p750k", "value", allow_optional=True),
+    Input("ecn-flow-edit-p500k", "value", allow_optional=True), Input("ecn-flow-edit-p250k", "value", allow_optional=True),
 )
 def render_ecn_100k_residual(p1m, p750k, p500k, p250k):
     try:
@@ -2463,12 +2799,12 @@ def render_ecn_100k_residual(p1m, p750k, p500k, p250k):
     Output("ecn-flow-source-selected-store", "data", allow_duplicate=True),
     Output("ecn-A", "value"), Output("ecn-k", "value"), Output("ecn-direct-size-probs-store", "data"),
     Input("ecn-flow-source-add", "n_clicks"),
-    Input("ecn-flow-source-remove-selected", "n_clicks"),
-    Input("ecn-flow-edit-pair", "value"), Input("ecn-flow-edit-cross-pair", "value"),
-    Input("ecn-flow-edit-cross-mid", "value"),
-    Input("ecn-flow-edit-A", "value"), Input("ecn-flow-edit-k", "value"),
-    Input("ecn-flow-edit-p1m", "value"), Input("ecn-flow-edit-p750k", "value"),
-    Input("ecn-flow-edit-p500k", "value"), Input("ecn-flow-edit-p250k", "value"),
+    Input("ecn-flow-source-remove-selected", "n_clicks", allow_optional=True),
+    Input("ecn-flow-edit-pair", "value", allow_optional=True), Input("ecn-flow-edit-cross-pair", "value", allow_optional=True),
+    Input("ecn-flow-edit-cross-mid", "value", allow_optional=True),
+    Input("ecn-flow-edit-A", "value", allow_optional=True), Input("ecn-flow-edit-k", "value", allow_optional=True),
+    Input("ecn-flow-edit-p1m", "value", allow_optional=True), Input("ecn-flow-edit-p750k", "value", allow_optional=True),
+    Input("ecn-flow-edit-p500k", "value", allow_optional=True), Input("ecn-flow-edit-p250k", "value", allow_optional=True),
     State("flow-target-pair", "value"), State("ecn-flow-source-selected-store", "data"),
     State("ecn-extra-flow-sources-store", "data"), State("ecn-A", "value"), State("ecn-k", "value"),
     State("ecn-direct-size-probs-store", "data"),
@@ -2562,6 +2898,7 @@ def solve_model(_clicks, *values):
                     source_pair = source.get("pair")
                     if not source_pair:
                         raise ValueError("Select an FX pair for every flow source")
+                    _validate_explicit_rfq_flow(source.get("flow", {}), f"Flow source {source_pair}")
                     source_legs = _pair_legs(source_pair)
                     if not source_legs or not target_legs or source_legs[1] != target_legs[1]:
                         raise ValueError(f"Flow source {source_pair} must share the quote currency of target pair {target_pair}")
@@ -2609,13 +2946,13 @@ def solve_model(_clicks, *values):
 
 @app.callback(
     Output("m-converged", "children"), Output("m-iterations", "children"), Output("m-rho", "children"), Output("m-residual", "children"),
-    Output("value-chart", "figure"), Output("value-volatility-heatmap", "figure"), Output("residual-chart", "figure"), Output("value-change-chart", "figure"), Output("markout-resolvent-change-chart", "figure"), Output("internalization-chart", "figure"),
+    Output("value-chart", "figure"), Output("value-volatility-heatmap", "figure"), Output("final-residual-inventory-chart", "figure"), Output("residual-chart", "figure"), Output("value-change-chart", "figure"), Output("markout-resolvent-change-chart", "figure"), Output("internalization-chart", "figure"),
     Output("tier-select", "options"), Output("tier-select", "value"), Output("ladder-q", "options"), Output("ladder-q", "value"),
     Input("solution-store", "data"), Input("config-store", "data"),
 )
 def render_solution(solution, cfg):
     if not solution or not cfg:
-        return "—", "—", "—", "—", go.Figure(), go.Figure(), go.Figure(), go.Figure(), go.Figure(), go.Figure(), [], None, [], None
+        return "—", "—", "—", "—", go.Figure(), go.Figure(), go.Figure(), go.Figure(), go.Figure(), go.Figure(), go.Figure(), [], None, [], None
     fig = go.Figure()
     vol_states = solution.get("volatilityStatesPips", [])
     value_surface = solution.get("valueByVolatility", [])
@@ -2630,6 +2967,7 @@ def render_solution(solution, cfg):
         fig.add_trace(go.Scatter(x=solution["qGrid"], y=solution["value"], mode="lines+markers", name="h(q)"))
         fig.update_layout(title="Continuation value h(q)", xaxis_title="Inventory q [EUR M]", yaxis_title="h(q)", template="trinity_dark")
     value_heatmap = value_volatility_heatmap(solution)
+    residual_inventory_fig = final_bellman_residual_figure(solution)
     residual_fig = convergence_figure(solution.get("bellmanResidual", []), "Bellman residual", "max |R(q, σ) - ρ|")
     value_change_fig = convergence_figure(solution.get("valueChange", []), "Value-function change", "max |Δh|")
     markout_change_fig = convergence_figure(solution.get("markoutResolventChange", []), "Markout resolvent change", "max |Δr_tau(q)|")
@@ -2639,7 +2977,11 @@ def render_solution(solution, cfg):
     q0 = min((float(q) for q in solution["qGrid"]), key=abs) if qopts else None
     return (
         "Yes" if solution["converged"] else "No", str(solution["iterations"]),
-        f"{solution['averageReward']:.6g}", f"{solution['residual']:.3g}", fig, value_heatmap, residual_fig, value_change_fig, markout_change_fig, internal_fig,
+        f"{solution['averageReward']:.6g}",
+        (f"{solution['finalBellmanResidual']:.3g} (worst q={solution['worstResidualInventory']:g}M, "
+         f"σ-state={solution['worstResidualVolatilityIndex']})"
+         if "finalBellmanResidual" in solution else f"{solution['residual']:.3g}"),
+        fig, value_heatmap, residual_inventory_fig, residual_fig, value_change_fig, markout_change_fig, internal_fig,
         opts, (0 if opts else None), qopts, q0,
     )
 
@@ -2746,36 +3088,6 @@ def expected_internalization_times(solution: dict[str, Any] | None, cfg: dict[st
 
     enabled_tiers = {t["name"]: t for t in cfg.get("tiers", []) if t.get("enabled", False)}
 
-    def source_won_rate(tier_cfg: dict[str, Any], source: dict[str, Any],
-                        delta: float, size: float, size_index: int) -> float:
-        flow = source["flow"]
-        mapping = source.get("mapping", {}) or {}
-        mapping_type = str(mapping.get("type", "identity"))
-        size_scale = _source_size_scale(source)
-        delta_scale = 1.0
-        if mapping_type == "crossed":
-            cross_mid = float(mapping.get("crossMid", 0.0))
-            if cross_mid <= 0.0:
-                raise ValueError("Crossed RFQ source requires positive cross mid")
-            delta_scale = 1.0
-        elif mapping_type == "affine":
-            delta_scale = float(mapping.get("deltaScale", 1.0))
-        elif mapping_type != "identity":
-            raise ValueError(f"Unsupported RFQ flow-source mapping {mapping_type}")
-
-        source_delta = 0.5 + delta_scale * (delta - 0.5)
-        source_size = size * size_scale
-        center = float(flow["shift"]) - float(flow["volumeShift"]) * (source_size - 1.0)
-        y = float(flow["steepness"]) * (source_delta - center)
-        if y >= 0.0:
-            e = math.exp(-y) if y < 745.0 else 0.0
-            hit = 1.0 / (1.0 + e)
-        else:
-            e = math.exp(y) if y > -745.0 else 0.0
-            hit = e / (1.0 + e)
-
-        exogenous_rate = float(_source_rfq_rates_per_side(tier_cfg, source)[size_index])
-        return exogenous_rate * hit
 
     def add_transition(i: int, q2: float, rate: float) -> None:
         if rate <= 0.0:
@@ -2804,23 +3116,31 @@ def expected_internalization_times(solution: dict[str, Any] | None, cfg: dict[st
         return _ecn_source_fill_distribution(source, posted)
 
 
-    # Customer tiers.
+    # Customer tiers: exogenous events come from the explicit RFQ request-size
+    # distributions. Pricing knots only determine d(z) through interpolation.
+    spread_pips = float(cfg.get("spreadPips", 0.0))
     for tier_policy in solution.get("tiers", []):
         tier_cfg = enabled_tiers.get(tier_policy.get("name"))
         if not tier_cfg:
             continue
-        sizes = [float(z) for z in tier_policy.get("sizes", [])]
         sources = _tier_flow_sources(tier_cfg)
-        for i, q in enumerate(q_grid):
-            for side, direction in (("bid", 1.0), ("ask", -1.0)):
-                row = tier_policy[side][i]
-                for j, z in enumerate(sizes):
-                    q2 = float(q) + direction * z
-                    if q2 < q_grid[0] - 1e-8 or q2 > q_grid[-1] + 1e-8:
-                        continue
-                    delta = float(row[j])
-                    rate = sum(source_won_rate(tier_cfg, source, delta, z, j) for source in sources)
-                    add_transition(i, q2, rate)
+        for side, direction in (("bid", 1.0), ("ask", -1.0)):
+            for source in sources:
+                rfq_sizes, one_side_rates = _source_rfq_distribution_atoms(tier_cfg, source)
+                delta_by_size = {
+                    float(z): _policy_delta_series_for_size(tier_policy, side, float(z))
+                    for z in rfq_sizes
+                }
+                for z, exogenous_rate in zip(rfq_sizes, one_side_rates):
+                    z = float(z)
+                    deltas = delta_by_size[z]
+                    for i, q in enumerate(q_grid):
+                        q2 = float(q) + direction * z
+                        if q2 < q_grid[0] - 1e-8 or q2 > q_grid[-1] + 1e-8:
+                            continue
+                        delta = float(deltas[i])
+                        hit = float(_source_hit_ratio(source, delta, z, spread_pips))
+                        add_transition(i, q2, float(exogenous_rate) * hit)
 
     # Dark-pool fills.
     dark_policy = solution.get("darkPool")

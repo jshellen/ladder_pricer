@@ -107,70 +107,58 @@ std::vector<double> build_grid(const py::dict& spec) {
 
 
 
-std::vector<double> rfq_size_support(const std::vector<double>& pricing_sizes, double step) {
-    if (pricing_sizes.empty()) throw std::invalid_argument("tier sizes must not be empty");
-    if (!(step > 0.0) || !std::isfinite(step)) {
-        throw std::invalid_argument("RFQ size step must be positive");
+// RFQ event-size support is configured explicitly, independently of pricing knots.
+FXMapping build_fx_mapping(const py::dict& source) {
+    const py::str key("mapping");
+    if (!source.contains(key)) return FXMapping{};
+    const py::dict mapping = py::cast<py::dict>(source[key]);
+    const std::string type = mapping.contains(py::str("type"))
+        ? text(mapping, "type") : std::string("identity");
+    if (type == "identity") return FXMapping{};
+    if (type == "crossed") {
+        const double cross_mid = number(mapping, "crossMid");
+        if (!(cross_mid > 0.0) || !std::isfinite(cross_mid)) {
+            throw std::invalid_argument("crossed flow mapping requires finite positive crossMid");
+        }
+        // Crossing preserves normalized price improvement; it changes size units.
+        return FXMapping(1.0, cross_mid);
     }
-    const double lo = pricing_sizes.front();
-    const double hi = pricing_sizes.back();
-    std::vector<double> out;
-    for (std::size_t n = 0;; ++n) {
-        const double z = lo + static_cast<double>(n) * step;
-        if (z > hi + 1e-10) break;
-        out.push_back(std::min(z, hi));
+    if (type == "affine") {
+        return FXMapping(number(mapping, "deltaScale"),
+                         optional_number(mapping, "sourceSizePerTarget", 1.0));
     }
-    if (out.empty() || std::abs(out.back() - hi) > 1e-10) out.push_back(hi);
-    out.insert(out.end(), pricing_sizes.begin(), pricing_sizes.end());
-    std::sort(out.begin(), out.end());
-    out.erase(std::unique(out.begin(), out.end(), [](double a, double b) {
-        return std::abs(a - b) <= 1e-10;
-    }), out.end());
-    return out;
+    throw std::invalid_argument("flow source mapping type must be identity, crossed, or affine");
 }
 
-double a0_from_total_rfq_rate(const py::dict& flow,
-                                  const std::vector<double>& target_sizes,
-                                  double source_size_per_target) {
-    // Compatibility with the short-lived totalRfqRate config format.  The
-    // calibrated model uses lambda_side(z)=A0*z^(-theta-beta*z); therefore a
-    // pooled two-sided total rate Lambda implies
-    // A0 = Lambda / (2 * sum_j shape(z_j)).
-    const double total_rate = number(flow, "totalRfqRate");
-    const double theta = number(flow, "theta");
-    const double beta = number(flow, "beta");
-    double shape_mass = 0.0;
-    for (double target_size : target_sizes) {
-        const double source_size = target_size * source_size_per_target;
-        shape_mass += std::pow(source_size, -theta - beta * source_size);
+DiscreteRfqDistribution configured_rfq_distribution(const py::dict& flow) {
+    if (!flow.contains(py::str("totalRfqRate")) ||
+        !flow.contains(py::str("rfqSizes")) ||
+        !flow.contains(py::str("rfqProbabilities"))) {
+        throw std::invalid_argument(
+            "RFQ source requires totalRfqRate, rfqSizes, and rfqProbabilities; legacy A0/theta/beta is no longer supported");
     }
-    if (!(shape_mass > 0.0)) {
-        throw std::invalid_argument("RFQ arrival-intensity shape must have positive mass");
-    }
-    return total_rate / (2.0 * shape_mass);
+    return DiscreteRfqDistribution(
+        number(flow, "totalRfqRate"),
+        numbers(flow[py::str("rfqSizes")]),
+        numbers(flow[py::str("rfqProbabilities")]));
 }
 
-LogisticFlow build_logistic_flow(const py::dict& flow,
-                                 const std::vector<double>& target_sizes,
-                                 double source_size_per_target = 1.0) {
-    const py::str a0_key("A0");
-    const double a0 = flow.contains(a0_key)
-        ? py::cast<double>(flow[a0_key])
-        : a0_from_total_rfq_rate(flow, target_sizes, source_size_per_target);
-    return LogisticFlow(a0, number(flow, "theta"), number(flow, "beta"),
-                        number(flow, "shift"), number(flow, "steepness"), number(flow, "volumeShift"));
+FlowSource build_flow_source(const std::string& name, const py::dict& flow,
+                             FXMapping mapping) {
+    return FlowSource(
+        name, configured_rfq_distribution(flow),
+        LogisticWinProbability(number(flow, "shift"), number(flow, "steepness"),
+                               number(flow, "volumeShift")),
+        std::move(mapping));
 }
 
-AggregatedFlow build_tier_flow(const py::dict& tier, double target_spread_pips) {
-    const std::vector<double> pricing_sizes = numbers(tier[py::str("sizes")]);
-    const std::vector<double> target_sizes = rfq_size_support(
-        pricing_sizes, optional_number(tier, "rfqSizeStep", 1.0));
+AggregatedFlow build_tier_flow(const py::dict& tier) {
     const py::str sources_key("flowSources");
     if (!tier.contains(sources_key)) {
         const py::dict flow = py::cast<py::dict>(tier[py::str("flow")]);
         std::vector<FlowSource> direct;
-        direct.emplace_back(
-            "direct", build_logistic_flow(flow, target_sizes), 1.0, 1.0);
+        direct.push_back(build_flow_source(
+            "direct", flow, FXMapping{}));
         return AggregatedFlow(std::move(direct));
     }
 
@@ -183,34 +171,7 @@ AggregatedFlow build_tier_flow(const py::dict& tier, double target_spread_pips) 
         const std::string name = source.contains(py::str("name"))
             ? text(source, "name") : std::string("source");
 
-        double delta_scale = 1.0;
-        double source_size_per_target = 1.0;
-        if (source.contains(py::str("mapping"))) {
-            const py::dict mapping = py::cast<py::dict>(source[py::str("mapping")]);
-            const std::string type = mapping.contains(py::str("type"))
-                ? text(mapping, "type") : std::string("identity");
-            if (type == "identity") {
-                // defaults above
-            } else if (type == "crossed") {
-                const double cross_mid = number(mapping, "crossMid");
-                if (cross_mid <= 0.0) {
-                    throw std::invalid_argument("crossed flow mapping requires positive crossMid");
-                }
-                // The source quote is obtained by crossing the target quote.
-                // Both mid and spread scale by the same cross, so normalized
-                // delta is invariant: d_source == d_target.
-                delta_scale = 1.0;
-                source_size_per_target = cross_mid;
-            } else if (type == "affine") {
-                delta_scale = number(mapping, "deltaScale");
-                source_size_per_target = optional_number(mapping, "sourceSizePerTarget", 1.0);
-            } else {
-                throw std::invalid_argument("flow source mapping type must be identity, crossed, or affine");
-            }
-        }
-        sources.emplace_back(
-            name, build_logistic_flow(flow, target_sizes, source_size_per_target),
-            delta_scale, source_size_per_target);
+        sources.push_back(build_flow_source(name, flow, build_fx_mapping(source)));
     }
     return AggregatedFlow(std::move(sources));
 }
@@ -226,20 +187,14 @@ std::optional<DarkPool> build_dark_pool(const py::dict& cfg, double reference_sp
         numbers(cfg[py::str("postedSizes")]));
 }
 
-AggregatedECNFlow build_ecn_flow(const py::dict& cfg, double target_spread_pips) {
+AggregatedECNFlow build_ecn_flow(const py::dict& cfg) {
     const py::str sources_key("flowSources");
     if (!cfg.contains(sources_key)) {
         const py::dict flow = py::cast<py::dict>(cfg[py::str("flow")]);
         std::vector<ECNFlowSource> direct;
-        if (cfg.contains(py::str("tradeSizeProbabilities"))) {
-            direct.emplace_back(
-                "direct", ExponentialFlow(number(flow, "A"), number(flow, "k")),
-                1.0, 1.0, numbers(cfg[py::str("tradeSizeProbabilities")]));
-        } else {
-            direct.emplace_back(
-                "direct", ExponentialFlow(number(flow, "A"), number(flow, "k")),
-                1.0, 1.0, optional_number(cfg, "meanTradeSize", 1.0));
-        }
+        direct.emplace_back(
+            "direct", ExponentialFlow(number(flow, "A"), number(flow, "k")),
+            FXMapping{}, numbers(cfg[py::str("tradeSizeProbabilities")]));
         return AggregatedECNFlow(std::move(direct));
     }
 
@@ -252,50 +207,19 @@ AggregatedECNFlow build_ecn_flow(const py::dict& cfg, double target_spread_pips)
         const std::string name = source.contains(py::str("name"))
             ? text(source, "name") : std::string("source");
 
-        double delta_scale = 1.0;
-        double source_size_per_target = 1.0;
-        if (source.contains(py::str("mapping"))) {
-            const py::dict mapping = py::cast<py::dict>(source[py::str("mapping")]);
-            const std::string type = mapping.contains(py::str("type"))
-                ? text(mapping, "type") : std::string("identity");
-            if (type == "identity") {
-                // defaults above
-            } else if (type == "crossed") {
-                const double cross_mid = number(mapping, "crossMid");
-                if (cross_mid <= 0.0) {
-                    throw std::invalid_argument("crossed ECN flow mapping requires positive crossMid");
-                }
-                // Same normalized quote delta after crossing; cross mid only
-                // converts source-base trade sizes into target-base inventory.
-                delta_scale = 1.0;
-                source_size_per_target = cross_mid;
-            } else if (type == "affine") {
-                delta_scale = number(mapping, "deltaScale");
-                source_size_per_target = optional_number(mapping, "sourceSizePerTarget", 1.0);
-            } else {
-                throw std::invalid_argument("ECN flow source mapping type must be identity, crossed, or affine");
-            }
-        }
-        if (source.contains(py::str("tradeSizeProbabilities"))) {
-            sources.emplace_back(
-                name, ExponentialFlow(number(flow, "A"), number(flow, "k")),
-                delta_scale, source_size_per_target,
-                numbers(source[py::str("tradeSizeProbabilities")]));
-        } else {
-            sources.emplace_back(
-                name, ExponentialFlow(number(flow, "A"), number(flow, "k")),
-                delta_scale, source_size_per_target,
-                optional_number(source, "meanTradeSize", 1.0));
-        }
+        sources.emplace_back(
+            name, ExponentialFlow(number(flow, "A"), number(flow, "k")),
+            build_fx_mapping(source),
+            numbers(source[py::str("tradeSizeProbabilities")]));
     }
     return AggregatedECNFlow(std::move(sources));
 }
 
-std::optional<PassiveECN> build_passive_ecn(const py::dict& cfg, double target_spread_pips, double reference_spot) {
+std::optional<PassiveECN> build_passive_ecn(const py::dict& cfg, double reference_spot) {
     if (!boolean(cfg, "enabled")) return std::nullopt;
     return PassiveECN(
         numbers(cfg[py::str("deltas")]),
-        build_ecn_flow(cfg, target_spread_pips),
+        build_ecn_flow(cfg),
         number(cfg, "quoteSize"), fee_price_units(cfg, "makerFeeEurPerEurM", reference_spot));
 }
 
@@ -334,7 +258,7 @@ PricingProblem build_problem(const py::dict& cfg, std::optional<double> gamma_ov
         const py::dict markout = py::cast<py::dict>(tier[py::str("markout")]);
         tiers.emplace_back(
             text(tier, "name"), numbers(tier[py::str("sizes")]),
-            build_tier_flow(tier, number(cfg, "spreadPips")),
+            build_tier_flow(tier),
             SaturatingMarkout(
                 eur_per_eurm_to_price_units(
                     number(markout, "asymptoticEurPerEurM"), reference_spot, "markout"),
@@ -361,7 +285,7 @@ PricingProblem build_problem(const py::dict& cfg, std::optional<double> gamma_ov
         InternalizationTime(number(internal, "tau0"), number(internal, "tau1"), number(internal, "tau2")),
         std::move(tiers),
         build_dark_pool(py::cast<py::dict>(cfg[py::str("darkPool")]), reference_spot),
-        build_passive_ecn(py::cast<py::dict>(cfg[py::str("passiveEcn")]), number(cfg, "spreadPips"), reference_spot));
+        build_passive_ecn(py::cast<py::dict>(cfg[py::str("passiveEcn")]), reference_spot));
 }
 
 py::list matrix_value(const std::vector<std::vector<double>>& matrix) {
@@ -387,6 +311,10 @@ py::dict solution_value(const Solution& solution, const PricingProblem& problem,
     out["residual"] = solution.diagnostics.reward_upper_bound - solution.diagnostics.reward_lower_bound;
     out["valueChange"] = solution.diagnostics.value_change;
     out["bellmanResidual"] = solution.diagnostics.bellman_residual;
+    out["finalBellmanResidual"] = solution.diagnostics.final_bellman_residual;
+    out["worstResidualInventory"] = solution.diagnostics.worst_inventory;
+    out["worstResidualVolatilityIndex"] = solution.diagnostics.worst_volatility_index;
+    out["finalBellmanResidualByState"] = solution.diagnostics.final_bellman_residual_by_state;
     out["markoutResolventChange"] = solution.diagnostics.markout_resolvent_change;
 
     py::list markout_exposure;

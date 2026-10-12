@@ -1,3 +1,4 @@
+#include "historical_test_flow.hpp"
 #include "ladder_pricer/howard.hpp"
 #include "ladder_pricer/analytics.hpp"
 #include "ladder_pricer/simulation.hpp"
@@ -60,11 +61,9 @@ int main() {
     }
     std::vector<double> sizes{1,2,3,5,10,20};
     std::vector<Tier> tiers;
-    tiers.emplace_back("Tier 1", sizes,
-        LogisticFlow(.0155,.144,.0857,.52,8.42,.026),
+    tiers.emplace_back("Tier 1", sizes, historical_test_flow(HistoricalLogisticFixture(.0155,.144,.0857,.52,8.42,.026), sizes),
         SaturatingMarkout(1e-4, .5), true, -10, 100);
-    tiers.emplace_back("Tier 2", sizes,
-        LogisticFlow(.0232,.303,.122,.48,2.86,.02),
+    tiers.emplace_back("Tier 2", sizes, historical_test_flow(HistoricalLogisticFixture(.0232,.303,.122,.48,2.86,.02), sizes),
         SaturatingMarkout(1e-4, .5), true, -10, 100);
 
     PricingProblem p(grid(), .002, 0,
@@ -116,12 +115,12 @@ int main() {
     // {1,1/2,1/3,1/4}; 3M therefore tests a genuinely interpolated quote.
     {
         const std::vector<double> sampled_sizes{1.0, 2.0, 4.0};
-        const LogisticFlow sampled_flow(1.0, 1.0, 0.0, 0.50, 5.0, 0.0);
+        const HistoricalLogisticFixture sampled_flow(1.0, 1.0, 0.0, 0.50, 5.0, 0.0);
         std::vector<Tier> size_tiers;
         size_tiers.emplace_back(
             "RFQ size sampling", sampled_sizes,
             AggregatedFlow(std::vector<FlowSource>{
-                FlowSource("EURSEK", sampled_flow, 1.0, 1.0),
+                FlowSource("EURSEK", DiscreteRfqDistribution(2.0*(1.0+0.5+1.0/3.0+0.25), {1.0,2.0,3.0,4.0}, {1.0/(1.0+0.5+1.0/3.0+0.25),0.5/(1.0+0.5+1.0/3.0+0.25),(1.0/3.0)/(1.0+0.5+1.0/3.0+0.25),0.25/(1.0+0.5+1.0/3.0+0.25)}), historical_win(sampled_flow)),
             }),
             SaturatingMarkout(0.0, 0.5), false, -10.0, 100.0);
         PricingProblem size_problem(
@@ -194,6 +193,67 @@ int main() {
         assert(saw_bid && saw_ask);
     }
 
+
+    // Step 4: Monte Carlo must consume the RFQ distribution stored on the
+    // flow source, not reconstruct request sizes from pricing knots.  Here 2M
+    // is a pricing knot but not an RFQ atom, while 3M is an RFQ atom but not a
+    // pricing knot.  The simulator must therefore sample {1,3,4} only.
+    {
+        const std::vector<double> pricing_knots{1.0, 2.0, 4.0};
+        const HistoricalLogisticFixture flow(0.7, 0.2, 0.0, 0.50, 5.0, 0.0);
+        const DiscreteRfqDistribution distribution(
+            3.0, {1.0, 3.0, 4.0}, {0.20, 0.50, 0.30});
+
+        // Explicit sizes live in the source base currency.  A crossed source
+        // with c=2 must map {2,6,8} source millions to {1,3,4} target millions.
+        {
+            FlowSource crossed(
+                "USDSEK", DiscreteRfqDistribution(3.0, {2.0, 6.0, 8.0}, {0.20, 0.50, 0.30}),
+                historical_win(flow), FXMapping(1.0, 2.0));
+            std::mt19937_64 crossed_rng(2026100912);
+            std::map<double, int> sampled;
+            for (int n = 0; n < 10000; ++n) ++sampled[crossed.sample_rfq_target_size(crossed_rng)];
+            assert(sampled.size() == 3);
+            assert(sampled[1.0] > 0 && sampled[3.0] > 0 && sampled[4.0] > 0);
+            assert(sampled[2.0] == 0 && sampled[6.0] == 0 && sampled[8.0] == 0);
+        }
+
+        std::vector<Tier> explicit_tiers;
+        explicit_tiers.emplace_back(
+            "Step4 explicit distribution", pricing_knots,
+            AggregatedFlow(std::vector<FlowSource>{
+                FlowSource("EURSEK", distribution, historical_win(flow)),
+            }),
+            SaturatingMarkout(0.0, 0.5), false, -10.0, 100.0);
+        PricingProblem explicit_problem(
+            grid(), .002, 0.0, QuadraticPenalty(.1, .002),
+            InternalizationTime(4,.07,.0084), explicit_tiers);
+        auto explicit_solution = HowardSolver(explicit_problem).solve();
+        auto explicit_mc = MonteCarloSimulator(explicit_problem, explicit_solution, 11.5)
+                               .run(4.0, 2000, 0.0, 0.0, 20261009, 5, 5);
+
+        std::map<double, std::uint64_t> requests;
+        std::uint64_t total = 0;
+        for (const auto& aggregate : explicit_mc.rfq_aggregates) {
+            requests[aggregate.size] += aggregate.requests;
+            total += aggregate.requests;
+        }
+        assert(requests[2.0] == 0);
+        assert(requests[3.0] > 0);
+        assert(requests.size() == 3);
+
+        // Lambda=3 RFQs/min pooled across bid+ask.
+        const double expected_total = 3.0 * 4.0 * 2000.0;
+        assert(std::abs(static_cast<double>(total) - expected_total) / expected_total < 0.04);
+        const std::vector<double> support{1.0, 3.0, 4.0};
+        const std::vector<double> probabilities{0.20, 0.50, 0.30};
+        for (std::size_t j = 0; j < support.size(); ++j) {
+            const double realized = static_cast<double>(requests[support[j]])
+                                  / static_cast<double>(total);
+            assert(std::abs(realized - probabilities[j]) < 0.02);
+        }
+    }
+
     // Native progress reporting is based on genuinely completed paths and must
     // always finish at exactly paths / paths.
     int progress_reports = 0;
@@ -257,7 +317,7 @@ int main() {
         PassiveECN(
             {0.5},
             AggregatedECNFlow(std::vector<ECNFlowSource>{
-                ECNFlowSource("EURSEK", ExponentialFlow(100.0, 1.0), 1.0, 1.0,
+                ECNFlowSource("EURSEK", ExponentialFlow(100.0, 1.0), FXMapping{},
                               std::vector<double>{0.20, 0.20, 0.20, 0.20, 0.20}),
             }),
             1.0, 0.0));
@@ -293,8 +353,7 @@ int main() {
         // visit more than one calibrated volatility state when Q has active
         // transitions, and the path vectors must remain aligned.
         std::vector<Tier> vol_tiers;
-        vol_tiers.emplace_back("Vol MC tier", std::vector<double>{1.0},
-            LogisticFlow(0.02,0.1,0.01,0.50,6.0,0.0),
+        vol_tiers.emplace_back("Vol MC tier", std::vector<double>{1.0}, historical_test_flow(HistoricalLogisticFixture(0.02,0.1,0.01,0.50,6.0,0.0), std::vector<double>{1.0}),
             SaturatingMarkout(0.0,0.5), false,-10.0,100.0);
         const std::vector<double> sigmas{0.0005,0.0015};
         const std::vector<std::vector<double>> qvol{{-2.0,2.0},{2.0,-2.0}};

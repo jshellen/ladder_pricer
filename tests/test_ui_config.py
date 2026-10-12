@@ -19,9 +19,9 @@ def ui_values_from_default():
             f"{p}-enabled": ["on"] if tier["enabled"] else [],
             f"{p}-name": tier["name"],
             f"{p}-sizes": ", ".join(str(x) for x in tier["sizes"]),
-            f"{p}-rfq-size-step": tier.get("rfqSizeStep", 1.0),
-            f"{p}-A0": tier["flow"]["A0"],
-            f"{p}-theta": tier["flow"]["theta"], f"{p}-beta": tier["flow"]["beta"],
+            f"{p}-rfq-rate": tier["flow"]["totalRfqRate"],
+            f"{p}-rfq-sizes": ", ".join(str(x) for x in tier["flow"]["rfqSizes"]),
+            f"{p}-rfq-probs": ", ".join(str(x) for x in tier["flow"]["rfqProbabilities"]),
             f"{p}-steep": tier["flow"]["steepness"], f"{p}-shift": tier["flow"]["shift"], f"{p}-vshift": tier["flow"]["volumeShift"],
             f"{p}-fee": tier.get("feeEurPerEurM", 0.0),
             f"{p}-markout-enabled": ["on"] if tier["useMarkout"] else [],
@@ -134,11 +134,11 @@ def test_tier_fee_round_trips_from_ui():
     assert cfg["tiers"][0]["feeEurPerEurM"] == 1.75
 
 
-def test_tier_theta_accepts_four_decimal_precision():
+def test_total_rfq_rate_accepts_extra_decimal_precision():
     values = ui_values_from_default()
-    values["t0-theta"] = 0.0144
+    values["t0-rfq-rate"] = 0.1416354448123
     cfg = build_config(values)
-    assert cfg["tiers"][0]["flow"]["theta"] == 0.0144
+    assert cfg["tiers"][0]["flow"]["totalRfqRate"] == 0.1416354448123
 
 
 def test_continuous_dash_number_inputs_do_not_impose_step_grid():
@@ -177,9 +177,7 @@ def test_continuous_parameters_accept_extra_decimal_precision():
         "tau0": 4.0125,
         "tau1": 0.00703125,
         "tau2": 0.00084375,
-        "t0-A0": 0.0155123,
-        "t0-theta": 0.0144,
-        "t0-beta": 0.00857,
+        "t0-rfq-rate": 0.1416354448123,
         "t0-steep": 8.42123,
         "t0-shift": 0.52125,
         "t0-vshift": 0.0026125,
@@ -202,8 +200,7 @@ def test_continuous_parameters_accept_extra_decimal_precision():
     assert cfg["spot"] == 11.51234567
     assert cfg["spreadPips"] == 19.375
     assert cfg["gamma"] == 0.0144
-    assert cfg["tiers"][0]["flow"]["A0"] == 0.0155123
-    assert cfg["tiers"][0]["flow"]["theta"] == 0.0144
+    assert cfg["tiers"][0]["flow"]["totalRfqRate"] == 0.1416354448123
     assert cfg["tiers"][0]["deltaMin"] == -10.125
     assert cfg["darkPool"]["lambda"] == 2.0125
     assert cfg["darkPool"]["mu"] == 2.0125
@@ -214,28 +211,41 @@ def test_continuous_parameters_accept_extra_decimal_precision():
     assert cfg["passiveEcn"]["quoteSize"] == 1.125
 
 
-def test_rfq_flow_curve_itself_defines_size_density():
+def test_rfq_distribution_is_explicit_and_independent_of_pricing_knots():
     cfg = build_config(ui_values_from_default())
-    flow = cfg["tiers"][0]["flow"]
-    assert "A0" in flow
-    assert "totalRfqRate" not in flow
-    assert "sizeProbabilities" not in flow
-
     tier = cfg["tiers"][0]
+    flow = tier["flow"]
+
     assert tier["sizes"] == [1, 2, 3, 5, 10, 20]
-    assert tier["rfqSizeStep"] == 1.0
-    rfq_sizes = list(range(1, 21))
-    weights = [z ** (-flow["theta"] - flow["beta"] * z) for z in rfq_sizes]
-    probabilities = [w / sum(weights) for w in weights]
-    assert sum(probabilities) == pytest.approx(1.0)
+    assert "rfqSizeStep" not in tier
+    assert "A0" not in flow and "theta" not in flow and "beta" not in flow
+    assert flow["totalRfqRate"] == pytest.approx(0.1416354448280368)
+    assert flow["rfqSizes"] == [float(x) for x in range(1, 21)]
+    assert sum(flow["rfqProbabilities"]) == pytest.approx(1.0)
 
     from pathlib import Path
     app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
-    assert 'A0 · exogenous intensity scale' in app_source
-    assert 'intensity curve itself is the density' in app_source
-    assert 'RFQ size probabilities' not in app_source
-    assert 'RFQ size step [EUR M]' in app_source
-    assert 'prices between knots are linearly interpolated' in app_source
+    assert 'Total RFQ rate · bid + ask [RFQ/min]' in app_source
+    assert 'RFQ sizes [source CCY M]' in app_source
+    assert 'RFQ probabilities' in app_source
+    assert 'A0 · exogenous intensity scale' not in app_source
+    assert 'RFQ size step [EUR M]' not in app_source
+    assert 'Quotes at RFQ sizes between pricing knots are linearly interpolated' in app_source
+
+
+def test_rfq_distribution_validation_rejects_bad_probabilities_and_sizes():
+    values = ui_values_from_default()
+    values["t0-rfq-probs"] = "0.5, 0.4"
+    values["t0-rfq-sizes"] = "1, 2"
+    with pytest.raises(ValueError, match="sum to 1"):
+        build_config(values)
+
+    values = ui_values_from_default()
+    values["t0-rfq-sizes"] = "1, 1, 2"
+    values["t0-rfq-probs"] = "0.2, 0.3, 0.5"
+    with pytest.raises(ValueError, match="strictly increasing"):
+        build_config(values)
+
 
 def test_dark_pool_is_zero_inflated_poisson_only():
     cfg = build_config(ui_values_from_default())
@@ -317,6 +327,10 @@ def test_mc_rfq_validation_uses_all_path_population_aggregates_and_tier_selector
     assert 'mc.get("rfqDeltaAggregates", [])' in app_source
     assert 'mc.get("rfqInventoryAggregates", [])' in app_source
     assert 'requests_by_size.get(float(z), 0) / exposure' in app_source
+    assert '_tier_rfq_distribution_sizes(tier)' in app_source
+    assert '_distribution_activity(tier, float(z))' in app_source
+    assert '_distribution_hit_ratio(tier, grid, float(z), spread_pips)' in app_source
+    assert '_policy_delta_series_for_size(tier_sol, "bid", float(z))' in app_source
     assert 'int(row.get("admissibleRequests", 0))' in app_source
     assert 'title=f"Implied hit ratios by inventory · {tier_name}"' in app_source
 
@@ -350,11 +364,16 @@ def test_native_rfq_sampling_is_independent_of_pricing_knots():
     simulation = (root / "cpp/src/simulation.cpp").read_text()
     core = (root / "cpp/src/core.cpp").read_text()
     bindings = (root / "cpp/src/python_bindings.cpp").read_text()
-    assert 'source.target_sizes().at(size_idx)' in simulation
+    assert 'source.sample_rfq_target_size(event_rng)' in simulation
     assert 'policy_delta_for_size(policy, rfq_side, rfq_size, q)' in simulation
     assert 'linear interpolation of delta is exactly linear interpolation of price' in simulation
+    assert 'double FlowSource::sample_rfq_target_size' in core
+    assert 'distribution_.probabilities()' in core
+    assert 'distribution_.total_rfq_rate()' in core
     assert 'build_rfq_size_support' in core
-    assert 'optional_number(tier, "rfqSizeStep", 1.0)' in bindings
+    assert 'configured_rfq_distribution(flow)' in bindings
+    assert 'flow.contains(py::str("rfqSizes"))' in bindings
+    assert 'flow.contains(py::str("rfqProbabilities"))' in bindings
 
 
 def test_passive_ecn_trade_size_distribution_is_discrete_and_normalized():
@@ -423,9 +442,10 @@ def test_crossed_fx_sources_inherit_target_delta_and_do_not_configure_source_spr
     bindings_source = (Path(__file__).resolve().parents[1] / "cpp" / "src" / "python_bindings.cpp").read_text()
     assert 'number_input("Source spread [pips]"' not in app_source
     assert 'sourceSpreadPips' not in app_source
-    assert 'delta_scale = 1.0;' in bindings_source
-    assert 'crossed flow mapping requires positive crossMid' in bindings_source
-    assert 'crossed ECN flow mapping requires positive crossMid' in bindings_source
+    assert 'FXMapping build_fx_mapping(const py::dict& source)' in bindings_source
+    assert 'return FXMapping(1.0, cross_mid);' in bindings_source
+    assert 'crossed flow mapping requires finite positive crossMid' in bindings_source
+    assert bindings_source.count('build_fx_mapping(source)') == 2
 
 
 def test_tier_markout_is_native_eur_per_eurm_and_size_independent():
@@ -457,3 +477,119 @@ def test_native_markout_boundary_uses_eur_per_eurm_and_no_size_scaling():
     assert 'size_exponent' not in core_hpp
     assert 'markout().asymptotic(z)' not in core_cpp
     assert 'size_exponent' not in core_cpp
+
+
+def test_step2_hjb_evaluation_uses_rfq_distribution_not_pricing_knots():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    core = (root / "cpp/src/core.cpp").read_text()
+    howard = (root / "cpp/src/howard.cpp").read_text()
+    bindings = (root / "cpp/src/python_bindings.cpp").read_text()
+
+    assert 'for (const auto& source : tier.flow().sources())' in core
+    assert 'for (const auto& atom : source.rfq_atoms())' in core
+    assert 'interpolate_size_row(tier.sizes(), row_values, z)' in core
+    assert 'for (const auto& atom : source.rfq_atoms())' in howard
+    assert 'interpolate_size_row(tier.sizes(), deltas, z)' in howard
+    assert 'configured_rfq_distribution(flow)' in bindings
+    assert 'numbers(flow[py::str("rfqSizes")])' in bindings
+    assert 'numbers(flow[py::str("rfqProbabilities")])' in bindings
+    assert 'rfq_distribution_support' not in bindings
+
+
+
+def test_pricing_knots_do_not_modify_explicit_rfq_distribution_config():
+    values = ui_values_from_default()
+    baseline = build_config(values)["tiers"][0]["flow"]
+    values["t0-sizes"] = "1, 1.5, 2, 3, 4, 5, 7, 10, 15, 20"
+    changed = build_config(values)["tiers"][0]["flow"]
+    assert changed == baseline
+
+
+def test_step5_default_distribution_preserves_pre_refactor_arrival_curve_economics():
+    cfg = default_config()
+    legacy = [
+        (cfg["tiers"][0]["flow"], 0.0155, 0.144, 0.0857),
+        (cfg["tiers"][1]["flow"], 0.0232, 0.303, 0.122),
+    ]
+    for flow, a0, theta, beta in legacy:
+        sizes = flow["rfqSizes"]
+        old_one_side_rates = [a0 * z ** (-theta - beta * z) for z in sizes]
+        old_total = 2.0 * sum(old_one_side_rates)
+        old_probabilities = [x / sum(old_one_side_rates) for x in old_one_side_rates]
+        assert flow["totalRfqRate"] == pytest.approx(old_total, rel=0.0, abs=1e-14)
+        assert flow["rfqProbabilities"] == pytest.approx(old_probabilities, rel=0.0, abs=1e-14)
+
+
+def test_expected_internalization_uses_explicit_rfq_atoms_not_pricing_knots():
+    from pathlib import Path
+
+    app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
+    block = app_source.split("def expected_internalization_times", 1)[1]
+    block = block.split("# Dark-pool fills.", 1)[0]
+    assert "_source_rfq_distribution_atoms(tier_cfg, source)" in block
+    assert "_policy_delta_series_for_size(tier_policy, side, float(z))" in block
+    assert "float(exogenous_rate) * hit" in block
+    assert "tier_cfg[\"sizes\"]" not in block
+
+
+def test_flow_source_modal_contains_selected_source_diagnostics():
+    from pathlib import Path
+
+    app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
+    assert 'diagnostic_expander("RFQ size distribution"' in app_source
+    assert 'diagnostic_expander("Hit ratios"' in app_source
+    assert 'diagnostic_expander("Markouts"' in app_source
+    assert 'Output("flow-source-rfq-distribution-chart", "figure")' in app_source
+    assert 'Output("flow-source-hit-ratio-chart", "figure")' in app_source
+    assert 'Output("flow-source-markout-chart", "figure")' in app_source
+    assert 'Input("flow-source-selected-store", "data")' in app_source
+    assert 'Input("flow-edit-rfq-rate", "value", allow_optional=True)' in app_source
+    assert 'Input("flow-edit-rfq-sizes", "value", allow_optional=True)' in app_source
+    assert 'Input("flow-edit-rfq-probs", "value", allow_optional=True)' in app_source
+
+
+def test_ecn_flow_source_modal_contains_selected_source_diagnostics():
+    from pathlib import Path
+
+    app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
+    assert 'diagnostic_expander("ECN trade-size distribution"' in app_source
+    assert 'diagnostic_expander("Fill intensity / relative hit curve"' in app_source
+    assert 'Output("ecn-flow-source-size-distribution-chart", "figure")' in app_source
+    assert 'Output("ecn-flow-source-hit-curve-chart", "figure")' in app_source
+    assert 'Input("ecn-flow-source-selected-store", "data")' in app_source
+    assert 'Input("ecn-flow-edit-A", "value", allow_optional=True)' in app_source
+    assert 'Input("ecn-flow-edit-k", "value", allow_optional=True)' in app_source
+
+
+def test_ecn_modal_does_not_invent_unmodelled_markout_curve():
+    from pathlib import Path
+
+    app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
+    assert 'Passive ECN does not currently have a separate markout process in the HJB.' in app_source
+    assert 'ecn-flow-source-markout-chart' not in app_source
+
+
+def test_dynamic_flow_editor_inputs_are_optional_dash_dependencies():
+    """Conditionally rendered flow editors must not break unrelated callbacks."""
+    from pathlib import Path
+    import re
+
+    app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
+    dynamic_ids = {
+        "flow-source-remove-selected",
+        "flow-edit-pair", "flow-edit-cross-pair", "flow-edit-cross-mid",
+        "flow-edit-rfq-rate", "flow-edit-rfq-sizes", "flow-edit-rfq-probs",
+        "flow-edit-steep", "flow-edit-shift", "flow-edit-vshift",
+        "ecn-flow-source-remove-selected",
+        "ecn-flow-edit-pair", "ecn-flow-edit-cross-pair", "ecn-flow-edit-cross-mid",
+        "ecn-flow-edit-A", "ecn-flow-edit-k",
+        "ecn-flow-edit-p1m", "ecn-flow-edit-p750k", "ecn-flow-edit-p500k", "ecn-flow-edit-p250k",
+    }
+    for component_id in dynamic_ids:
+        pattern = rf'Input\("{re.escape(component_id)}",\s*"(?:value|n_clicks)"(?!,\s*allow_optional=True)'
+        assert re.search(pattern, app_source) is None, f"{component_id} must be optional when conditionally rendered"
+
+    setup_source = (Path(__file__).resolve().parents[1] / "setup.py").read_text()
+    assert '"dash>=3.1"' in setup_source
