@@ -1375,16 +1375,16 @@ Policy PolicyBuilder::improve(const std::vector<double>& value, const Policy& pr
 
         for (Side side : {Side::Bid, Side::Ask}) {
             {
-                const auto candidate = coordinate_optimize_ladder(
-                    tier, value, q_grid[q0], side, matrix(old, side, q0));
+                const auto candidate = build_ladder(
+                    tier, value, q_grid[q0], side);
                 matrix(out, side, q0) = choose_howard_safe(
                     tier, value, q_grid[q0], side, matrix(old, side, q0), candidate);
             }
 
             for (std::size_t i = q0 + 1; i < q_grid.size(); ++i) {
                 if (q_grid[i] > q_operational + kTolerance) {
-                    const auto candidate = coordinate_optimize_ladder(
-                        tier, value, q_grid[i], side, matrix(old, side, i));
+                    const auto candidate = build_ladder(
+                        tier, value, q_grid[i], side);
                     matrix(out, side, i) = choose_howard_safe(
                         tier, value, q_grid[i], side, matrix(old, side, i), candidate);
                     continue;
@@ -1399,8 +1399,8 @@ Policy PolicyBuilder::improve(const std::vector<double>& value, const Policy& pr
                     bounds.lower = inner;
                 }
                 {
-                    const auto candidate = coordinate_optimize_ladder(
-                        tier, value, q_grid[i], side, matrix(old, side, i), bounds);
+                    const auto candidate = build_ladder(
+                        tier, value, q_grid[i], side, bounds);
                     matrix(out, side, i) = choose_howard_safe(
                         tier, value, q_grid[i], side, matrix(old, side, i), candidate, bounds);
                 }
@@ -1409,8 +1409,8 @@ Policy PolicyBuilder::improve(const std::vector<double>& value, const Policy& pr
             for (std::size_t offset = 1; offset <= q0; ++offset) {
                 const std::size_t i = q0 - offset;
                 if (q_grid[i] < -q_operational - kTolerance) {
-                    const auto candidate = coordinate_optimize_ladder(
-                        tier, value, q_grid[i], side, matrix(old, side, i));
+                    const auto candidate = build_ladder(
+                        tier, value, q_grid[i], side);
                     matrix(out, side, i) = choose_howard_safe(
                         tier, value, q_grid[i], side, matrix(old, side, i), candidate);
                     continue;
@@ -1425,8 +1425,8 @@ Policy PolicyBuilder::improve(const std::vector<double>& value, const Policy& pr
                     bounds.upper = inner;
                 }
                 {
-                    const auto candidate = coordinate_optimize_ladder(
-                        tier, value, q_grid[i], side, matrix(old, side, i), bounds);
+                    const auto candidate = build_ladder(
+                        tier, value, q_grid[i], side, bounds);
                     matrix(out, side, i) = choose_howard_safe(
                         tier, value, q_grid[i], side, matrix(old, side, i), candidate, bounds);
                 }

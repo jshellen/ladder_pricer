@@ -16,23 +16,14 @@ def parse_numbers(raw: Any) -> list[float]:
     return values
 
 
-def _rfq_distribution(values: Mapping[str, Any], prefix: str) -> tuple[float, list[float], list[float]]:
-    total_rate = _number(values, f"{prefix}-rfq-rate")
-    if total_rate < 0.0:
-        raise ValueError("Total RFQ rate must be nonnegative")
-    sizes = parse_numbers(values.get(f"{prefix}-rfq-sizes", ""))
-    probabilities = parse_numbers(values.get(f"{prefix}-rfq-probs", ""))
-    if len(sizes) != len(probabilities):
-        raise ValueError("RFQ sizes and probabilities must have the same length")
-    if any(z <= 0.0 for z in sizes):
-        raise ValueError("RFQ sizes must be positive")
-    if any(b <= a for a, b in zip(sizes, sizes[1:])):
-        raise ValueError("RFQ sizes must be strictly increasing")
-    if any(p < 0.0 for p in probabilities):
-        raise ValueError("RFQ probabilities must be nonnegative")
-    if abs(sum(probabilities) - 1.0) > 1e-9:
-        raise ValueError("RFQ probabilities must sum to 1")
-    return total_rate, sizes, probabilities
+def _rfq_curve(values: Mapping[str, Any], prefix: str) -> tuple[float, float, float]:
+    import math
+    a0 = _number(values, f"{prefix}-a0")
+    theta = _number(values, f"{prefix}-theta")
+    beta = _number(values, f"{prefix}-beta")
+    if any(not math.isfinite(x) or x < 0.0 for x in (a0, theta, beta)):
+        raise ValueError("RFQ A0, theta and beta must be finite and nonnegative")
+    return a0, theta, beta
 
 
 def _number(values: Mapping[str, Any], key: str) -> float:
@@ -97,11 +88,11 @@ def build_config(values: Mapping[str, Any]) -> dict[str, Any]:
     for i in range(3):
         p = f"t{i}"
         sizes = parse_numbers(values.get(f"{p}-sizes", ""))
-        total_rfq_rate, rfq_sizes, rfq_probabilities = _rfq_distribution(values, p)
+        a0, theta, beta = _rfq_curve(values, p)
         flow = {
-            "totalRfqRate": total_rfq_rate,
-            "rfqSizes": rfq_sizes,
-            "rfqProbabilities": rfq_probabilities,
+            "A0": a0,
+            "theta": theta,
+            "beta": beta,
             "steepness": _number(values, f"{p}-steep"),
             "shift": _number(values, f"{p}-shift"),
             "volumeShift": _number(values, f"{p}-vshift"),

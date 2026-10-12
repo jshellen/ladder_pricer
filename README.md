@@ -78,19 +78,27 @@ source_size  = cross_mid * target_size
 
 For example, a 25% EURSEK delta implies a 25% USDSEK delta when USDSEK is formed as
 `EURSEK / EURUSD`. The cross mid is still needed for base-currency size conversion.
-Customer RFQ sizes are now represented by a discrete exogenous distribution that is
-independent of the pricing-control knots. Each flow source owns a pooled bid+ask total
-request rate `Lambda_s` and a source-currency size PMF `{z_{s,k}, p_{s,k}}`; one-sided
-atom intensity is `0.5 * Lambda_s * p_{s,k}`. Legacy `A0/theta/beta` configurations are
-frozen onto the RFQ integration grid at the native boundary to produce the same object.
-The HJB, pricing-knot optimizer and Monte Carlo all consume that common distribution.
-Quotes for customer sizes between pricing knots are obtained by linear interpolation of
-the neighboring prices. Adding an internal pricing knot therefore does not create a new
-RFQ event or change the exogenous request rate.
+Customer RFQ flow uses the **original parametric one-sided intensity**
+`lambda(z) = A0 * z**(-theta - beta*z)`, with the calibration in each
+`flow` source. RFQ events are defined **only at the tier's pricing knots**.
+For example, pricing sizes `[1,5,10]` produce RFQs at 1M, 5M and 10M only;
+20M requests are not represented in the HJB or Monte Carlo. The per-side arrival
+rate of each supported size is evaluated directly from the curve at that size.
+Adding or removing a pricing knot changes both the represented RFQ event set
+and its total event rate, just as in the original model.
 
-Because several transformed logistic curves no longer have the single-curve Lambert-W
-optimum, aggregated tiers use a bounded one-dimensional numerical quote optimization.
-Single-source legacy tiers retain the original analytical fast path.
+The implementation constructs an internal discrete event sampler from these knot
+intensities for the existing HJB/Howard, analytics and Monte Carlo routines.
+This is **not** a user-configured or independently calibrated RFQ size PMF.
+Customer win probability remains the separate logistic model, and the original
+monotonicity-constrained, rung-by-rung `build_ladder()` policy improvement is used.
+Flow sources with crossed FX mappings evaluate their own lambda curve at the
+corresponding source-currency trade size.
+
+Quotes between pricing knots continue to be linearly interpolated for display and
+external RFQ quotation, and quotes beyond the last knot use flat extrapolation.
+Those intermediary or larger sizes do not contribute to the HJB or simulator.
+
 
 ## Python API
 

@@ -311,9 +311,9 @@ def _default_cross_flow_source(
     # distribution and win-probability curve. The user can then replace them
     # with source-pair-specific calibration in the editor.
     flow = deepcopy(template_flow) if template_flow else {
-        "totalRfqRate": 0.10,
-        "rfqSizes": [1.0],
-        "rfqProbabilities": [1.0],
+        "A0": 0.0155,
+        "theta": 0.144,
+        "beta": 0.0857,
         "steepness": 8.42,
         "shift": 0.52,
         "volumeShift": 0.026,
@@ -416,33 +416,17 @@ def _empty_diagnostic_figure(message: str, title: str = "") -> go.Figure:
 
 
 def flow_source_distribution_figure(source: dict[str, Any]) -> go.Figure:
-    """Selected customer source's empirical RFQ-size PMF in source currency."""
-    flow = source.get("flow", {})
+    """Parametric historical one-sided lambda(z), independent of displayed knots."""
     label = str(source.get("pair") or source.get("name") or "RFQ source")
     try:
-        _validate_explicit_rfq_flow(flow, label)
-        sizes = np.asarray(flow["rfqSizes"], dtype=float)
-        probs = np.asarray(flow["rfqProbabilities"], dtype=float)
-        total = float(flow["totalRfqRate"])
+        sizes = np.linspace(1, 20, 191)
+        rates = _source_lambda(source, sizes)
     except Exception as exc:
-        return _empty_diagnostic_figure(f"Invalid RFQ distribution · {exc}", f"RFQ size distribution · {label}")
-    fig = go.Figure(go.Bar(
-        x=sizes, y=probs,
-        customdata=total * probs,
-        hovertemplate=(
-            "RFQ size=%{x:g}M<br>Probability=%{y:.2%}"
-            "<br>Pooled arrival contribution=%{customdata:.6f} /min<extra></extra>"
-        ),
-        name="Size probability",
-    ))
-    fig.update_layout(
-        title=f"RFQ size distribution · {label} · total rate {total:.6g}/min (bid + ask)",
-        xaxis_title=f"RFQ size [{label[:3] if len(label) >= 3 else 'source'} M]",
-        yaxis_title="Probability mass",
-        yaxis_tickformat=".0%",
-        template="trinity_dark",
-        bargap=0.18,
-    )
+        return _empty_diagnostic_figure(f"Invalid RFQ intensity · {exc}", f"RFQ λ(z) · {label}")
+    fig = go.Figure(go.Scatter(x=sizes, y=rates, mode="lines", name="λ(z)"))
+    fig.update_layout(title=f"Exogenous RFQ intensity · {label}",
+        xaxis_title="RFQ size [source CCY M]", yaxis_title="One-side arrivals / min",
+        template="trinity_dark")
     return fig
 
 
@@ -451,8 +435,8 @@ def flow_source_hit_ratio_figure(source: dict[str, Any], target_spread_pips: flo
     flow = source.get("flow", {})
     label = str(source.get("pair") or source.get("name") or "RFQ source")
     try:
-        _validate_explicit_rfq_flow(flow, label)
-        source_sizes = np.asarray(flow["rfqSizes"], dtype=float)
+        _validate_rfq_curve(flow, label)
+        source_sizes = np.linspace(1, 20, 20)
         scale = _source_size_scale(source)
         if scale <= 0.0:
             raise ValueError("source size scale must be positive")
@@ -600,14 +584,14 @@ def flow_source_settings_editor(source_key: str, source: dict[str, Any], target_
         header,
         *source_fields,
         html.Div(
-            "RFQ arrivals are calibrated independently of pricing knots. Total RFQ rate is the pooled bid+ask request rate for this source. RFQ sizes and probabilities are in the source pair's base currency; probabilities must sum to 1. Quotes at RFQ sizes between pricing knots are linearly interpolated.",
+            "Original RFQ arrival curve: λ(z) = A0 × z^(−θ−βz). Only pricing knots generate RFQ events; λ is per side, with size in the source pair base currency (millions).",
             className="muted-note modal-note",
         ),
-        html.Div("Exogenous RFQ distribution", className="subhead"),
+        html.Div("Exogenous RFQ intensity curve", className="subhead"),
         html.Div([
-            number_input("Total RFQ rate · bid + ask [RFQ/min]", "flow-edit-rfq-rate", float(flow.get("totalRfqRate", 0.0)), "any"),
-            text_input("RFQ sizes [source CCY M]", "flow-edit-rfq-sizes", ", ".join(str(x) for x in flow.get("rfqSizes", [1.0]))),
-            text_input("RFQ probabilities", "flow-edit-rfq-probs", ", ".join(str(x) for x in flow.get("rfqProbabilities", [1.0]))),
+            number_input("A0 · one-side RFQ rate at 1M [RFQ/min]", "flow-edit-a0", float(flow.get("A0", 0.0)), "any"),
+            number_input("Theta · size exponent", "flow-edit-theta", float(flow.get("theta", 0.0)), "any"),
+            number_input("Beta · size decay", "flow-edit-beta", float(flow.get("beta", 0.0)), "any"),
         ], className="grid-2 flow-calibration-grid"),
         html.Div("Win probability calibration", className="subhead"),
         html.Div([
@@ -704,9 +688,9 @@ def tier_panel(index: int, tier: dict[str, Any], open_: bool = False):
         # Keep the direct source calibration mounted so the modal can edit it
         # without coupling RFQ distributions to pricing knots.
         html.Div([
-            number_input("Total RFQ rate", f"{p}-rfq-rate", tier["flow"]["totalRfqRate"], "any"),
-            text_input("RFQ sizes", f"{p}-rfq-sizes", ", ".join(str(x) for x in tier["flow"]["rfqSizes"])),
-            text_input("RFQ probabilities", f"{p}-rfq-probs", ", ".join(str(x) for x in tier["flow"]["rfqProbabilities"])),
+            number_input("A0", f"{p}-a0", tier["flow"]["A0"], "any"),
+            number_input("Theta", f"{p}-theta", tier["flow"]["theta"], "any"),
+            number_input("Beta", f"{p}-beta", tier["flow"]["beta"], "any"),
             number_input("Steepness", f"{p}-steep", tier["flow"]["steepness"], "any"),
             number_input("Shift", f"{p}-shift", tier["flow"]["shift"], "any"),
             number_input("Volume shift", f"{p}-vshift", tier["flow"]["volumeShift"], "any"),
@@ -766,25 +750,25 @@ def _logistic(x: np.ndarray | float) -> np.ndarray | float:
     return float(out) if out.ndim == 0 else out
 
 
-def _validate_explicit_rfq_flow(flow: dict[str, Any], label: str = "RFQ flow") -> None:
-    try:
-        total_rate = float(flow["totalRfqRate"])
-        sizes = [float(x) for x in flow["rfqSizes"]]
-        probabilities = [float(x) for x in flow["rfqProbabilities"]]
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(f"{label} requires total RFQ rate, RFQ sizes and probabilities") from exc
-    if not math.isfinite(total_rate) or total_rate < 0.0:
-        raise ValueError(f"{label} total RFQ rate must be finite and nonnegative")
-    if not sizes or len(sizes) != len(probabilities):
-        raise ValueError(f"{label} RFQ sizes and probabilities must have the same non-zero length")
-    if any((not math.isfinite(z) or z <= 0.0) for z in sizes):
-        raise ValueError(f"{label} RFQ sizes must be finite and positive")
-    if any(b <= a for a, b in zip(sizes, sizes[1:])):
-        raise ValueError(f"{label} RFQ sizes must be strictly increasing")
-    if any((not math.isfinite(p) or p < 0.0) for p in probabilities):
-        raise ValueError(f"{label} RFQ probabilities must be finite and nonnegative")
-    if not math.isclose(sum(probabilities), 1.0, rel_tol=0.0, abs_tol=1e-9):
-        raise ValueError(f"{label} RFQ probabilities must sum to 1")
+def _validate_rfq_curve(flow: dict[str, Any], label: str = "RFQ flow") -> None:
+    vals = []
+    for key in ("A0", "theta", "beta"):
+        try:
+            val = float(flow[key])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{label} requires numeric {key}") from exc
+        if not math.isfinite(val) or val < 0.0:
+            raise ValueError(f"{label} {key} must be finite and nonnegative")
+        vals.append(val)
+
+
+def _source_lambda(source: dict[str, Any], source_size):
+    flow = source["flow"]
+    _validate_rfq_curve(flow, str(source.get("name", "RFQ flow")))
+    z = np.asarray(source_size, dtype=float)
+    if np.any(z <= 0):
+        raise ValueError("RFQ size must be positive")
+    return float(flow["A0"]) * np.power(z, -float(flow["theta"]) - float(flow["beta"]) * z)
 
 
 def _source_size_scale(source: dict[str, Any]) -> float:
@@ -807,18 +791,10 @@ def _tier_flow_sources(tier: dict[str, Any]) -> list[dict[str, Any]]:
 def _source_rfq_distribution_atoms(
     tier: dict[str, Any], source: dict[str, Any],
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return target-size atoms and one-sided arrival rates used by HJB/MC.
-
-    Step-5 dashboard configs are explicit: exogenous request-size distributions
-    no longer depend on pricing knots or an A0/theta/beta curve.
-    """
-    del tier  # pricing knots are intentionally irrelevant to the RFQ distribution
-    flow = source["flow"]
-    _validate_explicit_rfq_flow(flow, str(source.get("name") or "RFQ flow"))
-    source_sizes = np.asarray(flow["rfqSizes"], dtype=float)
-    probabilities = np.asarray(flow["rfqProbabilities"], dtype=float)
+    """Only pricing knots are RFQ events, one-side rates from historical lambda(z)."""
+    target_sizes = np.asarray(tier["sizes"], dtype=float)
     scale = _source_size_scale(source)
-    return source_sizes / scale, 0.5 * float(flow["totalRfqRate"]) * probabilities
+    return target_sizes, np.asarray(_source_lambda(source, target_sizes * scale), dtype=float)
 
 
 def _tier_rfq_distribution_sizes(tier: dict[str, Any]) -> np.ndarray:
@@ -2253,7 +2229,7 @@ CONFIG_FIELDS = [
 for i in range(3):
     p = f"t{i}"
     for suffix in (
-        "enabled", "name", "sizes", "rfq-rate", "rfq-sizes", "rfq-probs", "steep", "shift", "vshift",
+        "enabled", "name", "sizes", "a0", "theta", "beta", "steep", "shift", "vshift",
         "fee", "markout-enabled", "markout-level", "markout-tau", "dmin", "dmax",
     ):
         CONFIG_FIELDS.append((f"{p}-{suffix}", State(f"{p}-{suffix}", "value")))
@@ -2373,7 +2349,7 @@ def render_flow_source_cards(tier_index, target_pair, selected, data):
     Input("flow-target-pair", "value"),
     Input("flow-source-selected-store", "data"),
     State("extra-flow-sources-store", "data"),
-    *[State(f"t{i}-{suffix}", "value") for i in range(3) for suffix in ("rfq-rate", "rfq-sizes", "rfq-probs", "steep", "shift", "vshift")],
+    *[State(f"t{i}-{suffix}", "value") for i in range(3) for suffix in ("a0", "theta", "beta", "steep", "shift", "vshift")],
 )
 def render_flow_source_settings(tier_index, target_pair, selected, data, *direct_values):
     """Render the settings form only when its identity changes.
@@ -2396,15 +2372,15 @@ def render_flow_source_settings(tier_index, target_pair, selected, data, *direct
     offset = ti * 6
     vals = direct_values[offset:offset + 6]
     try:
-        direct_rfq_sizes = parse_numbers(vals[1])
-        direct_rfq_probabilities = parse_numbers(vals[2])
+        direct_rfq_sizes = float(vals[1])
+        direct_rfq_probabilities = float(vals[2])
     except (TypeError, ValueError):
-        direct_rfq_sizes = [1.0]
-        direct_rfq_probabilities = [1.0]
+        direct_rfq_sizes = 0.144
+        direct_rfq_probabilities = 0.0857
     direct_flow = {
-        "totalRfqRate": vals[0],
-        "rfqSizes": direct_rfq_sizes,
-        "rfqProbabilities": direct_rfq_probabilities,
+        "A0": vals[0],
+        "theta": direct_rfq_sizes,
+        "beta": direct_rfq_probabilities,
         "steepness": vals[3], "shift": vals[4], "volumeShift": vals[5],
     }
 
@@ -2448,17 +2424,17 @@ def populate_flow_source_cross_mid(cross_pair):
 @app.callback(
     Output("extra-flow-sources-store", "data"),
     Output("flow-source-selected-store", "data", allow_duplicate=True),
-    Output("t0-rfq-rate", "value"), Output("t0-rfq-sizes", "value"), Output("t0-rfq-probs", "value"), Output("t0-steep", "value"), Output("t0-shift", "value"), Output("t0-vshift", "value"),
-    Output("t1-rfq-rate", "value"), Output("t1-rfq-sizes", "value"), Output("t1-rfq-probs", "value"), Output("t1-steep", "value"), Output("t1-shift", "value"), Output("t1-vshift", "value"),
-    Output("t2-rfq-rate", "value"), Output("t2-rfq-sizes", "value"), Output("t2-rfq-probs", "value"), Output("t2-steep", "value"), Output("t2-shift", "value"), Output("t2-vshift", "value"),
+    Output("t0-a0", "value"), Output("t0-theta", "value"), Output("t0-beta", "value"), Output("t0-steep", "value"), Output("t0-shift", "value"), Output("t0-vshift", "value"),
+    Output("t1-a0", "value"), Output("t1-theta", "value"), Output("t1-beta", "value"), Output("t1-steep", "value"), Output("t1-shift", "value"), Output("t1-vshift", "value"),
+    Output("t2-a0", "value"), Output("t2-theta", "value"), Output("t2-beta", "value"), Output("t2-steep", "value"), Output("t2-shift", "value"), Output("t2-vshift", "value"),
     Input("flow-source-add", "n_clicks"),
     Input("flow-source-remove-selected", "n_clicks", allow_optional=True),
     Input("flow-edit-pair", "value", allow_optional=True), Input("flow-edit-cross-pair", "value", allow_optional=True),
     Input("flow-edit-cross-mid", "value", allow_optional=True),
-    Input("flow-edit-rfq-rate", "value", allow_optional=True), Input("flow-edit-rfq-sizes", "value", allow_optional=True), Input("flow-edit-rfq-probs", "value", allow_optional=True),
+    Input("flow-edit-a0", "value", allow_optional=True), Input("flow-edit-theta", "value", allow_optional=True), Input("flow-edit-beta", "value", allow_optional=True),
     Input("flow-edit-steep", "value", allow_optional=True), Input("flow-edit-shift", "value", allow_optional=True), Input("flow-edit-vshift", "value", allow_optional=True),
     State("flow-source-tier-store", "data"), State("flow-target-pair", "value"), State("flow-source-selected-store", "data"), State("extra-flow-sources-store", "data"),
-    *[State(f"t{i}-{suffix}", "value") for i in range(3) for suffix in ("rfq-rate", "rfq-sizes", "rfq-probs", "steep", "shift", "vshift")],
+    *[State(f"t{i}-{suffix}", "value") for i in range(3) for suffix in ("a0", "theta", "beta", "steep", "shift", "vshift")],
     prevent_initial_call=True,
 )
 def update_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, rfq_rate, rfq_sizes, rfq_probs, steep, shift, vshift,
@@ -2483,9 +2459,9 @@ def update_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, rfq_ra
         current = direct[offset:offset + 6]
         try:
             template_flow = {
-                "totalRfqRate": float(current[0]),
-                "rfqSizes": parse_numbers(current[1]),
-                "rfqProbabilities": parse_numbers(current[2]),
+                "A0": float(current[0]),
+                "theta": float(current[1]),
+                "beta": float(current[2]),
                 "steepness": float(current[3]),
                 "shift": float(current[4]),
                 "volumeShift": float(current[5]),
@@ -2511,7 +2487,7 @@ def update_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, rfq_ra
     if selected == "direct":
         if all(x is not None for x in (rfq_rate, rfq_sizes, rfq_probs, steep, shift, vshift)):
             offset = ti * 6
-            direct[offset:offset + 6] = [float(rfq_rate), str(rfq_sizes), str(rfq_probs), float(steep), float(shift), float(vshift)]
+            direct[offset:offset + 6] = [float(rfq_rate), float(rfq_sizes), float(rfq_probs), float(steep), float(shift), float(vshift)]
         return out, no_update, *direct
 
     if selected.startswith("extra-"):
@@ -2534,14 +2510,14 @@ def update_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, rfq_ra
                 raise ValueError(f"No default mid available for cross {chosen_cross}")
             if chosen_mid is not None and chosen_mid <= 0.0:
                 raise ValueError("Cross mid must be positive")
-            parsed_sizes = parse_numbers(rfq_sizes)
-            parsed_probabilities = parse_numbers(rfq_probs)
+            parsed_sizes = float(rfq_sizes)
+            parsed_probabilities = float(rfq_probs)
             src.update({"name": chosen_pair or "Select FX pair", "pair": chosen_pair, "crossPair": chosen_cross})
             src["mapping"] = {"type": "crossed", "crossMid": chosen_mid}
             src["flow"] = {
-                "totalRfqRate": float(rfq_rate),
-                "rfqSizes": parsed_sizes,
-                "rfqProbabilities": parsed_probabilities,
+                "A0": float(rfq_rate),
+                "theta": parsed_sizes,
+                "beta": parsed_probabilities,
                 "steepness": float(steep), "shift": float(shift), "volumeShift": float(vshift),
             }
         return out, no_update, *direct
@@ -2556,7 +2532,7 @@ def update_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, rfq_ra
     Output("flow-source-markout-chart", "figure"),
     Input("flow-source-selected-store", "data"),
     Input("flow-edit-pair", "value", allow_optional=True), Input("flow-edit-cross-mid", "value", allow_optional=True),
-    Input("flow-edit-rfq-rate", "value", allow_optional=True), Input("flow-edit-rfq-sizes", "value", allow_optional=True), Input("flow-edit-rfq-probs", "value", allow_optional=True),
+    Input("flow-edit-a0", "value", allow_optional=True), Input("flow-edit-theta", "value", allow_optional=True), Input("flow-edit-beta", "value", allow_optional=True),
     Input("flow-edit-steep", "value", allow_optional=True), Input("flow-edit-shift", "value", allow_optional=True), Input("flow-edit-vshift", "value", allow_optional=True),
     Input("spread", "value"), Input("flow-source-tier-store", "data"),
     Input("t0-markout-enabled", "value"), Input("t0-markout-level", "value"), Input("t0-markout-tau", "value"),
@@ -2578,16 +2554,16 @@ def render_selected_flow_source_diagnostics(selected, pair, cross_mid, rfq_rate,
                 "type": "crossed", "crossMid": float(cross_mid) if cross_mid is not None else 1.0,
             },
             "flow": {
-                "totalRfqRate": float(rfq_rate),
-                "rfqSizes": parse_numbers(rfq_sizes),
-                "rfqProbabilities": parse_numbers(rfq_probs),
+                "A0": float(rfq_rate),
+                "theta": float(rfq_sizes),
+                "beta": float(rfq_probs),
                 "steepness": float(steep), "shift": float(shift), "volumeShift": float(vshift),
             },
         }
         dist_fig = flow_source_distribution_figure(source)
         hit_fig = flow_source_hit_ratio_figure(source, float(spread_pips or 0.0))
     except Exception as exc:
-        dist_fig = _empty_diagnostic_figure(f"RFQ distribution unavailable · {exc}", f"RFQ size distribution · {label}")
+        dist_fig = _empty_diagnostic_figure(f"RFQ intensity unavailable · {exc}", f"RFQ intensity · {label}")
         hit_fig = _empty_diagnostic_figure(f"Hit ratios unavailable · {exc}", f"Hit ratios · {label}")
 
     markouts = [
@@ -2898,7 +2874,7 @@ def solve_model(_clicks, *values):
                     source_pair = source.get("pair")
                     if not source_pair:
                         raise ValueError("Select an FX pair for every flow source")
-                    _validate_explicit_rfq_flow(source.get("flow", {}), f"Flow source {source_pair}")
+                    _validate_rfq_curve(source.get("flow", {}), f"Flow source {source_pair}")
                     source_legs = _pair_legs(source_pair)
                     if not source_legs or not target_legs or source_legs[1] != target_legs[1]:
                         raise ValueError(f"Flow source {source_pair} must share the quote currency of target pair {target_pair}")

@@ -130,35 +130,61 @@ FXMapping build_fx_mapping(const py::dict& source) {
     throw std::invalid_argument("flow source mapping type must be identity, crossed, or affine");
 }
 
-DiscreteRfqDistribution configured_rfq_distribution(const py::dict& flow) {
-    if (!flow.contains(py::str("totalRfqRate")) ||
-        !flow.contains(py::str("rfqSizes")) ||
-        !flow.contains(py::str("rfqProbabilities"))) {
-        throw std::invalid_argument(
-            "RFQ source requires totalRfqRate, rfqSizes, and rfqProbabilities; legacy A0/theta/beta is no longer supported");
+// Historical calibrated one-sided RFQ intensity, evaluated ONLY at pricing knots.
+// This distribution is an internal event sampler; no RFQ PMF is configured.
+DiscreteRfqDistribution configured_rfq_distribution(
+        const py::dict& flow, const std::vector<double>& pricing_knots,
+        const FXMapping& mapping) {
+    const double a0 = number(flow, "A0");
+    const double theta = number(flow, "theta");
+    const double beta = number(flow, "beta");
+    if (!std::isfinite(a0) || a0 < 0.0 || !std::isfinite(theta) || theta < 0.0 ||
+        !std::isfinite(beta) || beta < 0.0)
+        throw std::invalid_argument("A0, theta and beta must be finite and nonnegative");
+    if (pricing_knots.empty())
+        throw std::invalid_argument("RFQ pricing knots must not be empty");
+    std::vector<double> source_sizes;
+    std::vector<double> rates;
+    double one_side_total = 0.0;
+    for (const double z : pricing_knots) {
+        const double source_z = mapping.source_size(z);
+        const double rate = a0 * std::pow(source_z, -theta - beta * source_z);
+        if (!std::isfinite(rate) || rate < 0.0)
+            throw std::invalid_argument("nonfinite RFQ lambda(z) at pricing knot");
+        source_sizes.push_back(source_z);
+        rates.push_back(rate);
+        one_side_total += rate;
     }
-    return DiscreteRfqDistribution(
-        number(flow, "totalRfqRate"),
-        numbers(flow[py::str("rfqSizes")]),
-        numbers(flow[py::str("rfqProbabilities")]));
+    // Zero-flow sources remain valid, with all event weights zero.
+    std::vector<double> probabilities(rates.size(), 0.0);
+    if (one_side_total > 0.0) {
+        for (std::size_t i = 0; i < rates.size(); ++i)
+            probabilities[i] = rates[i] / one_side_total;
+    } else {
+        probabilities[0] = 1.0;
+    }
+    return DiscreteRfqDistribution(2.0 * one_side_total,
+                                    std::move(source_sizes), std::move(probabilities));
 }
 
 FlowSource build_flow_source(const std::string& name, const py::dict& flow,
+                             const std::vector<double>& pricing_knots,
                              FXMapping mapping) {
-    return FlowSource(
-        name, configured_rfq_distribution(flow),
+    auto distribution = configured_rfq_distribution(flow, pricing_knots, mapping);
+    return FlowSource(name, std::move(distribution),
         LogisticWinProbability(number(flow, "shift"), number(flow, "steepness"),
                                number(flow, "volumeShift")),
         std::move(mapping));
 }
 
 AggregatedFlow build_tier_flow(const py::dict& tier) {
+    const auto pricing_knots = numbers(tier[py::str("sizes")]);
     const py::str sources_key("flowSources");
     if (!tier.contains(sources_key)) {
         const py::dict flow = py::cast<py::dict>(tier[py::str("flow")]);
         std::vector<FlowSource> direct;
         direct.push_back(build_flow_source(
-            "direct", flow, FXMapping{}));
+            "direct", flow, pricing_knots, FXMapping{}));
         return AggregatedFlow(std::move(direct));
     }
 
@@ -171,7 +197,7 @@ AggregatedFlow build_tier_flow(const py::dict& tier) {
         const std::string name = source.contains(py::str("name"))
             ? text(source, "name") : std::string("source");
 
-        sources.push_back(build_flow_source(name, flow, build_fx_mapping(source)));
+        sources.push_back(build_flow_source(name, flow, pricing_knots, build_fx_mapping(source)));
     }
     return AggregatedFlow(std::move(sources));
 }
