@@ -8,6 +8,7 @@ sources = [
     "cpp/src/matrix.cpp",
     "cpp/src/core.cpp",
     "cpp/src/howard.cpp",
+    "cpp/src/expected_mtm.cpp",
     "cpp/src/analytics.cpp",
     "cpp/src/simulation.cpp",
 ]

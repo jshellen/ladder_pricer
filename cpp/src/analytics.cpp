@@ -167,14 +167,24 @@ PnlStatistics PnlAnalytics::statistics(double horizon, double sigma, double q0) 
             for(Side side:{Side::Bid,Side::Ask}){
                 const double dir=direction(side); const auto& deltas=row(policy,side,i);
                 for(double z:tier.rfq_sizes()){
-                    if(!problem_.grid().admissible(q,dir*z)) continue;
+                    // MC generates information shocks for every exogenous RFQ,
+                    // whether we win it or not, and even at the inventory cap.
+                    const double lambda=tier.flow().rfq_arrival_rate(z);
+                    const bool admissible=problem_.grid().admissible(q,dir*z);
                     const double delta=interpolate_size_row(tier.sizes(),deltas,z);
-                    const double rate=tier.flow().arrival_rate(delta,z);
-                    if(rate<=0.0) continue;
-                    std::vector<double> shift(nvars,0.0);
-                    shift[static_cast<std::size_t>(pnlvar)]=z*(problem_.spread()*(0.5-delta)-tier.fee());
-                    if(tier.use_markout()) shift[static_cast<std::size_t>(tau_to_var[tier.markout().tau_minutes()])]=-dir*tier.markout().asymptotic();
-                    events.push_back({q+dir*z,rate,std::move(shift)});
+                    const double rate=admissible?tier.flow().arrival_rate(delta,z):0.0;
+                    const double lost_rate=std::max(0.0,lambda-rate);
+                    if(rate>0.0){
+                        std::vector<double> shift(nvars,0.0);
+                        shift[static_cast<std::size_t>(pnlvar)]=z*(problem_.spread()*(0.5-delta)-tier.fee());
+                        if(tier.use_markout()) shift[static_cast<std::size_t>(tau_to_var[tier.markout().tau_minutes()])]=-dir*tier.markout().asymptotic();
+                        events.push_back({q+dir*z,rate,std::move(shift)});
+                    }
+                    if(lost_rate>0.0 && tier.use_markout()){
+                        std::vector<double> shift(nvars,0.0);
+                        shift[static_cast<std::size_t>(tau_to_var[tier.markout().tau_minutes()])]=-dir*tier.markout().asymptotic();
+                        events.push_back({q,lost_rate,std::move(shift)});
+                    }
                 }
             }
         }

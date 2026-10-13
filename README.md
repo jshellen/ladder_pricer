@@ -44,8 +44,9 @@ inside `config["tiers"][i]["markout"]`:
 curve is **independent of RFQ size within that tier**. Its existing `useMarkout`
 toggle still enables/disables that tier's markout.
 
-All three tiers initially use the *same* old empirical defaults (`-50.8 EUR/M`,
-`36.7 seconds`) for backward-compatible baseline results. Configure different
+All three tiers initially use the same empirical defaults (`-50.8 EUR/M`,
+`36.7 seconds`) for a common starting calibration. The optimized policies
+will differ from the previous fixed-internalization-time reward model. Configure different
 values in **Pricing tiers → Tier N → RFQ markout**. The tier diagnostics chart
 plots the selected tier's curve and overlays other enabled tiers as dashed lines.
 
@@ -56,11 +57,76 @@ customer sell a downward price impact, as before. Each native Tier owns its
 own `SaturatingMarkout`, and the existing HJB, Monte Carlo and analytical PnL
 code use each tier's curve. `tau_seconds_i` is converted into minutes for C++.
 
-**Intentionally unchanged:** The HJB still evaluates markout at its old
-exogenous `internalization(q_next)` horizon and charges the trade-size-weighted
-reward approximation. It does **not yet** use the proposed policy-dependent
-whole-inventory expected MTM. The existing MC and analytical PnL event handling
-is also unchanged. No new markout dependence on RFQ size was added.
+### Policy-dependent expected MTM (active C++ solver)
+
+The HJB no longer uses `tau0/tau1/tau2` as a proxy for the post-trade
+markout holding period. Those input fields remain visible only as a clearly
+labelled **legacy/inactive** diagnostic; they have no effect on the HJB policy.
+
+For every fixed policy π the combined RFQ, ECN and dark-pool inventory
+transition generator is G^π. For each distinct tier markout time constant τ,
+we solve the resolvent:
+
+```text
+(I - τ G^π) u_τ = q_grid.
+```
+
+Here `u_τ(q) = E_q[Q_E]` for an independent exponentially distributed time
+E with mean τ. In particular, this incorporates *all future inventory fills*
+without estimating an exogenous average internalization time or adding a new
+HJB state variable.
+
+Using dealer inventory direction `d = +1` for a customer SELL (dealer BID)
+and `d = -1` for a customer BUY (dealer ASK), the gross expected MTM of a
+won RFQ after changing inventory q -> q+d*z is
+
+```text
+MTM_gross = -d * M_inf_tier * u_τ(q+d*z)
+```
+
+where M_inf_tier >= 0 is the native, positive adverse price-change magnitude.
+Gross MTM is in *millions of quote currency*. It can be positive when the
+client's directional markout helps an existing position that remains after
+a risk-reducing fill. The public solve output converts this to EUR/event
+using 1e6/spot.
+
+**Critical comparison: the price moves even when we LOSE an RFQ.** As with
+Monte Carlo, an unfilled customer RFQ affects the market price but does not
+change inventory. The native model assumes exogenous buys/sells arrive with
+identical intensities, so the two unfilled baseline price shifts cancel in
+expectation. Therefore the reward improvement from *winning instead of
+losing* a specific RFQ is
+
+```text
+MTM_increment = -d * M_inf_tier * [u_τ(q+d*z) - u_τ(q)].
+```
+
+That is the term entering the quote Hamiltonian and expected HJB reward;
+`MTM_gross` is **not** subtracted once again or multiplied by z. Otherwise
+the model would double-charge the same information shock or ignore lost
+RFQs. In `solution["expectedMtm"]`, both arrays appear for every active tier,
+RFQ pricing size, inventory state, and bid/ask direction: `grossBidEur`,
+`grossAskEur`, `incrementalBidEur`, and `incrementalAskEur`.
+The dashboard plots gross/incremental effects for the available pricing size
+nearest 5M, in the tier diagnostics.
+
+**Policy-dependent optimization:** For a FIXED policy the resolvent and
+average reward are exact for this model. Since the incremental MTM also
+depends on future policies, ordinary Howard improvement is NOT the exact
+global optimizer of the policy-dependent objective. The C++ solver now uses
+a damped, actual-reward-checked best-response iteration: after a proposed
+policy it recomputes the entire generator, MTM and average reward; if the
+proposal worsens actual average reward it also tests conservative RFQ ladder
+interpolations, retaining only improving candidates. `converged` means this
+local improvement search settled or policy changes reached tolerance, **not**
+that a global mathematical optimum has been proven. Do not treat the old
+Bellman residual as an optimality bound in this new policy-dependent model.
+
+Monte Carlo already simulated information shocks from all requests. The
+analytical PnL moments have been made consistent: both won AND lost RFQs
+now contribute impact shocks, and only won RFQs alter cash/inventory.
+The HJB still uses the configured pricing knots rather than the complete
+interpolated RFQ size support (a previously known approximation).
 
 The `python_reference/` directory is a legacy independent implementation and
 is not the active C++ solver; its historical markout representation and
@@ -523,15 +589,28 @@ large q=0 curvature spike at an asymptotic markout of -50 EUR per EUR 1M,
 ECN disabled, gamma=1. The test fails before the fix and passes afterwards,
 and also checks both sides' cross-inventory ladder constraints.
 
-**Scope:** Markout calibration, the exogenous internalization-time function,
-HJB reward definitions, Monte Carlo and the expected-MTM calculation are
-unchanged. This fix addresses the demonstrated numerical instability; it
-does not establish global optimality for all constrained policies.
+**Historical note:** At the time of this stability fix the HJB still used
+the old markout reward; the policy-dependent expected-MTM model was added
+subsequently. The original ladder neighbor update remains in place.
 
 ## Per-tier markout configuration (2026-10-13)
 
 - Removed the obsolete top-level `config["markout"]` and the global markout sidebar panel.
 - Each tier now has `markout: {asymptoticEurPerMillion: ..., tauSeconds: ...}`.
 - Updated Dash callbacks, native C++ binding conversion, the selected-tier chart,
-  and configuration/regression tests. The solver's numerical core is unchanged.
+  and configuration/regression tests. Expected MTM was added subsequently.
 - The earlier Gauss–Seidel-style policy-improvement stability fix remains intact.
+
+## Validation of the expected-MTM update (2026-10-13)
+
+- New `cpp/tests/test_expected_mtm.cpp` checks the resolvent against an exact
+  Markov-chain solution, both trade directions, gross-vs-incremental MTM, and
+  independence from the legacy `tau0/tau1/tau2` inputs.
+- Existing Howard/ladder/analytics/simulation tests still pass in debug mode.
+- Closed-form PnL and Monte Carlo use matching RFQ-impact conventions. In
+  the included simulation regression case, their expected PnL outputs are
+  approximately 6,821 EUR and 6,850 EUR, respectively.
+- 42 Python tests pass with the current native extension; Python/native schema
+  is bumped to 3 and `run_dash.sh` rebuilds incompatible binaries.
+- Dash syntax is checked, but a live Dash server was not run in the build
+  environment, where Dash was unavailable.

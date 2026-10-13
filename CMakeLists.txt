@@ -9,6 +9,7 @@ add_library(ladder_pricer_core STATIC
     cpp/src/matrix.cpp
     cpp/src/core.cpp
     cpp/src/howard.cpp
+    cpp/src/expected_mtm.cpp
     cpp/src/analytics.cpp
     cpp/src/simulation.cpp
 )
@@ -25,6 +26,9 @@ if(TRINITY_BUILD_TESTS)
 
     add_executable(test_policy_improvement_regression cpp/tests/test_policy_improvement_regression.cpp)
     target_link_libraries(test_policy_improvement_regression PRIVATE ladder_pricer_core)
+
+    add_executable(test_expected_mtm cpp/tests/test_expected_mtm.cpp)
+    target_link_libraries(test_expected_mtm PRIVATE ladder_pricer_core)
 
     add_executable(test_simulation cpp/tests/test_simulation.cpp)
     target_link_libraries(test_simulation PRIVATE ladder_pricer_core)

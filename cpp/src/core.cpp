@@ -1,4 +1,5 @@
 #include "ladder_pricer/core.hpp"
+#include "ladder_pricer/expected_mtm.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -874,11 +875,11 @@ std::pair<double, double> PolicyBuilder::rung_bounds(const Tier& tier,
     return {lower, upper};
 }
 
-std::vector<double> PolicyBuilder::build_ladder(const Tier& tier,
+std::vector<double> PolicyBuilder::build_ladder(const Tier& tier, std::size_t tier_index,
                                                 const std::vector<double>& value,
                                                 double inventory,
                                                 Side side,
-                                                const LadderBounds& bounds) const {
+                                                const LadderBounds& bounds, const ExpectedMtm* mtm) const {
     const auto& grid = problem_.grid();
     const double hq = grid.interpolate(value, inventory);
     std::vector<double> row;
@@ -894,10 +895,10 @@ std::vector<double> PolicyBuilder::build_ladder(const Tier& tier,
         }
 
         const double q_next = inventory + dq;
-        const double markout = tier.use_markout()
-            ? tier.markout().expected(problem_.internalization_time().value(q_next))
+        const double impact = mtm
+            ? mtm->win_increment(tier_index, direction(side), inventory, q_next)
             : 0.0;
-        const double additive = -z * (markout + tier.fee()) + grid.interpolate(value, q_next) - hq;
+        const double additive = -z * tier.fee() + impact + grid.interpolate(value, q_next) - hq;
         const double unconstrained = tier.flow().optimal_delta(
             z, problem_.spread(), additive, lower, upper);
         row.push_back(std::clamp(unconstrained, lower, upper));
@@ -917,10 +918,10 @@ std::vector<double> PolicyBuilder::project_ladder(const Tier& tier,
     return out;
 }
 
-double PolicyBuilder::ladder_hamiltonian(const Tier& tier,
+double PolicyBuilder::ladder_hamiltonian(const Tier& tier, std::size_t tier_index,
                                           const std::vector<double>& value,
                                           double inventory, Side side,
-                                          const std::vector<double>& row_values) const {
+                                          const std::vector<double>& row_values, const ExpectedMtm& mtm) const {
     const auto& grid = problem_.grid();
     const double dir = direction(side);
     const double hq = grid.interpolate(value, inventory);
@@ -929,27 +930,26 @@ double PolicyBuilder::ladder_hamiltonian(const Tier& tier,
         const double z = tier.sizes()[j];
         if (!grid.admissible(inventory, dir * z)) continue;
         const double q_next = inventory + dir * z;
-        const double markout = tier.use_markout()
-            ? tier.markout().expected(problem_.internalization_time().value(q_next))
-            : 0.0;
+        const double impact = mtm.win_increment(tier_index, direction(side), inventory, q_next);
         const double delta = row_values[j];
         const double rate = tier.flow().arrival_rate(delta, z);
         total += rate * (z * (problem_.spread() * (0.5 - delta) - tier.fee())
-                         - z * markout
+                         + impact
                          + grid.interpolate(value, q_next) - hq);
     }
     return total;
 }
 
 std::vector<double> PolicyBuilder::choose_howard_safe(
-        const Tier& tier, const std::vector<double>& value,
+        const Tier& tier, std::size_t tier_index, const std::vector<double>& value,
         double inventory, Side side,
         const std::vector<double>& current,
         const std::vector<double>& candidate,
+        const ExpectedMtm& mtm,
         const LadderBounds& bounds) const {
     const auto baseline = project_ladder(tier, current, bounds);
-    return ladder_hamiltonian(tier, value, inventory, side, candidate)
-            >= ladder_hamiltonian(tier, value, inventory, side, baseline)
+    return ladder_hamiltonian(tier, tier_index, value, inventory, side, candidate, mtm)
+            >= ladder_hamiltonian(tier, tier_index, value, inventory, side, baseline, mtm)
         ? candidate : baseline;
 }
 
@@ -960,15 +960,16 @@ Policy PolicyBuilder::initial_policy() const {
 
     Policy policy;
     policy.tiers.reserve(problem_.tiers().size());
-    for (const auto& tier : problem_.tiers()) {
+    for (std::size_t k = 0; k < problem_.tiers().size(); ++k) {
+        const auto& tier = problem_.tiers()[k];
         LadderPolicy p;
         p.q_grid = q_grid;
         p.sizes = tier.sizes();
         p.bid.assign(q_grid.size(), std::vector<double>(tier.sizes().size(), 0.0));
         p.ask.assign(q_grid.size(), std::vector<double>(tier.sizes().size(), 0.0));
 
-        const auto zero_bid = build_ladder(tier, zero, 0.0, Side::Bid);
-        const auto zero_ask = build_ladder(tier, zero, 0.0, Side::Ask);
+        const auto zero_bid = build_ladder(tier, k, zero, 0.0, Side::Bid);
+        const auto zero_ask = build_ladder(tier, k, zero, 0.0, Side::Ask);
 
         auto defensive = [&tier](const std::vector<double>& row) {
             std::vector<double> out = row;
@@ -1129,7 +1130,8 @@ PassiveECNPolicy PolicyBuilder::improve_passive_ecn(const std::vector<double>& v
     return policy;
 }
 
-Policy PolicyBuilder::improve(const std::vector<double>& value, const Policy& previous) const {
+Policy PolicyBuilder::improve(const std::vector<double>& value, const Policy& previous,
+                              const ExpectedMtm& mtm) const {
     require(previous.tiers.size() == problem_.tiers().size(), "policy tier count mismatch");
     const auto& q_grid = problem_.grid().states();
     const std::size_t q0 = problem_.grid().zero_index();
@@ -1143,16 +1145,16 @@ Policy PolicyBuilder::improve(const std::vector<double>& value, const Policy& pr
 
         for (Side side : {Side::Bid, Side::Ask}) {
             {
-                const auto candidate = build_ladder(tier, value, q_grid[q0], side);
+                const auto candidate = build_ladder(tier, k, value, q_grid[q0], side, {}, &mtm);
                 matrix(out, side, q0) = choose_howard_safe(
-                    tier, value, q_grid[q0], side, matrix(old, side, q0), candidate);
+                    tier, k, value, q_grid[q0], side, matrix(old, side, q0), candidate, mtm);
             }
 
             for (std::size_t i = q0 + 1; i < q_grid.size(); ++i) {
                 if (q_grid[i] > q_operational + kTolerance) {
-                    const auto candidate = build_ladder(tier, value, q_grid[i], side);
+                    const auto candidate = build_ladder(tier, k, value, q_grid[i], side, {}, &mtm);
                     matrix(out, side, i) = choose_howard_safe(
-                        tier, value, q_grid[i], side, matrix(old, side, i), candidate);
+                        tier, k, value, q_grid[i], side, matrix(old, side, i), candidate, mtm);
                     continue;
                 }
                 // Use already-improved inner neighbor: outward sweep keeps ladder
@@ -1167,18 +1169,18 @@ Policy PolicyBuilder::improve(const std::vector<double>& value, const Policy& pr
                     bounds.lower = inner;
                 }
                 {
-                    const auto candidate = build_ladder(tier, value, q_grid[i], side, bounds);
+                    const auto candidate = build_ladder(tier, k, value, q_grid[i], side, bounds, &mtm);
                     matrix(out, side, i) = choose_howard_safe(
-                        tier, value, q_grid[i], side, matrix(old, side, i), candidate, bounds);
+                        tier, k, value, q_grid[i], side, matrix(old, side, i), candidate, mtm, bounds);
                 }
             }
 
             for (std::size_t offset = 1; offset <= q0; ++offset) {
                 const std::size_t i = q0 - offset;
                 if (q_grid[i] < -q_operational - kTolerance) {
-                    const auto candidate = build_ladder(tier, value, q_grid[i], side);
+                    const auto candidate = build_ladder(tier, k, value, q_grid[i], side, {}, &mtm);
                     matrix(out, side, i) = choose_howard_safe(
-                        tier, value, q_grid[i], side, matrix(old, side, i), candidate);
+                        tier, k, value, q_grid[i], side, matrix(old, side, i), candidate, mtm);
                     continue;
                 }
                 // Mirror the same-iteration Gauss-Seidel update on negative q.
@@ -1192,9 +1194,9 @@ Policy PolicyBuilder::improve(const std::vector<double>& value, const Policy& pr
                     bounds.upper = inner;
                 }
                 {
-                    const auto candidate = build_ladder(tier, value, q_grid[i], side, bounds);
+                    const auto candidate = build_ladder(tier, k, value, q_grid[i], side, bounds, &mtm);
                     matrix(out, side, i) = choose_howard_safe(
-                        tier, value, q_grid[i], side, matrix(old, side, i), candidate, bounds);
+                        tier, k, value, q_grid[i], side, matrix(old, side, i), candidate, mtm, bounds);
                 }
             }
         }
@@ -1253,7 +1255,8 @@ Policy PolicyBuilder::snap_operational_constraints(const Policy& policy) const {
 // Bellman operator
 // ---------------------------------------------------------------------------
 
-std::vector<double> BellmanModel::rhs(const std::vector<double>& value, const Policy& policy) const {
+std::vector<double> BellmanModel::rhs(const std::vector<double>& value, const Policy& policy,
+                                      const ExpectedMtm& mtm) const {
     const auto& grid = problem_.grid();
     const auto& q_grid = grid.states();
     require(value.size() == q_grid.size(), "value vector does not match solve inventory grid");
@@ -1279,11 +1282,11 @@ std::vector<double> BellmanModel::rhs(const std::vector<double>& value, const Po
                     const double delta = row[j];
                     const double rate = tier.flow().arrival_rate(delta, z);
                     const double q_next = q + dq;
-                    const double markout = tier.use_markout()
-                        ? tier.markout().expected(problem_.internalization_time().value(q_next))
-                        : 0.0;
+                    // The shock occurs even for a lost RFQ. Symmetric exogenous
+                    // buy/sell flow cancels the unfilled baseline in expectation.
+                    const double impact = mtm.win_increment(k, direction(side), q, q_next);
                     const double fill_value = z * (problem_.spread() * (0.5 - delta) - tier.fee())
-                                            - z * markout
+                                            + impact
                                             + grid.interpolate(value, q_next) - hq;
                     total += rate * fill_value;
                 }

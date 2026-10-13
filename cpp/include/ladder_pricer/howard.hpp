@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ladder_pricer/core.hpp"
+#include "ladder_pricer/expected_mtm.hpp"
 #include "ladder_pricer/matrix.hpp"
 
 namespace ladder_pricer {
@@ -19,7 +20,12 @@ private:
     };
 
     AffineOperator fixed_policy_operator(const Policy& policy) const;
-    std::pair<std::vector<double>, double> evaluate_policy(const Policy& policy) const;
+    struct PolicyEvaluation {
+        std::vector<double> value;
+        double average_reward;
+        ExpectedMtm mtm;
+    };
+    PolicyEvaluation evaluate_policy(const Policy& policy) const;
 
     static double policy_change(const Policy& lhs, const Policy& rhs);
     static double policy_scale(const Policy& policy);

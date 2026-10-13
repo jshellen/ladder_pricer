@@ -443,6 +443,10 @@ struct Solution {
 
     // Full hidden-grid policies are retained for simulation and diagnostics.
     std::vector<LadderPolicy> solve_tier_policies;
+    // Expected gross MTM of won RFQs and incremental won-vs-lost MTM.
+    // Values are in millions of quote currency; pybind converts to EUR.
+    std::vector<LadderPolicy> gross_mtm_tiers;
+    std::vector<LadderPolicy> incremental_mtm_tiers;
     std::optional<DarkPoolPolicy> solve_dark_pool_policy;
     std::optional<PassiveECNPolicy> solve_passive_ecn_policy;
     double average_reward = 0.0;
@@ -450,11 +454,14 @@ struct Solution {
     SolverDiagnostics diagnostics;
 };
 
+class ExpectedMtm;
+
 class BellmanModel {
 public:
     explicit BellmanModel(const PricingProblem& problem) : problem_(problem) {}
 
-    std::vector<double> rhs(const std::vector<double>& value, const Policy& policy) const;
+    std::vector<double> rhs(const std::vector<double>& value, const Policy& policy,
+                            const ExpectedMtm& mtm) const;
 
 private:
     const PricingProblem& problem_;
@@ -465,7 +472,8 @@ public:
     explicit PolicyBuilder(const PricingProblem& problem) : problem_(problem) {}
 
     Policy initial_policy() const;
-    Policy improve(const std::vector<double>& value, const Policy& previous) const;
+    Policy improve(const std::vector<double>& value, const Policy& previous,
+                   const ExpectedMtm& mtm) const;
     Policy snap_operational_constraints(const Policy& policy) const;
 
 private:
@@ -476,22 +484,25 @@ private:
         std::vector<double> upper;
     };
 
-    std::vector<double> build_ladder(const Tier& tier,
+    std::vector<double> build_ladder(const Tier& tier, std::size_t tier_index,
                                      const std::vector<double>& value,
                                      double inventory,
                                      Side side,
-                                     const LadderBounds& bounds = {}) const;
+                                     const LadderBounds& bounds = {},
+                                     const ExpectedMtm* mtm = nullptr) const;
     std::vector<double> project_ladder(const Tier& tier,
                                        const std::vector<double>& row,
                                        const LadderBounds& bounds) const;
-    double ladder_hamiltonian(const Tier& tier, const std::vector<double>& value,
+    double ladder_hamiltonian(const Tier& tier, std::size_t tier_index,
+                              const std::vector<double>& value,
                               double inventory, Side side,
-                              const std::vector<double>& row) const;
-    std::vector<double> choose_howard_safe(const Tier& tier,
+                              const std::vector<double>& row, const ExpectedMtm& mtm) const;
+    std::vector<double> choose_howard_safe(const Tier& tier, std::size_t tier_index,
                                            const std::vector<double>& value,
                                            double inventory, Side side,
                                            const std::vector<double>& current,
                                            const std::vector<double>& candidate,
+                                           const ExpectedMtm& mtm,
                                            const LadderBounds& bounds = {}) const;
     std::pair<double, double> rung_bounds(const Tier& tier,
                                          std::size_t rung,
@@ -502,6 +513,7 @@ private:
     PassiveECNPolicy improve_passive_ecn(const std::vector<double>& value) const;
 
     const PricingProblem& problem_;
+
 };
 
 

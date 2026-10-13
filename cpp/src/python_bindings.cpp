@@ -314,7 +314,7 @@ py::list matrix_value(const std::vector<std::vector<double>>& matrix) {
     return rows;
 }
 
-py::dict solution_value(const Solution& solution, const PricingProblem& problem) {
+py::dict solution_value(const Solution& solution, const PricingProblem& problem, double reference_spot) {
     py::dict out;
     out["qGrid"] = solution.q_grid;
     out["value"] = solution.value;
@@ -337,6 +337,35 @@ py::dict solution_value(const Solution& solution, const PricingProblem& problem)
         tier_values.append(std::move(tier));
     }
     out["tiers"] = std::move(tier_values);
+    // Gross event MTM is the entire post-trade inventory exposure; the
+    // incremental (won-vs-lost) value is what enters the HJB reward.
+    py::list mtm_values;
+    for (std::size_t k = 0; k < solution.gross_mtm_tiers.size(); ++k) {
+        const auto& gross = solution.gross_mtm_tiers[k];
+        const auto& inc = solution.incremental_mtm_tiers[k];
+        const double factor = 1e6 / reference_spot;
+        const auto to_eur = [factor](const std::vector<std::vector<double>>& rows) {
+            py::list out_rows;
+            for (const auto& row : rows) {
+                std::vector<double> euros;
+                euros.reserve(row.size());
+                for (double v : row) euros.push_back(v * factor);
+                out_rows.append(euros);
+            }
+            return out_rows;
+        };
+        py::dict item;
+        item["name"] = problem.tiers()[k].name();
+        item["sizes"] = gross.sizes;
+        item["grossBidEur"] = to_eur(gross.bid);
+        item["grossAskEur"] = to_eur(gross.ask);
+        item["incrementalBidEur"] = to_eur(inc.bid);
+        item["incrementalAskEur"] = to_eur(inc.ask);
+        mtm_values.append(std::move(item));
+    }
+    out["expectedMtm"] = std::move(mtm_values);
+    out["expectedMtmUnits"] = "EUR per RFQ event (whole inventory MTM)";
+    out["optimizationMethod"] = "damped policy-dependent MTM best response";
 
     if (solution.dark_pool_policy && problem.dark_pool()) {
         const auto& policy = *solution.dark_pool_policy;
@@ -582,7 +611,7 @@ public:
             py::gil_scoped_release release;
             solution_ = HowardSolver(problem_).solve();
         }
-        return solution_value(*solution_, problem_);
+        return solution_value(*solution_, problem_, reference_spot_);
     }
 
     py::dict statistics(double horizon_minutes, double initial_inventory = 0.0) {
@@ -690,7 +719,7 @@ PYBIND11_MODULE(_native, module) {
     module.attr("ECN_PARAMETERIZATION_VERSION") = 10;
     // Increment whenever the Python -> native configuration schema changes.
     // Version 2 expects a separate markout object inside each RFQ tier.
-    module.attr("PRICING_CONFIG_SCHEMA_VERSION") = 2;
+    module.attr("PRICING_CONFIG_SCHEMA_VERSION") = 3;
     py::class_<ladder_pricer::python::Engine>(module, "Engine")
         .def(py::init<py::dict>())
         .def("solve", &ladder_pricer::python::Engine::solve)

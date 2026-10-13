@@ -166,10 +166,7 @@ HowardSolver::AffineOperator HowardSolver::fixed_policy_operator(const Policy& p
                     const double delta = deltas[j];
                     const double rate = tier.flow().arrival_rate(delta, z);
                     const double q_next = q + dq;
-                    const double markout = tier.use_markout()
-                        ? tier.markout().expected(problem_.internalization_time().value(q_next))
-                        : 0.0;
-                    op.reward[i] += rate * (z * (problem_.spread() * (0.5 - delta) - tier.fee()) - z * markout);
+                    op.reward[i] += rate * z * (problem_.spread() * (0.5 - delta) - tier.fee());
                     add_transition(op.generator, states, i, q_next, rate);
                 }
             }
@@ -218,12 +215,37 @@ HowardSolver::AffineOperator HowardSolver::fixed_policy_operator(const Policy& p
     return op;
 }
 
-std::pair<std::vector<double>, double> HowardSolver::evaluate_policy(const Policy& policy) const {
-    const auto op = fixed_policy_operator(policy);
+HowardSolver::PolicyEvaluation HowardSolver::evaluate_policy(const Policy& policy) const {
+    auto op = fixed_policy_operator(policy);
+    const ExpectedMtm mtm(problem_, op.generator);
+    const auto& states = problem_.grid().states();
     const std::size_t n = op.reward.size();
+
+    // A customer RFQ generates an information shock regardless of whether we
+    // win it (as in Monte Carlo). Symmetric, exogenous customer buy/sell flow
+    // has ZERO expected markout reward when we do not participate. Winning a
+    // request changes that baseline via inventory q -> q_next. Thus the only
+    // non-cancelling term is rate_win * [gross MTM(q_next) - gross MTM(q)].
+    for (std::size_t i = 0; i < n; ++i) {
+        const double q = states[i];
+        for (std::size_t k = 0; k < problem_.tiers().size(); ++k) {
+            const auto& tier = problem_.tiers()[k];
+            const auto& p = policy.tiers[k];
+            for (Side side : {Side::Bid, Side::Ask}) {
+                const double dir = direction(side);
+                const auto& deltas = row(p, side, i);
+                for (std::size_t j = 0; j < tier.sizes().size(); ++j) {
+                    const double z = tier.sizes()[j];
+                    if (!problem_.grid().admissible(q, dir * z)) continue;
+                    const double rate = tier.flow().arrival_rate(deltas[j], z);
+                    op.reward[i] += rate * mtm.win_increment(k, dir, q, q + dir * z);
+                }
+            }
+        }
+    }
+
     DenseMatrix A(n + 1, n + 1);
     std::vector<double> b(n + 1, 0.0);
-
     for (std::size_t i = 0; i < n; ++i) {
         for (std::size_t j = 0; j < n; ++j) A(i, j) = op.generator(i, j);
         A(i, n) = -1.0;
@@ -233,7 +255,7 @@ std::pair<std::vector<double>, double> HowardSolver::evaluate_policy(const Polic
 
     const auto x = A.solve(b);
     std::vector<double> h(x.begin(), x.begin() + static_cast<std::ptrdiff_t>(n));
-    return {std::move(h), x[n]};
+    return {std::move(h), x[n], mtm};
 }
 
 double HowardSolver::policy_change(const Policy& lhs, const Policy& rhs) {
@@ -283,12 +305,43 @@ Solution HowardSolver::solve() const {
     constexpr int kMaximumIterations = 256;
     for (int iteration = 1; iteration <= kMaximumIterations; ++iteration) {
         const auto h_previous = h;
-        std::tie(h, rho) = evaluate_policy(policy);
-        const Policy improved = builder.improve(h, policy);
-        const double p_change = policy_change(improved, policy);
-        policy = improved;
-
-        const auto rhs = bellman.rhs(h, policy);
+        const auto evaluation = evaluate_policy(policy);
+        h = evaluation.value;
+        rho = evaluation.average_reward;
+        const Policy improved = builder.improve(h, policy, evaluation.mtm);
+        // Because MTM depends on the entire future policy, the frozen-MTM
+        // Howard step is NOT guaranteed to improve the actual average reward.
+        // Verify against a full re-evaluation and backtrack continuous quote
+        // deltas if necessary. This is a monotone, damped best-response search,
+        // not a claim of global optimality of the q-only policy family.
+        double candidate_rho = evaluate_policy(improved).average_reward;
+        Policy accepted = improved;
+        constexpr double kRewardImprovementTol = 1e-12;
+        if (candidate_rho < rho + kRewardImprovementTol) {
+            // Blend customer pricing (feasible: the ladder constraints are
+            // linear). ECN/dark-pool activation choices are discrete and stay
+            // unchanged in these cautious trial steps.
+            for (double alpha : {0.5, 0.25, 0.125, 0.0625, 0.03125}) {
+                Policy trial = policy;
+                for (std::size_t k = 0; k < trial.tiers.size(); ++k) {
+                    for (std::size_t i = 0; i < trial.tiers[k].bid.size(); ++i) {
+                        for (std::size_t j = 0; j < trial.tiers[k].bid[i].size(); ++j) {
+                            trial.tiers[k].bid[i][j] += alpha * (improved.tiers[k].bid[i][j] - trial.tiers[k].bid[i][j]);
+                            trial.tiers[k].ask[i][j] += alpha * (improved.tiers[k].ask[i][j] - trial.tiers[k].ask[i][j]);
+                        }
+                    }
+                }
+                const double trial_rho = evaluate_policy(trial).average_reward;
+                if (trial_rho > candidate_rho) {
+                    candidate_rho = trial_rho;
+                    accepted = std::move(trial);
+                }
+            }
+        }
+        const bool reward_stalled = candidate_rho <= rho + kRewardImprovementTol;
+        const double p_change = reward_stalled ? 0.0 : policy_change(accepted, policy);
+        if (!reward_stalled) policy = std::move(accepted);
+        const auto rhs = bellman.rhs(h, policy, evaluation.mtm);
         double residual = 0.0;
         for (double x : rhs) residual = std::max(residual, std::abs(x - rho));
         double h_change = 0.0;
@@ -304,14 +357,23 @@ Solution HowardSolver::solve() const {
         diagnostics.value_change.push_back(h_change);
         diagnostics.bellman_residual.push_back(residual);
 
-        if (residual <= residual_tol && p_change <= policy_tol) {
+        if (reward_stalled || (residual <= residual_tol && p_change <= policy_tol)) {
+            // Convergence means no further material true-reward improvement
+            // along the proposed/damped best-response direction. The Bellman
+            // residual is NOT a global-optimality certificate in this model.
             diagnostics.converged = true;
             break;
         }
     }
 
     policy = builder.snap_operational_constraints(policy);
-    const auto final_rhs = bellman.rhs(h, policy);
+    // Re-evaluate the ACTUAL final policy; the old (frozen) MTM resolvent is
+    // never used to report its value function, reward or diagnostics.
+    const auto final_evaluation = evaluate_policy(policy);
+    h = final_evaluation.value;
+    rho = final_evaluation.average_reward;
+    diagnostics.average_reward = rho;
+    const auto final_rhs = bellman.rhs(h, policy, final_evaluation.mtm);
     double residual = 0.0;
     for (double x : final_rhs) residual = std::max(residual, std::abs(x - rho));
     diagnostics.reward_lower_bound = rho - residual;
@@ -323,6 +385,35 @@ Solution HowardSolver::solve() const {
     solution.solve_q_grid = states;
     solution.value_solve = h;
     solution.average_reward = rho;
+    // Capture the actual FINAL policy's whole-inventory MTM for diagnostics.
+    // This is intentionally separate from the incremental reward, as the
+    // latter accounts for price shocks on LOST RFQs as well.
+    for (std::size_t k = 0; k < problem_.tiers().size(); ++k) {
+        const auto& tier = problem_.tiers()[k];
+        LadderPolicy gross, incremental;
+        gross.q_grid = incremental.q_grid = grid.operational_states();
+        gross.sizes = incremental.sizes = tier.sizes();
+        for (double q : grid.operational_states()) {
+            std::vector<double> gb, ga, ib, ia;
+            for (double z : tier.sizes()) {
+                const double bid_next = q + z, ask_next = q - z;
+                gb.push_back(grid.admissible(q, z)
+                    ? final_evaluation.mtm.trade_mtm(k, 1.0, bid_next) : 0.0);
+                ga.push_back(grid.admissible(q, -z)
+                    ? final_evaluation.mtm.trade_mtm(k, -1.0, ask_next) : 0.0);
+                ib.push_back(grid.admissible(q, z)
+                    ? final_evaluation.mtm.win_increment(k, 1.0, q, bid_next) : 0.0);
+                ia.push_back(grid.admissible(q, -z)
+                    ? final_evaluation.mtm.win_increment(k, -1.0, q, ask_next) : 0.0);
+            }
+            gross.bid.push_back(std::move(gb));
+            gross.ask.push_back(std::move(ga));
+            incremental.bid.push_back(std::move(ib));
+            incremental.ask.push_back(std::move(ia));
+        }
+        solution.gross_mtm_tiers.push_back(std::move(gross));
+        solution.incremental_mtm_tiers.push_back(std::move(incremental));
+    }
     solution.hard_inventory_limit = grid.hard_limit();
     solution.diagnostics = diagnostics;
     solution.solve_tier_policies = policy.tiers;

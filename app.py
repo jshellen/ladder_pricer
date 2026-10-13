@@ -1116,7 +1116,7 @@ def internalization_figure(cfg: dict[str, Any]) -> go.Figure:
     p=cfg["internalization"]
     t=float(p["tau0"])+float(p["tau1"])*q+float(p["tau2"])*q*q
     fig=go.Figure(go.Scatter(x=q,y=t,mode="lines",name="t(|q|)"))
-    fig.update_layout(title="Internalization time",xaxis_title="|q| [EUR M]",yaxis_title="Minutes",template="trinity_dark")
+    fig.update_layout(title="Legacy internalization proxy — not used in HJB",xaxis_title="|q| [EUR M]",yaxis_title="Minutes",template="trinity_dark")
     return fig
 
 
@@ -1139,6 +1139,37 @@ def markout_figure(tier: dict[str, Any], cfg: dict[str, Any]) -> go.Figure:
         title=f"RFQ markout · {tier['name']}",
         xaxis_title="Time since RFQ [seconds]",
         yaxis_title="MTM markout [EUR per traded EUR 1M]",
+        template="trinity_dark",
+    )
+    return fig
+
+
+def expected_mtm_figure(solution: dict[str, Any], tier_index: int) -> go.Figure:
+    """Expected gross RFQ MTM and won-versus-lost increment in EUR/event.
+
+    Gross MTM is the full post-trade inventory exposure. Incremental MTM is
+    the part used in the HJB reward because lost RFQs also move the price.
+    """
+    data = solution.get("expectedMtm", [])[tier_index]
+    q = np.asarray(solution["qGrid"], dtype=float)
+    sizes = np.asarray(data["sizes"], dtype=float)
+    j = int(np.argmin(np.abs(sizes - 5.0)))
+    z = float(sizes[j])
+    fig = go.Figure()
+    for key, label, color, dash in (
+        ("grossBidEur", "Gross MTM · dealer buys", BID_COLOR, "solid"),
+        ("grossAskEur", "Gross MTM · dealer sells", ASK_COLOR, "solid"),
+        ("incrementalBidEur", "Won − lost · dealer buys", BID_COLOR, "dot"),
+        ("incrementalAskEur", "Won − lost · dealer sells", ASK_COLOR, "dot"),
+    ):
+        y = [float(row[j]) for row in data[key]]
+        fig.add_trace(go.Scatter(x=q, y=y, mode="lines", name=label,
+                                 line=dict(color=color, dash=dash)))
+    fig.add_hline(y=0.0, line_dash="dash", opacity=0.35)
+    fig.update_layout(
+        title=f"Expected MTM · {data['name']} · {z:g}M RFQ",
+        xaxis_title="Inventory before RFQ [EUR M]",
+        yaxis_title="Expected MTM [EUR per RFQ event]",
         template="trinity_dark",
     )
     return fig
@@ -1556,7 +1587,7 @@ sidebar = html.Aside([
             number_input("Gamma / φ", "gamma", DEFAULT["gamma"], "any"),
         ], className="grid-2"),
     ], True),
-    panel("Internalization time (unchanged, temporary)", [
+    panel("Legacy internalization proxy (inactive in HJB)", [
         html.Div([
             number_input("Tau 0 [min]", "tau0", DEFAULT["internalization"]["tau0"], "any"),
             number_input("Tau 1", "tau1", DEFAULT["internalization"]["tau1"], "any"),
@@ -1603,15 +1634,15 @@ sidebar = html.Aside([
 policy_tab = html.Div([
     html.Div([
         card("Converged", "m-converged"),
-        card("Howard iterations", "m-iterations"),
+        card("Best-response iterations", "m-iterations"),
         card("Average reward", "m-rho"),
-        card("Bellman residual", "m-residual"),
+        card("Frozen best-response residual", "m-residual"),
     ], className="metrics-row"),
     dcc.Tabs(id="policy-subtabs", value="overview", children=[
         dcc.Tab(label="Overview", value="overview", children=html.Div([
             diagnostic_expander("Continuation value h(q)", graph("value-chart"), open_=True),
-            diagnostic_expander("Internalization time", graph("internalization-chart")),
-            diagnostic_expander("Bellman residual", graph("residual-chart")),
+            diagnostic_expander("Legacy internalization proxy (not used by HJB)", graph("internalization-chart")),
+            diagnostic_expander("Frozen best-response residual (not an optimality certificate)", graph("residual-chart")),
             diagnostic_expander("Value-function change", graph("value-change-chart")),
         ], className="subtab-inner diagnostics-stack"), className="dash-tab", selected_className="dash-tab dash-tab-selected"),
         dcc.Tab(label="Tier diagnostics", value="tiers", children=html.Div([
@@ -1626,6 +1657,7 @@ policy_tab = html.Div([
             diagnostic_expander("Win probabilities", graph("hit-ratio-chart")),
             diagnostic_expander("Implied hit ratios vs inventory", graph("implied-hit-chart")),
             diagnostic_expander("Markouts", graph("markout-chart")),
+            diagnostic_expander("Expected whole-inventory MTM · 5M RFQ", graph("expected-mtm-chart")),
             diagnostic_expander("Quotes vs inventory", graph("quote-inventory-chart")),
             diagnostic_expander("Bid quote surface (3D)", graph("bid-surface-chart", height=500)),
             diagnostic_expander("Ask quote surface (3D)", graph("ask-surface-chart", height=500)),
@@ -2453,7 +2485,7 @@ def render_solution(solution, cfg):
         return "—", "—", "—", "—", go.Figure(), go.Figure(), go.Figure(), go.Figure(), [], None, [], None
     fig = go.Figure(go.Scatter(x=solution["qGrid"], y=solution["value"], mode="lines+markers", name="h(q)"))
     fig.update_layout(title="Continuation value h(q)", xaxis_title="Inventory q [EUR M]", yaxis_title="h(q)", template="trinity_dark")
-    residual_fig = convergence_figure(solution.get("bellmanResidual", []), "Bellman residual", "max |R(q) - ρ|")
+    residual_fig = convergence_figure(solution.get("bellmanResidual", []), "Frozen best-response residual", "max |R(q) - ρ|")
     value_change_fig = convergence_figure(solution.get("valueChange", []), "Value-function change", "max |Δh|")
     internal_fig = internalization_figure(cfg)
     opts = [{"label": t["name"], "value": i} for i, t in enumerate(solution["tiers"])]
@@ -2468,13 +2500,13 @@ def render_solution(solution, cfg):
 
 @app.callback(
     Output("rfq-arrival-chart", "figure"), Output("flow-chart", "figure"), Output("hit-ratio-chart", "figure"), Output("implied-hit-chart", "figure"),
-    Output("markout-chart", "figure"), Output("quote-inventory-chart", "figure"),
+    Output("markout-chart", "figure"), Output("expected-mtm-chart", "figure"), Output("quote-inventory-chart", "figure"),
     Output("bid-surface-chart", "figure"), Output("ask-surface-chart", "figure"), Output("ladder-chart", "figure"),
     Output("flow-parameter-table", "children"), Output("ladder-table", "children"),
     Input("solution-store", "data"), Input("config-store", "data"), Input("tier-select", "value"), Input("ladder-q", "value"),
 )
 def render_tier_diagnostics(solution, cfg, tier_index, q_value):
-    empty = (go.Figure(),) * 9 + (html.Div("Solve the model first"), html.Div("Solve the model first"))
+    empty = (go.Figure(),) * 10 + (html.Div("Solve the model first"), html.Div("Solve the model first"))
     if not solution or not cfg or tier_index is None:
         return empty
     try:
@@ -2487,6 +2519,7 @@ def render_tier_diagnostics(solution, cfg, tier_index, q_value):
             hit_ratio_figure(tier, float(cfg["spreadPips"])),
             implied_hit_ratio_figure(solution, cfg, ti),
             markout_figure(tier, cfg),
+            expected_mtm_figure(solution, ti),
             quote_inventory_figure(solution, cfg, ti),
             quote_surface_figure(solution, cfg, ti, "bid"),
             quote_surface_figure(solution, cfg, ti, "ask"),
@@ -2496,7 +2529,7 @@ def render_tier_diagnostics(solution, cfg, tier_index, q_value):
         )
     except Exception as exc:
         err = html.Div(f"Tier diagnostic failed: {exc}", className="error-note")
-        return (go.Figure(),) * 9 + (err, err)
+        return (go.Figure(),) * 10 + (err, err)
 
 
 @app.callback(
