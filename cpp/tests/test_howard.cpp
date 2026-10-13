@@ -19,6 +19,18 @@ std::vector<double> grid() {
 }
 
 int main() {
+    // A single pooled size-independent curve, converted from -50 EUR/M at
+    // EURSEK=11.5 to positive adverse price magnitude in SEK/EUR.
+    {
+        const double spot = 11.5;
+        const double magnitude = 50.0 * spot / 1e6;
+        const double tau = 40.0 / 60.0;
+        const SaturatingMarkout markout(magnitude, tau);
+        assert(std::abs(markout.expected(0.0)) < 1e-15);
+        assert(std::abs(markout.expected(40.0 / 60.0) - magnitude * (1.0 - std::exp(-1.0))) < 1e-15);
+        assert(std::abs(markout.expected(300.0 / 60.0) - magnitude * (1.0 - std::exp(-7.5))) < 1e-15);
+        assert(std::abs(markout.asymptotic() * 1e6 / spot - 50.0) < 1e-12);
+    }
     {
         PassiveECN ecn({-0.10, 0.0, 0.25, 0.50},
             ExponentialFlow(0.15, 2.4), 1.0, 0.0);
@@ -102,10 +114,10 @@ int main() {
         std::vector<Tier> ecn_tiers;
         ecn_tiers.emplace_back("Tier 1", ecn_sizes,
             LogisticFlow(0.0155,0.144,0.0857,0.52,8.42,0.026),
-            SaturatingMarkout(1e-4,0.5,0.5), true, -10, 100);
+            SaturatingMarkout(1e-4,0.5), true, -10, 100);
         ecn_tiers.emplace_back("Tier 2", ecn_sizes,
             LogisticFlow(0.0232,0.303,0.122,0.48,2.86,0.02),
-            SaturatingMarkout(1e-4,0.5,0.5), true, -10, 100);
+            SaturatingMarkout(1e-4,0.5), true, -10, 100);
         PricingProblem ecn_problem(
             grid(), 0.002, 0.0,
             QuadraticPenalty(0.1, 0.002),
@@ -159,7 +171,7 @@ int main() {
     {
         Tier fee_tier("Fee tier", {1.0},
             LogisticFlow(0.1,0.1,0.1,0.5,5.0,0.0),
-            SaturatingMarkout(0.0,0.5,0.5), false, -10.0, 100.0, 2e-4);
+            SaturatingMarkout(0.0,0.5), false, -10.0, 100.0, 2e-4);
         assert(std::abs(fee_tier.fee() - 2e-4) < 1e-15);
     }
     {
@@ -224,13 +236,13 @@ int main() {
     std::vector<Tier> tiers;
     tiers.emplace_back("Tier 1", sizes,
         LogisticFlow(0.0155,0.144,0.0857,0.52,8.42,0.026),
-        SaturatingMarkout(1e-4,0.5,0.5), true, -10, 100);
+        SaturatingMarkout(1e-4,0.5), true, -10, 100);
     tiers.emplace_back("Tier 2", sizes,
         LogisticFlow(0.0232,0.303,0.122,0.48,2.86,0.02),
-        SaturatingMarkout(1e-4,0.5,0.5), true, -10, 100);
+        SaturatingMarkout(1e-4,0.5), true, -10, 100);
     tiers.emplace_back("Tier 3", std::vector<double>{1},
         LogisticFlow(1.0,0.144,0.0857,0.52,20.0,0.026),
-        SaturatingMarkout(4e-4,0.5,0.10), true, -10, 100);
+        SaturatingMarkout(4e-4,0.10), true, -10, 100);
 
     PricingProblem problem(grid(), 0.002, 0.0,
         QuadraticPenalty(0.1, 0.002),

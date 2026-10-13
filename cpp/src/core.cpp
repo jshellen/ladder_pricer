@@ -578,23 +578,17 @@ double AggregatedFlow::optimal_delta(double target_size, double spread, double a
     return objective(candidate) >= best_value ? candidate : knots[best];
 }
 
-SaturatingMarkout::SaturatingMarkout(double impact_scale, double size_exponent, double tau_minutes)
-    : impact_scale_(impact_scale), size_exponent_(size_exponent), tau_minutes_(tau_minutes) {
-    require(impact_scale_ >= 0.0, "markout impact scale must be nonnegative");
-    require(size_exponent_ >= 0.0, "markout size exponent must be nonnegative");
-    require(tau_minutes_ > 0.0, "markout tau must be positive");
+SaturatingMarkout::SaturatingMarkout(double asymptotic_adverse_price, double tau_minutes)
+    : asymptotic_adverse_price_(asymptotic_adverse_price), tau_minutes_(tau_minutes) {
+    require(std::isfinite(asymptotic_adverse_price_) && asymptotic_adverse_price_ >= 0.0,
+            "markout adverse magnitude must be finite and nonnegative");
+    require(std::isfinite(tau_minutes_) && tau_minutes_ > 0.0,
+            "markout tau must be finite and positive");
 }
 
-double SaturatingMarkout::asymptotic(double size) const {
-    require(size > 0.0, "trade size must be positive");
-    return impact_scale_ * std::pow(size, size_exponent_);
-}
-
-double SaturatingMarkout::expected(double size, double minutes) const {
-    if (minutes <= 0.0) {
-        return 0.0;
-    }
-    return asymptotic(size) * (-std::expm1(-minutes / tau_minutes_));
+double SaturatingMarkout::expected(double minutes) const noexcept {
+    if (minutes <= 0.0) return 0.0;
+    return asymptotic_adverse_price_ * (-std::expm1(-minutes / tau_minutes_));
 }
 
 double InternalizationTime::value(double inventory) const noexcept {
@@ -901,7 +895,7 @@ std::vector<double> PolicyBuilder::build_ladder(const Tier& tier,
 
         const double q_next = inventory + dq;
         const double markout = tier.use_markout()
-            ? tier.markout().expected(z, problem_.internalization_time().value(q_next))
+            ? tier.markout().expected(problem_.internalization_time().value(q_next))
             : 0.0;
         const double additive = -z * (markout + tier.fee()) + grid.interpolate(value, q_next) - hq;
         const double unconstrained = tier.flow().optimal_delta(
@@ -936,7 +930,7 @@ double PolicyBuilder::ladder_hamiltonian(const Tier& tier,
         if (!grid.admissible(inventory, dir * z)) continue;
         const double q_next = inventory + dir * z;
         const double markout = tier.use_markout()
-            ? tier.markout().expected(z, problem_.internalization_time().value(q_next))
+            ? tier.markout().expected(problem_.internalization_time().value(q_next))
             : 0.0;
         const double delta = row_values[j];
         const double rate = tier.flow().arrival_rate(delta, z);
@@ -1161,7 +1155,9 @@ Policy PolicyBuilder::improve(const std::vector<double>& value, const Policy& pr
                         tier, value, q_grid[i], side, matrix(old, side, i), candidate);
                     continue;
                 }
-                const auto& inner = matrix(old, side, i - 1);
+                // Use already-improved inner neighbor: outward sweep keeps ladder
+                // constraints consistent within the same policy iteration.
+                const auto& inner = matrix(out, side, i - 1);
                 LadderBounds bounds;
                 if (side == Side::Bid) {
                     bounds.min_gaps = gaps(inner);
@@ -1185,7 +1181,8 @@ Policy PolicyBuilder::improve(const std::vector<double>& value, const Policy& pr
                         tier, value, q_grid[i], side, matrix(old, side, i), candidate);
                     continue;
                 }
-                const auto& inner = matrix(old, side, i + 1);
+                // Mirror the same-iteration Gauss-Seidel update on negative q.
+                const auto& inner = matrix(out, side, i + 1);
                 LadderBounds bounds;
                 if (side == Side::Bid) {
                     bounds.max_gaps = gaps(inner);
@@ -1283,7 +1280,7 @@ std::vector<double> BellmanModel::rhs(const std::vector<double>& value, const Po
                     const double rate = tier.flow().arrival_rate(delta, z);
                     const double q_next = q + dq;
                     const double markout = tier.use_markout()
-                        ? tier.markout().expected(z, problem_.internalization_time().value(q_next))
+                        ? tier.markout().expected(problem_.internalization_time().value(q_next))
                         : 0.0;
                     const double fill_value = z * (problem_.spread() * (0.5 - delta) - tier.fee())
                                             - z * markout

@@ -173,7 +173,7 @@ PnlStatistics PnlAnalytics::statistics(double horizon, double sigma, double q0) 
                     if(rate<=0.0) continue;
                     std::vector<double> shift(nvars,0.0);
                     shift[static_cast<std::size_t>(pnlvar)]=z*(problem_.spread()*(0.5-delta)-tier.fee());
-                    if(tier.use_markout()) shift[static_cast<std::size_t>(tau_to_var[tier.markout().tau_minutes()])]=-dir*tier.markout().asymptotic(z);
+                    if(tier.use_markout()) shift[static_cast<std::size_t>(tau_to_var[tier.markout().tau_minutes()])]=-dir*tier.markout().asymptotic();
                     events.push_back({q+dir*z,rate,std::move(shift)});
                 }
             }

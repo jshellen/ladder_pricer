@@ -443,7 +443,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
 
                 // An RFQ is an information event whether or not we win it.
                 if (tier.use_markout()) {
-                    impacts[tier.markout().tau_minutes()] += -dir * tier.markout().asymptotic(rfq_size);
+                    impacts[tier.markout().tau_minutes()] += -dir * tier.markout().asymptotic();
                 }
 
                 if (retain && won) {

@@ -167,7 +167,7 @@ HowardSolver::AffineOperator HowardSolver::fixed_policy_operator(const Policy& p
                     const double rate = tier.flow().arrival_rate(delta, z);
                     const double q_next = q + dq;
                     const double markout = tier.use_markout()
-                        ? tier.markout().expected(z, problem_.internalization_time().value(q_next))
+                        ? tier.markout().expected(problem_.internalization_time().value(q_next))
                         : 0.0;
                     op.reward[i] += rate * (z * (problem_.spread() * (0.5 - delta) - tier.fee()) - z * markout);
                     add_transition(op.generator, states, i, q_next, rate);

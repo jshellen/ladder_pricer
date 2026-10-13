@@ -8,6 +8,25 @@ from typing import Any, Callable, Iterable
 from . import _native
 
 
+_EXPECTED_PRICING_CONFIG_SCHEMA_VERSION = 2  # Tier-local RFQ markout (no global config["markout"])
+
+
+def _check_pricing_schema(native_module: Any) -> None:
+    """Reject an older compiled extension before creating a solver instance."""
+    actual = getattr(native_module, "PRICING_CONFIG_SCHEMA_VERSION", None)
+    if actual != _EXPECTED_PRICING_CONFIG_SCHEMA_VERSION:
+        raise RuntimeError(
+            "The compiled trinity._native extension does not support tier-specific "
+            "RFQ markout (native config schema: " + str(actual) + "). "
+            "Rebuild it from this directory with "
+            "`python3 -m pip install -e . --no-deps --force-reinstall` and "
+            "restart the dashboard. Alternatively run `./run_dash.sh`, "
+            "which rebuilds an outdated extension automatically."
+        )
+
+
+_check_pricing_schema(_native)
+
 _EXPECTED_ECN_PARAMETERIZATION_VERSION = 10
 if getattr(_native, "ECN_PARAMETERIZATION_VERSION", None) != _EXPECTED_ECN_PARAMETERIZATION_VERSION:
     raise RuntimeError(

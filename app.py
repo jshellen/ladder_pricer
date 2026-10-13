@@ -21,6 +21,7 @@ from trinity.defaults import (
     default_ecn_trade_size_probabilities,
     default_fx_mid,
 )
+from trinity.markout import markout_eur_per_million
 from trinity.service import ENGINES
 from trinity.ui_config import build_config, checked, parse_numbers
 
@@ -565,12 +566,14 @@ def tier_panel(index: int, tier: dict[str, Any], open_: bool = False):
         html.Div([
             number_input("Fee [pips]", f"{p}-fee", tier.get("feePips", 0.0), "any"),
         ], className="grid-2"),
-        html.Div("Markout", className="subhead"),
+        html.Div("RFQ markout", className="subhead"),
         checkbox("Enabled", f"{p}-markout-enabled", tier["useMarkout"]),
         html.Div([
-            number_input("Scale [pips]", f"{p}-impact", tier["markout"]["impactScalePips"], "any"),
-            number_input("Size exponent", f"{p}-impact-beta", tier["markout"]["sizeExponent"], "any"),
-            number_input("Tau [min]", f"{p}-impact-tau", tier["markout"]["tauMinutes"], "any"),
+            number_input("Asymptote [EUR / EUR 1M]", f"{p}-markout-asymptote", tier["markout"]["asymptoticEurPerMillion"], "any"),
+            number_input("Tau [seconds]", f"{p}-markout-tau-seconds", tier["markout"]["tauSeconds"], "any"),
+        ], className="grid-2"),
+        html.Div("Same EUR/M curve for every RFQ size in this tier. Negative means adverse MTM.", className="muted-note"),
+        html.Div([
             number_input("Delta min", f"{p}-dmin", tier["deltaMin"], "any"),
             number_input("Delta max", f"{p}-dmax", tier["deltaMax"], "any"),
         ], className="grid-2"),
@@ -754,13 +757,15 @@ def _arrival_rate(tier: dict[str, Any], delta, z: float, target_spread_pips: flo
     return _activity(tier, z) * _hit_ratio(tier, delta, z, target_spread_pips)
 
 
-def _markout_pips(tier: dict[str, Any], z: float, t_minutes):
+def _markout_eur_per_million(tier: dict[str, Any], cfg: dict[str, Any], t_seconds):
+    """Tier-specific signed markout; identical per EUR 1M for each RFQ size."""
+    t = np.asarray(t_seconds, dtype=float)
     if not tier.get("useMarkout", True):
-        return np.zeros_like(np.asarray(t_minutes, dtype=float))
+        return np.zeros_like(t)
     spec = tier["markout"]
-    tau = max(float(spec["tauMinutes"]), 1e-15)
-    asymptotic = float(spec["impactScalePips"]) * float(z) ** float(spec["sizeExponent"])
-    return asymptotic * (1.0 - np.exp(-np.asarray(t_minutes, dtype=float) / tau))
+    return markout_eur_per_million(
+        t, float(spec["asymptoticEurPerMillion"]), float(spec["tauSeconds"])
+    )
 
 
 def _quote_vs_mid_pips(delta, side: str, spread_pips: float):
@@ -1069,7 +1074,7 @@ def ladder_figure(solution: dict[str, Any], cfg: dict[str, Any], tier_index: int
     return fig
 
 
-def flow_parameter_table(tier: dict[str, Any]) -> html.Table:
+def flow_parameter_table(tier: dict[str, Any], cfg: dict[str, Any]) -> html.Table:
     rows=[]
     one_side_total = sum(0.5 * _source_total_rfq_rate(tier, source) for source in _tier_flow_sources(tier))
     pricing = np.asarray(tier["sizes"], dtype=float)
@@ -1081,9 +1086,9 @@ def flow_parameter_table(tier: dict[str, Any]) -> html.Table:
             f"{float(z):g}" + (" · price knot" if is_knot else ""),
             f"{100.0 * size_share:.2f}%", f"{rate:.6g}", f"{_delta50(tier,float(z)):.4f}",
             f"{float(tier['flow']['steepness']):.4g}", f"{float(tier.get('feePips', 0.0)):.3f}",
-            f"{float(_markout_pips(tier,float(z),1.0)):.3f}",
+            f"{float(_markout_eur_per_million(tier,cfg,60.0)):.2f}",
         ])
-    return _simple_table(["Size [M]","RFQ size share","λ_RFQ(z) [1/min]","δ50(z)","Steepness","Fee [pips]","Markout @1m [pips]"], rows)
+    return _simple_table(["Size [M]","RFQ size share","λ_RFQ(z) [1/min]","δ50(z)","Steepness","Fee [pips]","Markout @60s [EUR/M]"], rows)
 
 
 def ladder_table(solution: dict[str, Any], cfg: dict[str, Any], tier_index: int, q_value: float) -> html.Table:
@@ -1115,12 +1120,27 @@ def internalization_figure(cfg: dict[str, Any]) -> go.Figure:
     return fig
 
 
-def markout_figure(tier: dict[str, Any]) -> go.Figure:
-    t=np.linspace(0,15,300)
-    fig=go.Figure()
-    for z in tier["sizes"]:
-        fig.add_trace(go.Scatter(x=t,y=_markout_pips(tier,float(z),t),mode="lines",name=f"{float(z):g}M"))
-    fig.update_layout(title=f"RFQ markout · {tier['name']}",xaxis_title="Time since trade [min]",yaxis_title="Adverse markout [pips]",template="trinity_dark")
+def markout_figure(tier: dict[str, Any], cfg: dict[str, Any]) -> go.Figure:
+    t = np.linspace(0.0, 300.0, 301)
+    fig = go.Figure()
+    # Show the selected tier prominently and other active tiers for comparison.
+    for other in cfg["tiers"]:
+        if other is tier or not other.get("enabled", False):
+            continue
+        fig.add_trace(go.Scatter(
+            x=t, y=_markout_eur_per_million(other, cfg, t), mode="lines",
+            name=str(other["name"]), line=dict(dash="dash", width=1.5), opacity=0.65,
+        ))
+    fig.add_trace(go.Scatter(
+        x=t, y=_markout_eur_per_million(tier, cfg, t), mode="lines",
+        name=str(tier["name"]), line=dict(color=ASK_COLOR, width=3),
+    ))
+    fig.update_layout(
+        title=f"RFQ markout · {tier['name']}",
+        xaxis_title="Time since RFQ [seconds]",
+        yaxis_title="MTM markout [EUR per traded EUR 1M]",
+        template="trinity_dark",
+    )
     return fig
 
 
@@ -1536,7 +1556,7 @@ sidebar = html.Aside([
             number_input("Gamma / φ", "gamma", DEFAULT["gamma"], "any"),
         ], className="grid-2"),
     ], True),
-    panel("Internalization time", [
+    panel("Internalization time (unchanged, temporary)", [
         html.Div([
             number_input("Tau 0 [min]", "tau0", DEFAULT["internalization"]["tau0"], "any"),
             number_input("Tau 1", "tau1", DEFAULT["internalization"]["tau1"], "any"),
@@ -1846,7 +1866,7 @@ for i in range(3):
     p = f"t{i}"
     for suffix in (
         "enabled", "name", "sizes", "rfq-size-step", "A0", "theta", "beta", "steep", "shift", "vshift",
-        "fee", "markout-enabled", "impact", "impact-beta", "impact-tau", "dmin", "dmax",
+        "fee", "markout-enabled", "markout-asymptote", "markout-tau-seconds", "dmin", "dmax",
     ):
         CONFIG_FIELDS.append((f"{p}-{suffix}", State(f"{p}-{suffix}", "value")))
 for component_id in (
@@ -2466,12 +2486,12 @@ def render_tier_diagnostics(solution, cfg, tier_index, q_value):
             flow_curve_figure(tier, float(cfg["spreadPips"])),
             hit_ratio_figure(tier, float(cfg["spreadPips"])),
             implied_hit_ratio_figure(solution, cfg, ti),
-            markout_figure(tier),
+            markout_figure(tier, cfg),
             quote_inventory_figure(solution, cfg, ti),
             quote_surface_figure(solution, cfg, ti, "bid"),
             quote_surface_figure(solution, cfg, ti, "ask"),
             ladder_figure(solution, cfg, ti, qv),
-            flow_parameter_table(tier),
+            flow_parameter_table(tier, cfg),
             ladder_table(solution, cfg, ti, qv),
         )
     except Exception as exc:

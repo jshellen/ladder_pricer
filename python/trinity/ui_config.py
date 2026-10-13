@@ -66,7 +66,6 @@ def build_config(values: Mapping[str, Any]) -> dict[str, Any]:
         "tau1": _number(values, "tau1"),
         "tau2": _number(values, "tau2"),
     }
-
     tiers: list[dict[str, Any]] = []
     for i in range(3):
         p = f"t{i}"
@@ -79,18 +78,20 @@ def build_config(values: Mapping[str, Any]) -> dict[str, Any]:
             "shift": _number(values, f"{p}-shift"),
             "volumeShift": _number(values, f"{p}-vshift"),
         }
+        m_inf = _number(values, f"{p}-markout-asymptote")
+        tau_s = _number(values, f"{p}-markout-tau-seconds")
+        if not (float("-inf") < m_inf <= 0.0):
+            raise ValueError(f"Markout asymptote for Tier {i + 1} must be finite and <= 0 EUR/M")
+        if not (0.0 < tau_s < float("inf")):
+            raise ValueError(f"Markout tau for Tier {i + 1} must be finite and > 0 seconds")
         tiers.append({
             "enabled": checked(values.get(f"{p}-enabled")),
             "name": str(values.get(f"{p}-name", f"Tier {i + 1}")),
             "sizes": sizes,
             "rfqSizeStep": _number(values, f"{p}-rfq-size-step") if values.get(f"{p}-rfq-size-step") is not None else 1.0,
             "flow": flow,
-            "markout": {
-                "impactScalePips": _number(values, f"{p}-impact"),
-                "sizeExponent": _number(values, f"{p}-impact-beta"),
-                "tauMinutes": _number(values, f"{p}-impact-tau"),
-            },
             "useMarkout": checked(values.get(f"{p}-markout-enabled")),
+            "markout": {"asymptoticEurPerMillion": m_inf, "tauSeconds": tau_s},
             "feePips": _number(values, f"{p}-fee") if values.get(f"{p}-fee") is not None else 0.0,
             "deltaMin": _number(values, f"{p}-dmin"),
             "deltaMax": _number(values, f"{p}-dmax"),

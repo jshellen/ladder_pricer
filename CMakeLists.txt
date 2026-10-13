@@ -23,6 +23,9 @@ if(TRINITY_BUILD_TESTS)
     add_executable(test_analytics cpp/tests/test_analytics.cpp)
     target_link_libraries(test_analytics PRIVATE ladder_pricer_core)
 
+    add_executable(test_policy_improvement_regression cpp/tests/test_policy_improvement_regression.cpp)
+    target_link_libraries(test_policy_improvement_regression PRIVATE ladder_pricer_core)
+
     add_executable(test_simulation cpp/tests/test_simulation.cpp)
     target_link_libraries(test_simulation PRIVATE ladder_pricer_core)
 endif()

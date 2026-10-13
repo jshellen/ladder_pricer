@@ -23,8 +23,9 @@ def ui_values_from_default():
             f"{p}-steep": tier["flow"]["steepness"], f"{p}-shift": tier["flow"]["shift"], f"{p}-vshift": tier["flow"]["volumeShift"],
             f"{p}-fee": tier.get("feePips", 0.0),
             f"{p}-markout-enabled": ["on"] if tier["useMarkout"] else [],
-            f"{p}-impact": tier["markout"]["impactScalePips"], f"{p}-impact-beta": tier["markout"]["sizeExponent"],
-            f"{p}-impact-tau": tier["markout"]["tauMinutes"], f"{p}-dmin": tier["deltaMin"], f"{p}-dmax": tier["deltaMax"],
+            f"{p}-markout-asymptote": tier["markout"]["asymptoticEurPerMillion"],
+            f"{p}-markout-tau-seconds": tier["markout"]["tauSeconds"],
+            f"{p}-dmin": tier["deltaMin"], f"{p}-dmax": tier["deltaMax"],
         })
     dp = cfg["darkPool"]
     values.update({
@@ -49,13 +50,38 @@ def test_default_dash_values_round_trip_to_model_config():
     assert actual == expected
 
 
-def test_markout_checkbox_is_not_parsed_as_impact_scale():
+def test_tier_markout_curves_and_switches_are_independent():
     values = ui_values_from_default()
     values["t0-markout-enabled"] = ["on"]
-    values["t0-impact"] = 1.25
+    values["t1-markout-enabled"] = []
+    values["t0-markout-asymptote"] = -60.25
+    values["t0-markout-tau-seconds"] = 42.125
+    values["t1-markout-asymptote"] = -20.0
+    values["t1-markout-tau-seconds"] = 10.0
+    values["t2-markout-asymptote"] = -80.0
+    values["t2-markout-tau-seconds"] = 90.0
     actual = build_config(values)
     assert actual["tiers"][0]["useMarkout"] is True
-    assert actual["tiers"][0]["markout"]["impactScalePips"] == 1.25
+    assert actual["tiers"][1]["useMarkout"] is False
+    assert [t["markout"] for t in actual["tiers"]] == [
+        {"asymptoticEurPerMillion": -60.25, "tauSeconds": 42.125},
+        {"asymptoticEurPerMillion": -20.0, "tauSeconds": 10.0},
+        {"asymptoticEurPerMillion": -80.0, "tauSeconds": 90.0},
+    ]
+    assert "markout" not in actual  # no longer a global parameter
+
+
+@pytest.mark.parametrize("key,value", [
+    ("t0-markout-asymptote", 10.0),
+    ("t1-markout-asymptote", float("nan")),
+    ("t2-markout-tau-seconds", 0.0),
+    ("t1-markout-tau-seconds", float("inf")),
+])
+def test_invalid_markout_config_rejected(key, value):
+    values = ui_values_from_default()
+    values[key] = value
+    with pytest.raises(ValueError, match="Markout"):
+        build_config(values)
 
 
 def test_checked_dash_checklist_values():
@@ -163,9 +189,8 @@ def test_continuous_parameters_accept_extra_decimal_precision():
         "t0-shift": 0.52125,
         "t0-vshift": 0.0026125,
         "t0-fee": 0.1375,
-        "t0-impact": 1.0125,
-        "t0-impact-beta": 0.5125,
-        "t0-impact-tau": 0.4875,
+        "t0-markout-asymptote": -50.8125,
+        "t0-markout-tau-seconds": 36.7125,
         "t0-dmin": -10.125,
         "t0-dmax": 99.875,
         "dp-lambda": 2.0125,
@@ -182,6 +207,7 @@ def test_continuous_parameters_accept_extra_decimal_precision():
     assert cfg["spot"] == 11.51234567
     assert cfg["spreadPips"] == 19.375
     assert cfg["gamma"] == 0.0144
+    assert cfg["tiers"][0]["markout"] == {"asymptoticEurPerMillion": -50.8125, "tauSeconds": 36.7125}
     assert cfg["tiers"][0]["flow"]["A0"] == 0.0155123
     assert cfg["tiers"][0]["flow"]["theta"] == 0.0144
     assert cfg["tiers"][0]["deltaMin"] == -10.125

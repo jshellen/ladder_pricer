@@ -263,16 +263,28 @@ std::optional<PassiveECN> build_passive_ecn(const py::dict& cfg, double target_s
 
 PricingProblem build_problem(const py::dict& cfg, std::optional<double> gamma_override = std::nullopt) {
     std::vector<Tier> tiers;
+    // Each tier has its own signed adverse EUR/M markout curve, common to
+    // every RFQ size inside that tier. Convert to positive quote/base price
+    // magnitude: (EUR per traded EUR 1M) * (quote per EUR) / 1e6.
+    const double reference_spot = number(cfg, "spot");
+    if (!std::isfinite(reference_spot) || reference_spot <= 0.0) {
+        throw std::invalid_argument("markout conversion requires a positive finite spot");
+    }
     const py::list tier_cfgs = py::cast<py::list>(cfg[py::str("tiers")]);
     for (const py::handle item : tier_cfgs) {
         const py::dict tier = py::cast<py::dict>(item);
         if (!boolean(tier, "enabled")) continue;
         const py::dict markout = py::cast<py::dict>(tier[py::str("markout")]);
+        const double m_inf = number(markout, "asymptoticEurPerMillion");
+        const double tau_seconds = number(markout, "tauSeconds");
+        if (!std::isfinite(m_inf) || m_inf > 0.0 || !std::isfinite(tau_seconds) || tau_seconds <= 0.0) {
+            throw std::invalid_argument("tier markout requires nonpositive EUR/M and positive seconds");
+        }
+        const SaturatingMarkout tier_markout(-m_inf * reference_spot / 1e6, tau_seconds / 60.0);
         tiers.emplace_back(
             text(tier, "name"), numbers(tier[py::str("sizes")]),
             build_tier_flow(tier, number(cfg, "spreadPips")),
-            SaturatingMarkout(number(markout, "impactScalePips") / 10000.0,
-                              number(markout, "sizeExponent"), number(markout, "tauMinutes")),
+            tier_markout,
             boolean(tier, "useMarkout"), number(tier, "deltaMin"), number(tier, "deltaMax"),
             optional_number(tier, "feePips", 0.0) / 10000.0,
             optional_number(tier, "rfqSizeStep", 1.0));
@@ -676,6 +688,9 @@ private:
 PYBIND11_MODULE(_native, module) {
     module.doc() = "C++ Howard pricing engine";
     module.attr("ECN_PARAMETERIZATION_VERSION") = 10;
+    // Increment whenever the Python -> native configuration schema changes.
+    // Version 2 expects a separate markout object inside each RFQ tier.
+    module.attr("PRICING_CONFIG_SCHEMA_VERSION") = 2;
     py::class_<ladder_pricer::python::Engine>(module, "Engine")
         .def(py::init<py::dict>())
         .def("solve", &ladder_pricer::python::Engine::solve)

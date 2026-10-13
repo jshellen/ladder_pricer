@@ -23,7 +23,7 @@ The C++17 library contains:
 - analytical logistic/Lambert-W quote improvement;
 - inventory ladder level/gap constraints;
 - hidden inventory solve buffer;
-- saturating adverse-selection markout;
+- independent two-parameter adverse-selection markout curve for each RFQ tier (EUR / traded EUR 1M);
 - per-tier trading fees that enter quote optimization, analytical PnL and Monte Carlo PnL;
 - dark-pool controls;
 - optional Crisafi-style passive ECN hedge control: `NONE` or a Tier-style price-improvement delta `d`. Here `d=0` is the same-side touch and `d=0.5` is mid; the default action grid is 0.00 to 0.50 in 0.01 increments, and ECN fills are strictly risk-reducing;
@@ -31,6 +31,40 @@ The C++17 library contains:
 - corrected impact-aware closed-form terminal PnL mean and standard deviation.
 
 The Dash layer does **not** implement pricing mathematics.
+
+### RFQ markout: simplified curve, independently calibrated by tier
+
+Every RFQ tier now has its **own** two-parameter markout curve, configured
+inside `config["tiers"][i]["markout"]`:
+
+`m_i(t_seconds) = m_inf_i * (1 - exp(-t_seconds / tau_seconds_i))`
+
+`m_inf_i` is a **negative** adverse markout in EUR per traded EUR 1M, and
+`tau_seconds_i > 0` is the curve's time constant in seconds. Each tier's
+curve is **independent of RFQ size within that tier**. Its existing `useMarkout`
+toggle still enables/disables that tier's markout.
+
+All three tiers initially use the *same* old empirical defaults (`-50.8 EUR/M`,
+`36.7 seconds`) for backward-compatible baseline results. Configure different
+values in **Pricing tiers → Tier N → RFQ markout**. The tier diagnostics chart
+plots the selected tier's curve and overlays other enabled tiers as dashed lines.
+
+The native builder converts each tier's magnitude into quote/base price units:
+`-m_inf_i * spot / 1e6` (e.g. `50 EUR/M * 11.5 SEK/EUR / 1e6 =
+0.000575 SEK/EUR`). A customer buy generates an upward price impact and a
+customer sell a downward price impact, as before. Each native Tier owns its
+own `SaturatingMarkout`, and the existing HJB, Monte Carlo and analytical PnL
+code use each tier's curve. `tau_seconds_i` is converted into minutes for C++.
+
+**Intentionally unchanged:** The HJB still evaluates markout at its old
+exogenous `internalization(q_next)` horizon and charges the trade-size-weighted
+reward approximation. It does **not yet** use the proposed policy-dependent
+whole-inventory expected MTM. The existing MC and analytical PnL event handling
+is also unchanged. No new markout dependence on RFQ size was added.
+
+The `python_reference/` directory is a legacy independent implementation and
+is not the active C++ solver; its historical markout representation and
+comparison helper have not been migrated to this interface.
 
 
 ### Aggregating customer flow into one target FX risk
@@ -204,6 +238,27 @@ spot or path PnL for a fixed seed.
 - risk parameter `φ` / `γ` vs `E[PnL] / Std[PnL]`;
 - underlying frontier table and Howard iteration counts.
 
+## Fix for `Solve failed · 'markout'` after upgrading
+
+This error occurs when an old compiled C++ extension (expecting a global
+`config["markout"]`) is loaded alongside newer Python code (which puts a markout
+curve inside each RFQ tier). **This is a stale extension, not HJB non-convergence.**
+
+Start the app using `./run_dash.sh`: it now detects this mismatch and rebuilds
+an outdated native extension automatically (using pip's isolated build so
+pybind11 need not be installed separately). If you prefer `python3 app.py`, run
+this once from the extracted project directory, using the same Python
+interpreter/virtual environment as the dashboard:
+
+```bash
+python3 -m pip install -e . --no-deps --force-reinstall
+python3 app.py
+```
+
+The native engine now also checks `PRICING_CONFIG_SCHEMA_VERSION` at import, so
+an outdated extension reports explicit rebuild instructions instead of failing
+inside the solve callback with a misleading `markout` key error.
+
 ## Install
 
 A normal Python environment with a C++17 compiler is enough. No Emscripten, Node, React, Boost, Eigen or SciPy are required.
@@ -320,11 +375,11 @@ The Dash application now carries the full diagnostic plot set from the previous 
 - internalization time vs inventory
 - tier flow curves and logistic hit-ratio curves
 - implied hit ratios under the solved policy
-- saturating markout curves by size
+- per-tier saturating markout curves (same curve for all RFQ sizes within each tier)
 - quotes vs inventory across all rungs
 - bid and ask 3D quote surfaces
 - volume-premium ladder at a selected inventory
-- flow/markout parameter and ladder tables
+- flow parameters, selected tier markout at 60 seconds and ladder tables
 - dark-pool fill-size density, full-fill probability and solved posted-size policy
 - Monte Carlo PnL distribution and inventory confidence band
 - exact event-time retained inventory path
@@ -340,7 +395,7 @@ Dash control values are converted to the numerical model by component ID in
 `python/trinity/ui_config.py`. The model configuration no longer depends on the
 positional ordering of callback states, so adding or reordering UI controls does
 not silently shift tier parameters. The regression tests in
-`tests/test_ui_config.py` cover the markout checkbox / impact-parameter mapping and tier-fee mapping.
+`tests/test_ui_config.py` cover independent tier markout parameters, tier markout switches and tier-fee mapping.
 
 ### Dark-pool diagnostics layout
 
@@ -428,7 +483,7 @@ exactly halfway between the current 3M and 5M prices. In the code the equivalent
 interpolated; because execution price is affine in `delta` for a fixed side and reference
 spot, this is mathematically identical to interpolating the price itself.
 
-The sampled **actual RFQ size** drives win probability, cash, inventory, markout, retained
+The sampled **actual RFQ size** drives win probability, cash, inventory, retained
 RFQ events, and the population hit-ratio aggregates.  Hence the realized hit-ratio chart can
 show 4M, 6M, 7M, etc. even though those sizes are not explicit pricing knots.
 
@@ -453,3 +508,30 @@ orientations (for example `USDEUR` from `EURUSD`). This is intentionally a
 temporary market-data boundary: a production deployment should replace the
 default lookup with the bank's/database market-data source while leaving the
 flow-source and HJB interfaces unchanged.
+
+## Policy-improvement stability fix (2026-10-13)
+
+The constrained RFQ ladder is optimized by sweeping outward from zero inventory.
+`PolicyBuilder::improve()` now uses the **already updated** inner-neighbour ladder
+from the current iteration (`out`), rather than the lagged previous-iteration
+ladder (`old`), when constructing cross-inventory monotonicity/gap bounds.
+This is a two-line algorithmic fix; the per-state Howard safeguard still
+compares candidates to the previous policy at that same inventory state.
+
+Regression: `cpp/tests/test_policy_improvement_regression.cpp` reproduces the
+large q=0 curvature spike at an asymptotic markout of -50 EUR per EUR 1M,
+ECN disabled, gamma=1. The test fails before the fix and passes afterwards,
+and also checks both sides' cross-inventory ladder constraints.
+
+**Scope:** Markout calibration, the exogenous internalization-time function,
+HJB reward definitions, Monte Carlo and the expected-MTM calculation are
+unchanged. This fix addresses the demonstrated numerical instability; it
+does not establish global optimality for all constrained policies.
+
+## Per-tier markout configuration (2026-10-13)
+
+- Removed the obsolete top-level `config["markout"]` and the global markout sidebar panel.
+- Each tier now has `markout: {asymptoticEurPerMillion: ..., tauSeconds: ...}`.
+- Updated Dash callbacks, native C++ binding conversion, the selected-tier chart,
+  and configuration/regression tests. The solver's numerical core is unchanged.
+- The earlier Gauss–Seidel-style policy-improvement stability fix remains intact.

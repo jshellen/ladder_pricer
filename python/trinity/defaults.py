@@ -144,8 +144,9 @@ _DEFAULT_CONFIG = {
             # this curve on the full RFQ-size support (1M steps by default),
             # independently of the pricing-size knots below.
             "flow": {"A0": 0.0155, "theta": 0.144, "beta": 0.0857, "steepness": 8.42, "shift": 0.52, "volumeShift": 0.026},
-            "markout": {"impactScalePips": 1.0, "sizeExponent": 0.5, "tauMinutes": 0.5},
             "useMarkout": True,
+            # Signed adverse markout, EUR per traded EUR 1M; independent of RFQ size.
+            "markout": {"asymptoticEurPerMillion": -50.8, "tauSeconds": 36.7},
             "feePips": 0.0,
             "deltaMin": -10.0,
             "deltaMax": 100.0,
@@ -156,8 +157,9 @@ _DEFAULT_CONFIG = {
             "sizes": [1, 2, 3, 5, 10, 20],
             "rfqSizeStep": 1.0,
             "flow": {"A0": 0.0232, "theta": 0.303, "beta": 0.122, "steepness": 2.86, "shift": 0.48, "volumeShift": 0.020},
-            "markout": {"impactScalePips": 1.0, "sizeExponent": 0.5, "tauMinutes": 0.5},
             "useMarkout": True,
+            # Signed adverse markout, EUR per traded EUR 1M; independent of RFQ size.
+            "markout": {"asymptoticEurPerMillion": -50.8, "tauSeconds": 36.7},
             "feePips": 0.0,
             "deltaMin": -10.0,
             "deltaMax": 100.0,
@@ -168,8 +170,9 @@ _DEFAULT_CONFIG = {
             "sizes": [1],
             "rfqSizeStep": 1.0,
             "flow": {"A0": 1.0, "theta": 0.144, "beta": 0.0857, "steepness": 20.0, "shift": 0.52, "volumeShift": 0.026},
-            "markout": {"impactScalePips": 4.0, "sizeExponent": 0.5, "tauMinutes": 0.10},
             "useMarkout": True,
+            # Signed adverse markout, EUR per traded EUR 1M; independent of RFQ size.
+            "markout": {"asymptoticEurPerMillion": -50.8, "tauSeconds": 36.7},
             "feePips": 0.0,
             "deltaMin": -10.0,
             "deltaMax": 100.0,

@@ -124,18 +124,16 @@ private:
 
 class SaturatingMarkout {
 public:
-    SaturatingMarkout(double impact_scale, double size_exponent, double tau_minutes);
+    // Internal price units (quote currency per base unit), always adverse magnitude >= 0.
+    // Each Tier owns its curve; RFQ size does not affect its per-million value.
+    SaturatingMarkout(double asymptotic_adverse_price, double tau_minutes);
 
-    double asymptotic(double size) const;
-    double expected(double size, double minutes) const;
-
-    double impact_scale() const noexcept { return impact_scale_; }
-    double size_exponent() const noexcept { return size_exponent_; }
+    double asymptotic() const noexcept { return asymptotic_adverse_price_; }
+    double expected(double minutes) const noexcept;
     double tau_minutes() const noexcept { return tau_minutes_; }
 
 private:
-    double impact_scale_;
-    double size_exponent_;
+    double asymptotic_adverse_price_;
     double tau_minutes_;
 };
 
