@@ -231,6 +231,14 @@ input[type="checkbox"] { accent-color: var(--accent); }
 }
 .modal-action-apply { background:var(--accent); color:#06111d; }
 .modal-action-apply:hover { background:#79b8ff; }
+/* Unfinished crossed sources cannot be applied. Give disabled state a clear look. */
+.modal-actions-right .modal-action-apply:disabled,
+.modal-actions-right .modal-action-apply:disabled:hover {
+  opacity:0.45;
+  cursor:not-allowed;
+  background:var(--accent);
+}
+
 .modal-action-danger, .modal-remove-button {
   background:#c43636; color:#fff; border:1px solid #e05b5b;
 }

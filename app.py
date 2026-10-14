@@ -72,6 +72,20 @@ def _cross_pair_options(target_pair: str | None, source_pair: str | None) -> lis
         pairs.insert(0, derived)
     return [{"label": pair, "value": pair} for pair in pairs]
 
+
+def _editor_cross_mid(cross_pair: str | None, entered_mid: float | None,
+                      pair_changed: bool) -> float | None:
+    """Resolve a crossed-source mid without depending on Dash callback order.
+
+    The JSON defaults are used on pair changes or while the input is blank.
+    Manual values are otherwise preserved.  An incomplete selection is
+    allowed while editing; final model validation happens on Solve.
+    """
+    reference_mid = default_fx_mid(cross_pair)
+    if reference_mid is not None and (pair_changed or entered_mid is None):
+        return reference_mid
+    return None if entered_mid is None else float(entered_mid)
+
 SESSION_CLOCK_ORIGIN = datetime(2000, 1, 1, 7, 45)
 SESSION_TIME_TICK_MINUTES = [0.0, 120.0, 240.0, 360.0, 480.0, SESSION_HORIZON]
 
@@ -492,7 +506,11 @@ def flow_pair_card(key: str, label: str, selected: bool, removable: bool = False
 def _dropdown_field(label: str, component_id: str, value: str | None, options: list[dict[str, str]], placeholder: str = "Select FX pair"):
     return html.Label([
         html.Span(label),
-        dcc.Dropdown(id=component_id, value=value, options=options, placeholder=placeholder, clearable=False, className="field-dropdown", persistence=True, persistence_type="memory"),
+        # Crossed source choices are scoped to the selected source, so never
+        # restore a previous source's selection when a fresh card is added.
+        dcc.Dropdown(id=component_id, value=value, options=options, placeholder=placeholder,
+                     clearable=False, className="field-dropdown",
+                     persistence=(component_id == "global-target-pair"), persistence_type="memory"),
     ], className="field")
 
 
@@ -565,7 +583,7 @@ def flow_source_settings_editor(source_key: str, source: dict[str, Any], target_
         ], style={"display": "none"})]
     else:
         pair = source.get("pair")
-        cross_pair = source.get("crossPair") or _derive_cross_pair(target_pair, pair)
+        cross_pair = source.get("crossPair")
         configured_mid = mapping.get("crossMid")
         cross_mid = configured_mid if configured_mid is not None else default_fx_mid(cross_pair)
         source_fields = [html.Div([
@@ -658,7 +676,7 @@ def ecn_flow_source_settings_editor(source_key: str, source: dict[str, Any], tar
         ], style={"display": "none"})]
     else:
         pair = source.get("pair")
-        cross_pair = source.get("crossPair") or _derive_cross_pair(target_pair, pair)
+        cross_pair = source.get("crossPair")
         configured_mid = mapping.get("crossMid")
         cross_mid = configured_mid if configured_mid is not None else default_fx_mid(cross_pair)
         source_fields = [
@@ -688,7 +706,7 @@ def ecn_flow_source_settings_editor(source_key: str, source: dict[str, Any], tar
             number_input("P(500k)", "ecn-flow-edit-p500k", _ecn_size_probabilities(source)[2], "any"),
             number_input("P(250k)", "ecn-flow-edit-p250k", _ecn_size_probabilities(source)[3], "any"),
         ], className="grid-2 flow-calibration-grid"),
-        html.Div(id="ecn-flow-edit-p100k-note", className="muted-note"),
+        html.Div(f"P(100k) = 1 − others = {_ecn_size_probabilities(source)[4]:.6f}", id="ecn-flow-edit-p100k-note", className="muted-note"),
     ], className="flow-source-settings")
 
 def tier_panel(index: int, tier: dict[str, Any], open_: bool = False):
@@ -2488,20 +2506,28 @@ def render_flow_source_settings(tier_index, target_pair, selected, data, *direct
 
 @app.callback(
     Output("flow-edit-cross-pair", "value"),
-    Input("flow-edit-pair", "value"),
-    State("global-target-pair", "value"),
+    Input("flow-edit-pair", "value", allow_optional=True),
+    State("flow-source-tier-store", "data"),
+    State("flow-source-selected-store", "data"),
+    State("extra-flow-sources-store", "data"),
     prevent_initial_call=True,
 )
-def derive_flow_source_cross_pair(source_pair, target_pair):
-    """Populate the economically implied hedge cross without rebuilding the form."""
-    if not source_pair or not target_pair:
+def clear_tier_crossing_on_source_change(pair, tier_index, selected, data):
+    """A new crossed-pair selection requires an explicit crossing choice."""
+    if tier_index is None or not isinstance(selected, str) or not selected.startswith("extra-"):
         return no_update
-    return _derive_cross_pair(target_pair, source_pair) or no_update
+    try:
+        source = (data or {}).get(str(tier_index), [])[int(selected.split("-", 1)[1])]
+    except (IndexError, ValueError):
+        return no_update
+    # The source store update may arrive before or after this callback.
+    # Either way, reset if the pair changed or the mapping was invalidated.
+    return None if source.get("pair") != pair or not source.get("crossPair") else no_update
 
 
 @app.callback(
     Output("flow-edit-cross-mid", "value"),
-    Input("flow-edit-cross-pair", "value"),
+    Input("flow-edit-cross-pair", "value", allow_optional=True),
     prevent_initial_call=True,
 )
 def populate_flow_source_cross_mid(cross_pair):
@@ -2517,10 +2543,10 @@ def populate_flow_source_cross_mid(cross_pair):
     Output("t1-A0", "value"), Output("t1-theta", "value"), Output("t1-beta", "value"), Output("t1-steep", "value"), Output("t1-shift", "value"), Output("t1-vshift", "value"),
     Input("flow-source-add", "n_clicks"),
     Input("flow-source-remove-selected", "n_clicks"),
-    Input("flow-edit-pair", "value"), Input("flow-edit-cross-pair", "value"),
-    Input("flow-edit-cross-mid", "value"), Input("flow-edit-spread", "value"),
-    Input("flow-edit-A0", "value"), Input("flow-edit-theta", "value"), Input("flow-edit-beta", "value"),
-    Input("flow-edit-steep", "value"), Input("flow-edit-shift", "value"), Input("flow-edit-vshift", "value"),
+    Input("flow-edit-pair", "value", allow_optional=True), Input("flow-edit-cross-pair", "value", allow_optional=True),
+    Input("flow-edit-cross-mid", "value", allow_optional=True), Input("flow-edit-spread", "value", allow_optional=True),
+    Input("flow-edit-A0", "value", allow_optional=True), Input("flow-edit-theta", "value", allow_optional=True), Input("flow-edit-beta", "value", allow_optional=True),
+    Input("flow-edit-steep", "value", allow_optional=True), Input("flow-edit-shift", "value", allow_optional=True), Input("flow-edit-vshift", "value", allow_optional=True),
     State("flow-source-tier-store", "data"), State("global-target-pair", "value"), State("flow-source-selected-store", "data"), State("extra-flow-sources-store", "data"),
     *[State(f"t{i}-{suffix}", "value") for i in range(len(DEFAULT["tiers"])) for suffix in ("A0", "theta", "beta", "steep", "shift", "vshift")],
     prevent_initial_call=True,
@@ -2569,19 +2595,23 @@ def update_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, spread
         if 0 <= idx < len(out.get(key, [])) and all(x is not None for x in (spread, A0, theta, beta, steep, shift, vshift)):
             src = out[key][idx]
             chosen_pair = str(pair) if pair else None
-            derived_cross = _derive_cross_pair(target_pair, chosen_pair)
-            chosen_cross = derived_cross if trigger == "flow-edit-pair" and derived_cross else (str(cross_pair) if cross_pair else derived_cross)
+            # Do not implicitly select a crossing pair. Changing the crossed
+            # source invalidates the previous mapping until explicitly chosen.
+            pair_changed = trigger == "flow-edit-pair" and chosen_pair != src.get("pair")
+            chosen_cross = None if pair_changed else (str(cross_pair) if cross_pair and chosen_pair else None)
 
             # Pair selection is market-data driven: use the temporary default
             # mid for the newly selected cross.  A manually edited Cross mid is
             # preserved for all other triggers.
-            chosen_mid = None if cross_mid is None else float(cross_mid)
-            if trigger in ("flow-edit-pair", "flow-edit-cross-pair"):
-                looked_up_mid = default_fx_mid(chosen_cross)
-                if looked_up_mid is not None:
-                    chosen_mid = looked_up_mid
-            if chosen_pair and chosen_mid is None:
-                raise ValueError(f"No default mid available for cross {chosen_cross}")
+            # Dash updates the source-pair, crossing-pair and crossing-mid
+            # inputs in separate callbacks.  A flow/size edit may reach this
+            # store before the crossing-mid callback has populated its field.
+            # Always resolve a missing mid from the configured FX defaults,
+            # regardless of which input triggered the update.  Changing the
+            # pair deliberately refreshes the default; other edits preserve a
+            # manually supplied mid.
+            chosen_mid = None if not chosen_cross else _editor_cross_mid(
+                chosen_cross, cross_mid, trigger in ("flow-edit-pair", "flow-edit-cross-pair"))
             if chosen_mid is not None and chosen_mid <= 0.0:
                 raise ValueError("Cross mid must be positive")
             if float(spread) <= 0.0:
@@ -2593,6 +2623,50 @@ def update_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, spread
         return out, no_update, *direct
 
     return out, no_update, *direct
+
+
+def _crossed_sources_ready(sources, selected, pair, crossing_pair):
+    """An Apply must never accept a newly-added, incomplete crossed source.
+
+    Also check the visible editor, so Apply stays disabled while Dash's
+    editor-to-store callback is still processing a pair selection.
+    """
+    sources = sources or []
+    if any(not source.get("pair") or not source.get("crossPair") for source in sources):
+        return False
+    if isinstance(selected, str) and selected.startswith("extra-"):
+        try:
+            source = sources[int(selected.split("-", 1)[1])]
+        except (ValueError, IndexError):
+            return False
+        return bool(pair and crossing_pair and
+                    pair == source.get("pair") and crossing_pair == source.get("crossPair"))
+    return True
+
+
+@app.callback(
+    Output("flow-source-apply", "disabled"),
+    Input("flow-source-tier-store", "data"),
+    Input("extra-flow-sources-store", "data"),
+    Input("flow-source-selected-store", "data"),
+    Input("flow-edit-pair", "value", allow_optional=True),
+    Input("flow-edit-cross-pair", "value", allow_optional=True),
+)
+def disable_incomplete_tier_flow_apply(tier_index, data, selected, pair, crossing_pair):
+    if tier_index is None:
+        return False
+    return not _crossed_sources_ready((data or {}).get(str(tier_index), []), selected, pair, crossing_pair)
+
+
+@app.callback(
+    Output("ecn-flow-source-apply", "disabled"),
+    Input("ecn-extra-flow-sources-store", "data"),
+    Input("ecn-flow-source-selected-store", "data"),
+    Input("ecn-flow-edit-pair", "value", allow_optional=True),
+    Input("ecn-flow-edit-cross-pair", "value", allow_optional=True),
+)
+def disable_incomplete_ecn_flow_apply(data, selected, pair, crossing_pair):
+    return not _crossed_sources_ready(data, selected, pair, crossing_pair)
 
 
 @app.callback(
@@ -2741,7 +2815,7 @@ def render_ecn_flow_source_settings(target_pair, selected, data, direct_A, direc
     Output("ecn-flow-edit-p750k", "value"),
     Output("ecn-flow-edit-p500k", "value"),
     Output("ecn-flow-edit-p250k", "value"),
-    Input("ecn-flow-edit-pair", "value"),
+    Input("ecn-flow-edit-pair", "value", allow_optional=True),
     State("ecn-flow-source-selected-store", "data"),
     prevent_initial_call=True,
 )
@@ -2760,19 +2834,24 @@ def populate_ecn_trade_size_defaults(source_pair, selected):
 
 @app.callback(
     Output("ecn-flow-edit-cross-pair", "value"),
-    Input("ecn-flow-edit-pair", "value"),
-    State("global-target-pair", "value"),
+    Input("ecn-flow-edit-pair", "value", allow_optional=True),
+    State("ecn-flow-source-selected-store", "data"),
+    State("ecn-extra-flow-sources-store", "data"),
     prevent_initial_call=True,
 )
-def derive_ecn_flow_source_cross_pair(source_pair, target_pair):
-    if not source_pair or not target_pair:
+def clear_ecn_crossing_on_source_change(pair, selected, data):
+    if not isinstance(selected, str) or not selected.startswith("extra-"):
         return no_update
-    return _derive_cross_pair(target_pair, source_pair) or no_update
+    try:
+        source = (data or [])[int(selected.split("-", 1)[1])]
+    except (IndexError, ValueError):
+        return no_update
+    return None if source.get("pair") != pair or not source.get("crossPair") else no_update
 
 
 @app.callback(
     Output("ecn-flow-edit-cross-mid", "value"),
-    Input("ecn-flow-edit-cross-pair", "value"),
+    Input("ecn-flow-edit-cross-pair", "value", allow_optional=True),
     prevent_initial_call=True,
 )
 def populate_ecn_flow_source_cross_mid(cross_pair):
@@ -2782,8 +2861,9 @@ def populate_ecn_flow_source_cross_mid(cross_pair):
 
 @app.callback(
     Output("ecn-flow-edit-p100k-note", "children"),
-    Input("ecn-flow-edit-p1m", "value"), Input("ecn-flow-edit-p750k", "value"),
-    Input("ecn-flow-edit-p500k", "value"), Input("ecn-flow-edit-p250k", "value"),
+    Input("ecn-flow-edit-p1m", "value", allow_optional=True), Input("ecn-flow-edit-p750k", "value", allow_optional=True),
+    Input("ecn-flow-edit-p500k", "value", allow_optional=True), Input("ecn-flow-edit-p250k", "value", allow_optional=True),
+    prevent_initial_call=True,
 )
 def render_ecn_100k_residual(p1m, p750k, p500k, p250k):
     try:
@@ -2799,11 +2879,11 @@ def render_ecn_100k_residual(p1m, p750k, p500k, p250k):
     Output("ecn-A", "value"), Output("ecn-k", "value"), Output("ecn-direct-size-probs-store", "data"),
     Input("ecn-flow-source-add", "n_clicks"),
     Input("ecn-flow-source-remove-selected", "n_clicks"),
-    Input("ecn-flow-edit-pair", "value"), Input("ecn-flow-edit-cross-pair", "value"),
-    Input("ecn-flow-edit-cross-mid", "value"), Input("ecn-flow-edit-spread", "value"),
-    Input("ecn-flow-edit-A", "value"), Input("ecn-flow-edit-k", "value"),
-    Input("ecn-flow-edit-p1m", "value"), Input("ecn-flow-edit-p750k", "value"),
-    Input("ecn-flow-edit-p500k", "value"), Input("ecn-flow-edit-p250k", "value"),
+    Input("ecn-flow-edit-pair", "value", allow_optional=True), Input("ecn-flow-edit-cross-pair", "value", allow_optional=True),
+    Input("ecn-flow-edit-cross-mid", "value", allow_optional=True), Input("ecn-flow-edit-spread", "value", allow_optional=True),
+    Input("ecn-flow-edit-A", "value", allow_optional=True), Input("ecn-flow-edit-k", "value", allow_optional=True),
+    Input("ecn-flow-edit-p1m", "value", allow_optional=True), Input("ecn-flow-edit-p750k", "value", allow_optional=True),
+    Input("ecn-flow-edit-p500k", "value", allow_optional=True), Input("ecn-flow-edit-p250k", "value", allow_optional=True),
     State("global-target-pair", "value"), State("ecn-flow-source-selected-store", "data"),
     State("ecn-extra-flow-sources-store", "data"), State("ecn-A", "value"), State("ecn-k", "value"),
     State("ecn-direct-size-probs-store", "data"),
@@ -2833,6 +2913,10 @@ def update_ecn_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, sp
                 out.pop(idx)
         return out, "direct", direct_A, direct_k, direct_size_probs
 
+    # The ECN controls may not yet be mounted immediately after opening the
+    # dashboard/modal; optional Dash Inputs are None in that transient state.
+    if any(value is None for value in (p1m, p750k, p500k, p250k)):
+        return (no_update,) * 5
     probs = _ecn_size_probabilities_from_four(p1m, p750k, p500k, p250k)
 
     if selected == "direct":
@@ -2849,16 +2933,14 @@ def update_ecn_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, sp
         if 0 <= idx < len(out) and all(x is not None for x in (spread, A, k)):
             src = out[idx]
             chosen_pair = str(pair) if pair else None
-            derived_cross = _derive_cross_pair(target_pair, chosen_pair)
-            chosen_cross = derived_cross if trigger == "ecn-flow-edit-pair" and derived_cross else (str(cross_pair) if cross_pair else derived_cross)
+            pair_changed = trigger == "ecn-flow-edit-pair" and chosen_pair != src.get("pair")
+            chosen_cross = None if pair_changed else (str(cross_pair) if cross_pair and chosen_pair else None)
 
-            chosen_mid = None if cross_mid is None else float(cross_mid)
-            if trigger in ("ecn-flow-edit-pair", "ecn-flow-edit-cross-pair"):
-                looked_up_mid = default_fx_mid(chosen_cross)
-                if looked_up_mid is not None:
-                    chosen_mid = looked_up_mid
-            if chosen_pair and chosen_mid is None:
-                raise ValueError(f"No default mid available for cross {chosen_cross}")
+            # The pair and mid inputs update asynchronously.  Look up the
+            # default even if an unrelated field triggered this callback
+            # while the Crossing Mid-Rate input is still blank.
+            chosen_mid = None if not chosen_cross else _editor_cross_mid(
+                chosen_cross, cross_mid, trigger in ("ecn-flow-edit-pair", "ecn-flow-edit-cross-pair"))
             if chosen_mid is not None and chosen_mid <= 0.0:
                 raise ValueError("Cross mid must be positive")
             if float(spread) <= 0.0:
@@ -3867,9 +3949,9 @@ def render_frontier(frontier, cfg):
 
 @app.callback(
     Output("flow-markout-preview", "figure"),
-    Input("flow-edit-markout-enabled", "value"),
-    Input("flow-edit-markout-asymptote", "value"),
-    Input("flow-edit-markout-tau", "value"),
+    Input("flow-edit-markout-enabled", "value", allow_optional=True),
+    Input("flow-edit-markout-asymptote", "value", allow_optional=True),
+    Input("flow-edit-markout-tau", "value", allow_optional=True),
     State("global-target-pair", "value"),
     prevent_initial_call=True,
 )
@@ -3881,9 +3963,9 @@ def preview_flow_markout(enabled, asymptote, tau, pair):
 @app.callback(
     *[Output(f"t{i}-{suffix}", "value") for i in range(len(DEFAULT["tiers"]))
       for suffix in ("markout-enabled", "markout-asymptote", "markout-tau-seconds")],
-    Input("flow-edit-markout-enabled", "value"),
-    Input("flow-edit-markout-asymptote", "value"),
-    Input("flow-edit-markout-tau", "value"),
+    Input("flow-edit-markout-enabled", "value", allow_optional=True),
+    Input("flow-edit-markout-asymptote", "value", allow_optional=True),
+    Input("flow-edit-markout-tau", "value", allow_optional=True),
     State("flow-source-tier-store", "data"),
     *[State(f"t{i}-{suffix}", "value") for i in range(len(DEFAULT["tiers"]))
       for suffix in ("markout-enabled", "markout-asymptote", "markout-tau-seconds")],

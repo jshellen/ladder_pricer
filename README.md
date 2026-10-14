@@ -361,3 +361,34 @@ button appears immediately to the right of **+ Add FX pair** in the footer,
 only when a valid crossed source is selected. The Direct source cannot be
 removed. The ECN popup's old descriptive paragraph has been removed.
 These are dashboard-only changes; native pricing and simulation are unchanged.
+
+### Crossed FX mid-rate editor fix
+
+The ECN and Tier Configure flow sources editors now resolve an empty crossing
+mid-rate from `fx_pair_defaults.json` on any edit, not only the crossing pair
+selection event. This prevents callback-order errors while selecting a crossed
+source (e.g. EURSEK target, USDSEK source and EURUSD crossing pair). Changing
+an FX pair refreshes its default mid; an explicitly edited mid is preserved
+when unrelated inputs change. The change affects only Dash/Python callbacks,
+not the HJB or C++ pricing logic.
+
+### Crossed source selection validation
+
+For both Tier RFQ and ECN flow-source editors, **+ Add FX pair** creates a
+blank Crossed pair and blank Crossing pair dropdown. Neither is preselected
+or restored from a previously edited row. Changing an existing Crossed pair
+clears its previous Crossing pair selection. **Apply** remains disabled until
+every added crossed source has both an explicitly selected Crossed pair and
+Crossing pair. This is a dashboard-only validation; Direct source settings
+and the C++ HJB model are unchanged.
+
+## Dashboard startup and dynamically rendered flow-source editors
+
+Tier and ECN source-editor fields are mounted into the modal only after the
+corresponding source has been selected. The associated Dash callback inputs
+are therefore declared with `allow_optional=True` (requires Dash 3.1 or newer),
+so initial dashboard loading and a quick Add/Remove FX pair action do not
+fail because an editor field has not been mounted yet. ECN trade-size editing
+also skips incomplete transient input values while the editor is mounting.
+The direct/crossed FX mapping, Apply validation, and native pricing models are
+otherwise unchanged.

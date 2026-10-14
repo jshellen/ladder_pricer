@@ -1088,3 +1088,245 @@ def test_ecn_optimizer_legacy_explainer_removed(dashboard):
                  if getattr(node, "id", None) == "ecn-flow-source-modal")
     assert not any("The ECN optimizer chooses one master delta" in getattr(node, "children", "")
                    for node in walk(modal) if isinstance(getattr(node, "children", None), str))
+
+@pytest.mark.parametrize("trigger", [
+    "ecn-flow-edit-cross-pair",  # crossing FX choice
+    "ecn-flow-edit-A",           # unrelated edit beats the mid-population callback
+    "ecn-flow-edit-p1m",         # pair choice emits size-default changes
+])
+def test_ecn_crossing_mid_populates_from_json_without_callback_race(dashboard, trigger):
+    """Selecting USDSEK/EURUSD must never require the mid callback to finish first."""
+    from trinity.defaults import default_fx_mid
+
+    assert default_fx_mid("EURUSD") == pytest.approx(1.18)
+    sources = [dashboard._default_cross_ecn_flow_source(0, "EURSEK")]
+    old_trigger = dashboard.ctx.triggered_id
+    try:
+        dashboard.ctx.triggered_id = trigger
+        stored, selection, direct_a, direct_k, direct_probs = dashboard.update_ecn_flow_source_editor(
+            0, 0, "USDSEK", "EURUSD", None, 20.0, 4.0, 8.4,
+            0.35, 0.08, 0.22, 0.16,
+            "EURSEK", "extra-0", sources, 0.15, 8.4,
+            dashboard.ECN_TRADE_SIZE_PROBABILITIES,
+        )
+    finally:
+        dashboard.ctx.triggered_id = old_trigger
+    assert stored[0]["pair"] == "USDSEK"
+    assert stored[0]["crossPair"] == "EURUSD"
+    assert stored[0]["mapping"]["crossMid"] == pytest.approx(1.18)
+    assert stored[0]["mapping"]["sourceSpreadPips"] == 20.0
+    assert selection is dashboard.no_update
+    assert (direct_a, direct_k, direct_probs) == (0.15, 8.4, dashboard.ECN_TRADE_SIZE_PROBABILITIES)
+
+
+def test_crossing_mid_manual_value_survives_unrelated_ecn_edit(dashboard):
+    sources = [dashboard._default_cross_ecn_flow_source(0, "EURSEK")]
+    old_trigger = dashboard.ctx.triggered_id
+    try:
+        dashboard.ctx.triggered_id = "ecn-flow-edit-k"
+        stored = dashboard.update_ecn_flow_source_editor(
+            0, 0, "USDSEK", "EURUSD", 1.2345, 20, 4.0, 8.4,
+            0.35, 0.08, 0.22, 0.16,
+            "EURSEK", "extra-0", sources, 0.15, 8.4,
+            dashboard.ECN_TRADE_SIZE_PROBABILITIES,
+        )[0]
+        dashboard.ctx.triggered_id = "ecn-flow-edit-cross-pair"
+        reset = dashboard.update_ecn_flow_source_editor(
+            0, 0, "USDSEK", "EURUSD", 1.2345, 20, 4.0, 8.4,
+            0.35, 0.08, 0.22, 0.16,
+            "EURSEK", "extra-0", sources, 0.15, 8.4,
+            dashboard.ECN_TRADE_SIZE_PROBABILITIES,
+        )[0]
+    finally:
+        dashboard.ctx.triggered_id = old_trigger
+    assert stored[0]["mapping"]["crossMid"] == pytest.approx(1.2345)
+    assert reset[0]["mapping"]["crossMid"] == pytest.approx(1.18)
+
+
+def test_rfq_crossed_mid_has_same_race_protection(dashboard):
+    source = dashboard._default_cross_flow_source(0, "EURSEK")
+    old_trigger = dashboard.ctx.triggered_id
+    try:
+        dashboard.ctx.triggered_id = "flow-edit-A0"
+        result = dashboard.update_flow_source_editor(
+            0, 0, "USDSEK", "EURUSD", None, 20,
+            0.01, 0.144, 0.0857, 8.42, 0.52, 0.026,
+            0, "EURSEK", "extra-0", {"0": [source], "1": []},
+            *([0.01, 0.144, 0.0857, 8.42, 0.52, 0.026] * 2),
+        )
+    finally:
+        dashboard.ctx.triggered_id = old_trigger
+    assert result[0]["0"][0]["mapping"]["crossMid"] == pytest.approx(1.18)
+
+
+def test_incomplete_cross_pair_is_allowed_during_editor_changes(dashboard):
+    """An in-progress dropdown choice must not open the Dash error overlay."""
+    old_trigger = dashboard.ctx.triggered_id
+    try:
+        dashboard.ctx.triggered_id = "ecn-flow-edit-A"
+        result = dashboard.update_ecn_flow_source_editor(
+            0, 0, "USDSEK", None, None, 20, 4.0, 8.4,
+            0.35, 0.08, 0.22, 0.16,
+            "EURSEK", "extra-0", [dashboard._default_cross_ecn_flow_source()],
+            0.15, 8.4, dashboard.ECN_TRADE_SIZE_PROBABILITIES,
+        )
+    finally:
+        dashboard.ctx.triggered_id = old_trigger
+    assert result[0][0]["pair"] == "USDSEK"
+    assert result[0][0]["crossPair"] is None
+    assert result[0][0]["mapping"]["crossMid"] is None
+
+
+def test_new_tier_and_ecn_sources_start_without_pair_choices(dashboard):
+    """No auto-selected source/cross and no reused dropdown-memory selection."""
+    for editor, source in (
+        (dashboard.flow_source_settings_editor, dashboard._default_cross_flow_source()),
+        (dashboard.ecn_flow_source_settings_editor, dashboard._default_cross_ecn_flow_source()),
+    ):
+        assert source["pair"] is None
+        assert source["crossPair"] is None
+        assert source["mapping"]["crossMid"] is None
+        view = editor("extra-0", source, "EURSEK")
+        choices = [node for node in walk(view) if getattr(node, "id", None) in (
+            "flow-edit-pair", "flow-edit-cross-pair",
+            "ecn-flow-edit-pair", "ecn-flow-edit-cross-pair",
+        )]
+        assert len(choices) == 2
+        assert all(node.value is None for node in choices)
+        assert all(node.placeholder == "Select FX pair" for node in choices)
+        assert all(node.persistence is False for node in choices)
+
+
+def test_apply_requires_all_crossed_pairs_explicitly_selected(dashboard):
+    tier = {"0": [dashboard._default_cross_flow_source()], "1": []}
+    ecn = [dashboard._default_cross_ecn_flow_source()]
+    assert dashboard.disable_incomplete_tier_flow_apply(0, tier, "extra-0", None, None)
+    assert dashboard.disable_incomplete_ecn_flow_apply(ecn, "extra-0", None, None)
+    assert dashboard.disable_incomplete_tier_flow_apply(0, tier, "direct", "EURSEK", None)
+    assert dashboard.disable_incomplete_ecn_flow_apply(ecn, "direct", "EURSEK", None)
+
+    # Selecting only the crossed pair must not enable Apply.
+    tier["0"][0]["pair"] = "USDSEK"
+    ecn[0]["pair"] = "USDSEK"
+    assert dashboard.disable_incomplete_tier_flow_apply(0, tier, "extra-0", "USDSEK", None)
+    assert dashboard.disable_incomplete_ecn_flow_apply(ecn, "extra-0", "USDSEK", None)
+
+    # Both explicitly selected: valid and stored choices must agree with the UI.
+    tier["0"][0]["crossPair"] = "EURUSD"
+    ecn[0]["crossPair"] = "EURUSD"
+    assert not dashboard.disable_incomplete_tier_flow_apply(0, tier, "extra-0", "USDSEK", "EURUSD")
+    assert not dashboard.disable_incomplete_ecn_flow_apply(ecn, "extra-0", "USDSEK", "EURUSD")
+    assert dashboard.disable_incomplete_tier_flow_apply(0, tier, "extra-0", "USDSEK", None)
+    assert dashboard.disable_incomplete_ecn_flow_apply(ecn, "extra-0", "USDSEK", None)
+
+    # The other Tier is independent. An incomplete second crossed source blocks
+    # Apply even after switching back to Direct.
+    tier["0"].append(dashboard._default_cross_flow_source())
+    ecn.append(dashboard._default_cross_ecn_flow_source())
+    assert dashboard.disable_incomplete_tier_flow_apply(0, tier, "direct", "EURSEK", None)
+    assert dashboard.disable_incomplete_ecn_flow_apply(ecn, "direct", "EURSEK", None)
+    assert not dashboard.disable_incomplete_tier_flow_apply(1, tier, "direct", "EURSEK", None)
+
+
+def test_changing_crossed_pair_requires_fresh_crossing_selection(dashboard):
+    src = dashboard._default_cross_flow_source()
+    src.update({"pair": "USDSEK", "crossPair": "EURUSD"})
+    src["mapping"]["crossMid"] = 1.18
+    old_trigger = dashboard.ctx.triggered_id
+    try:
+        dashboard.ctx.triggered_id = "flow-edit-pair"
+        updated = dashboard.update_flow_source_editor(
+            0, 0, "GBPSEK", "EURUSD", 1.18, 20,
+            0.01, 0.144, 0.0857, 8.42, 0.52, 0.026,
+            0, "EURSEK", "extra-0", {"0": [src], "1": []},
+            *([0.01, 0.144, 0.0857, 8.42, 0.52, 0.026] * 2),
+        )[0]["0"][0]
+        assert updated["pair"] == "GBPSEK"
+        assert updated["crossPair"] is None
+        assert updated["mapping"]["crossMid"] is None
+        assert dashboard.clear_tier_crossing_on_source_change("GBPSEK", 0, "extra-0", {"0": [updated]}) is None
+
+        dashboard.ctx.triggered_id = "ecn-flow-edit-pair"
+        source = dashboard._default_cross_ecn_flow_source()
+        source.update({"pair": "USDSEK", "crossPair": "EURUSD"})
+        ecn = dashboard.update_ecn_flow_source_editor(
+            0, 0, "GBPSEK", "EURUSD", 1.18, 20, 4, 8.4,
+            .35, .08, .22, .16, "EURSEK", "extra-0", [source],
+            .15, 8.4, dashboard.ECN_TRADE_SIZE_PROBABILITIES,
+        )[0][0]
+        assert ecn["pair"] == "GBPSEK"
+        assert ecn["crossPair"] is None
+        assert ecn["mapping"]["crossMid"] is None
+        assert dashboard.clear_ecn_crossing_on_source_change("GBPSEK", "extra-0", [ecn]) is None
+    finally:
+        dashboard.ctx.triggered_id = old_trigger
+
+
+def test_all_dynamic_editor_inputs_are_optional_at_dashboard_startup(dashboard):
+    """The editors are injected by callbacks *after* the initial Dash layout.
+
+    A normal Input('ecn-flow-edit-pair', 'value') caused a browser-side
+    'nonexistent object' error on page load; every such dependency must use
+    Dash 3.1+ allow_optional, including the mirrored Tier editor inputs.
+    """
+    initially_mounted = {
+        node.id for node in walk(dashboard.app.layout)
+        if isinstance(getattr(node, "id", None), str)
+    }
+    dynamic = []
+    for dependencies, _options, _function in dashboard.app.callbacks:
+        for dependency in dependencies:
+            if not isinstance(dependency, (Input, State)):
+                continue
+            component_id = dependency.args[0]
+            if isinstance(component_id, str) and component_id.startswith(("flow-edit-", "ecn-flow-edit-")):
+                assert component_id not in initially_mounted
+                assert dependency.kwargs.get("allow_optional") is True, component_id
+                dynamic.append(component_id)
+    assert "ecn-flow-edit-pair" in dynamic
+    assert "ecn-flow-edit-cross-pair" in dynamic
+    assert "flow-edit-pair" in dynamic
+    assert "flow-edit-cross-pair" in dynamic
+    assert len(dynamic) >= 35
+
+
+def test_ecn_add_does_not_require_transient_editor_inputs(dashboard):
+    """Clicking Add is valid even before Dash has mounted its editor controls."""
+    old_trigger = dashboard.ctx.triggered_id
+    try:
+        dashboard.ctx.triggered_id = "ecn-flow-source-add"
+        extras, selected, direct_A, direct_k, probabilities = dashboard.update_ecn_flow_source_editor(
+            1, 0, None, None, None, None, None, None,
+            None, None, None, None, "EURSEK", "direct", [],
+            0.15, 8.4, dashboard.ECN_TRADE_SIZE_PROBABILITIES,
+        )
+        assert selected == "extra-0"
+        assert len(extras) == 1
+        assert extras[0]["pair"] is None and extras[0]["crossPair"] is None
+        assert dashboard.disable_incomplete_ecn_flow_apply(extras, selected, None, None)
+        assert direct_A == 0.15 and direct_k == 8.4
+        assert probabilities == dashboard.ECN_TRADE_SIZE_PROBABILITIES
+
+        dashboard.ctx.triggered_id = "ecn-flow-source-remove-selected"
+        removed = dashboard.update_ecn_flow_source_editor(
+            1, 1, None, None, None, None, None, None,
+            None, None, None, None, "EURSEK", selected, extras,
+            direct_A, direct_k, probabilities,
+        )
+        assert removed[0] == [] and removed[1] == "direct"
+    finally:
+        dashboard.ctx.triggered_id = old_trigger
+
+
+def test_ecn_missing_size_inputs_skip_save_during_partial_mount(dashboard):
+    old_trigger = dashboard.ctx.triggered_id
+    try:
+        dashboard.ctx.triggered_id = "ecn-flow-edit-A"
+        result = dashboard.update_ecn_flow_source_editor(
+            0, 0, None, None, None, 20, 0.1, 8.4,
+            None, None, None, None, "EURSEK", "direct", [],
+            0.15, 8.4, dashboard.ECN_TRADE_SIZE_PROBABILITIES,
+        )
+        assert result == (dashboard.no_update,) * 5
+    finally:
+        dashboard.ctx.triggered_id = old_trigger
