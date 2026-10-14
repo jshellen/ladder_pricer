@@ -1,5 +1,5 @@
 #include "ladder_pricer/expected_mtm.hpp"
-#include "ladder_pricer/howard.hpp"
+#include "ladder_pricer/solver.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -8,7 +8,7 @@
 
 using namespace ladder_pricer;
 
-static PricingProblem make_problem(double tau0, double tau1, double tau2) {
+static PricingProblem make_problem() {
     std::vector<double> states;
     for (int q=-20; q<=20; ++q) states.push_back(static_cast<double>(q));
     std::vector<Tier> tiers;
@@ -18,8 +18,8 @@ static PricingProblem make_problem(double tau0, double tau1, double tau2) {
     tiers.emplace_back("T2", std::vector<double>{1.,5.},
                        LogisticFlow(.0232,.303,.122,.48,2.86,.02),
                        SaturatingMarkout(.00090, 2.00), true, -10, 100);
-    return PricingProblem(std::move(states), .002, 0., QuadraticPenalty(.1,.002),
-                          InternalizationTime(tau0,tau1,tau2), std::move(tiers));
+    return PricingProblem(std::move(states), .002, QuadraticPenalty(.1,.002),
+                          std::move(tiers));
 }
 
 static bool almost(double a, double b, double eps=1e-11) {
@@ -27,7 +27,7 @@ static bool almost(double a, double b, double eps=1e-11) {
 }
 
 int main() {
-    const auto problem = make_problem(4.,.070,.0084);
+    const auto problem = make_problem();
     const auto& grid = problem.grid().states();
     const std::size_t n = grid.size();
     const auto zero = problem.grid().zero_index();
@@ -64,19 +64,13 @@ int main() {
     assert(almost(mtm.win_increment(0,+1.,10.,15.),-5.*.00050/(1.+r*.5)));
     assert(almost(mtm.weighted_inventory(0,0.),0.));
 
-    // 3) The old tau0/tau1/tau2 internalization proxy must NOT change
-    // the resulting policy, reward, or whole-inventory expected MTM.
-    const auto s1 = HowardSolver(make_problem(4.,.07,.0084)).solve();
-    const auto s2 = HowardSolver(make_problem(50.,3.,5.)).solve();
-    assert(s1.diagnostics.converged && s2.diagnostics.converged);
-    assert(almost(s1.average_reward,s2.average_reward,1e-11));
-    assert(s1.value.size()==s2.value.size());
-    for(std::size_t i=0;i<s1.value.size();++i){
-        assert(almost(s1.value[i],s2.value[i],1e-10));
-    }
-    const auto idx=s1.q_grid.size()/2+10;
-    assert(almost(s1.gross_mtm_tiers[0].bid[idx][1],
-                  s2.gross_mtm_tiers[0].bid[idx][1],1e-10));
-    assert(std::isfinite(s1.gross_mtm_tiers[0].bid[idx][1]));
-    std::cout << "Expected MTM resolvent, side signs, and legacy independence OK\n";
+    // 3) The markout resolvent continues to supply finite values to the
+    // production solver, without an exogenous internalization-time proxy.
+    const auto solution = Solver(make_problem(),{12.,20.,35.},
+        {{0.,.1,.02},{.04,0.,.08},{.02,.07,0.}}).solve();
+    assert(solution.converged);
+    assert(solution.evaluation_residual<1e-8);
+    assert(solution.weighted_inventory.size()==2);
+    for (auto x:solution.weighted_inventory[0]) assert(std::isfinite(x));
+    std::cout << "Expected MTM resolvent and side signs OK\n";
 }

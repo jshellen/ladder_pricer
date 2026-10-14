@@ -46,7 +46,7 @@ body { overflow-x: hidden; }
 .status.error { color: #ff7b72; border-color: #6e3030; }
 .tabs { margin-top: 2px; }
 .tab-inner { padding-top: 14px; }
-.metrics-row { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 10px; }
+.metrics-row { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 10px; }
 .metrics-six { grid-template-columns: repeat(6,minmax(0,1fr)); }
 .metric-card, .chart-card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); }
 .metric-card { padding: 13px 14px; min-width: 0; }
@@ -196,12 +196,48 @@ input[type="checkbox"] { accent-color: var(--accent); }
 .modal-close { border:0; background:transparent; color:var(--muted); font-size:28px; cursor:pointer; line-height:1; padding:0 4px; }
 .modal-close:hover { color:var(--text); }
 .flow-source-target-label { margin:14px 0; color:#d8dee9; font-weight:600; }
+/* Market Data and Pricing Rungs now share the direct-flow source card
+   with RFQ flow intensities, Volatility and Markouts.  Do not create an
+   additional nested box for the two persistent input sections. */
+.flow-target-direct-settings > .diagnostic-expander { margin-top: 12px; }
+.flow-target-direct-settings .diagnostic-expander-body { padding: 14px; }
+.flow-target-market-data .grid-2 { gap: 12px; }
+.flow-target-pricing-knots .field { width: 100%; }
 .flow-source-editor { display:flex; flex-direction:column; gap:12px; }
 .flow-source-card { border:1px solid var(--border); border-radius:10px; background:#111821; padding:14px; }
 .flow-source-row-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
 .flow-source-title { font-weight:700; color:var(--text); }
 .modal-actions { display:flex; justify-content:space-between; align-items:center; gap:12px; border-top:1px solid var(--border); margin-top:16px; padding-top:14px; }
-.modal-actions-right { display:flex; gap:8px; }
+.modal-actions-right { display:flex; align-items:stretch; gap:10px; }
+/* Both source editors keep Add and (crossed-only) Remove together in the footer. */
+.modal-actions-left { display:flex; align-items:center; flex-wrap:wrap; gap:10px; }
+.modal-actions-left .secondary-button { align-self:auto; margin:0; height:44px; }
+.modal-actions-left .modal-remove-button {
+  display:inline-flex; align-items:center; justify-content:center;
+  height:44px; box-sizing:border-box; margin:0; padding:0 16px;
+  border-radius:9px; font:inherit; font-size:14px; font-weight:700;
+  line-height:1; white-space:nowrap; cursor:pointer;
+}
+.modal-actions-left .modal-remove-button:disabled { cursor:not-allowed; }
+/* Match the two footer buttons exactly, independent of the global sticky
+   full-width .primary-button style used by the main Solve button. */
+.modal-actions-right .modal-action-button {
+  display:inline-flex; align-items:center; justify-content:center;
+  flex:0 0 112px; width:112px; height:44px; box-sizing:border-box;
+  margin:0; padding:0 14px; border:1px solid transparent;
+  border-radius:9px; font:inherit; font-size:14px; font-weight:700;
+  line-height:1; white-space:nowrap; cursor:pointer;
+  position:static;
+}
+.modal-action-apply { background:var(--accent); color:#06111d; }
+.modal-action-apply:hover { background:#79b8ff; }
+.modal-action-danger, .modal-remove-button {
+  background:#c43636; color:#fff; border:1px solid #e05b5b;
+}
+.modal-action-danger:hover, .modal-remove-button:hover {
+  background:#e04444; color:#fff; border-color:#f08080;
+}
+
 .ghost-button { background:transparent; color:var(--muted); border:1px solid var(--border); border-radius:6px; padding:8px 12px; cursor:pointer; }
 .ghost-button:hover { color:var(--text); border-color:#526172; }
 .empty-flow-sources { border:1px dashed var(--border); border-radius:8px; text-align:center; }
@@ -209,6 +245,29 @@ input[type="checkbox"] { accent-color: var(--accent); }
 
 /* Pair-card flow source editor */
 .flow-source-dialog-body { display:flex; flex-direction:column; gap:18px; }
+/* Pair selectors sit below the Direct/Crossed cards, never stretched
+   across the full-width popup.  Each pair uses two stacked, aligned rows. */
+.flow-source-modal .flow-pair-selectors {
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+  width:min(100%, 480px);
+  margin:4px 0 12px;
+}
+.flow-source-modal .flow-pair-selectors > .field { margin:0; }
+/* Show the Direct source's disabled crossing control as a genuine disabled
+   dropdown while keeping its label/placeholder legible on white. */
+.flow-source-modal #flow-direct-crossing-placeholder,
+.flow-source-modal #ecn-direct-crossing-placeholder { opacity:0.8; }
+.flow-source-modal #flow-direct-crossing-placeholder button:disabled,
+.flow-source-modal #ecn-direct-crossing-placeholder button:disabled,
+.flow-source-modal #flow-direct-crossing-placeholder [aria-disabled="true"],
+.flow-source-modal #ecn-direct-crossing-placeholder [aria-disabled="true"],
+.flow-source-modal #flow-direct-crossing-placeholder .Select-control,
+.flow-source-modal #ecn-direct-crossing-placeholder .Select-control {
+  background:#e4e8ee !important;
+  cursor:not-allowed !important;
+}
 .flow-pair-cards { display:flex; flex-wrap:wrap; gap:10px; padding:2px 0 4px; }
 .flow-pair-card-wrap { position:relative; min-width:132px; }
 .flow-pair-card {
@@ -345,6 +404,25 @@ input[type="checkbox"] { accent-color: var(--accent); }
   opacity: 1 !important;
 }
 
+/* The sole editable Target FX pair lives in Global, outside the modal.
+   Dash 4 may put .field-dropdown on its own button. Keep the selected text
+   black on the white control (the same treatment as the modal pickers). */
+.sidebar #global-target-pair {
+  --Dash-Text-Primary: #111821;
+  --Dash-Text-Secondary: #334155;
+  color: #111821 !important;
+  -webkit-text-fill-color: #111821 !important;
+  background: #ffffff !important;
+}
+.sidebar #global-target-pair *,
+.sidebar #global-target-pair button,
+.sidebar #global-target-pair [role="combobox"],
+.sidebar #global-target-pair .dash-dropdown-value-item {
+  color: #111821 !important;
+  -webkit-text-fill-color: #111821 !important;
+  opacity: 1 !important;
+}
+
 /* Monte-Carlo progress modal */
 .mc-progress-modal-card {
   width:min(540px, 94vw);
@@ -379,3 +457,109 @@ input[type="checkbox"] { accent-color: var(--accent); }
   font-size:13px;
 }
 .status.running { color:#d29922; border-color:#6b5522; }
+
+/* Stochastic-volatility parameters in the target flow-source modal. */
+.flow-source-settings .grid-3 { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }
+.flow-source-dynamic-expanders > .diagnostic-expander { margin-top:12px; }
+.flow-source-settings .diagnostic-expander-body { padding:14px; }
+@media (max-width:700px) { .flow-source-settings .grid-3 { grid-template-columns:1fr; } }
+
+/* Regime controls live inside the individual policy diagnostics expanders. */
+.regime-local-selector { padding: 6px 8px 10px; max-width: 340px; }
+.regime-local-selector .field { flex: 1; margin-bottom: 0; }
+
+
+/* Main sidebar Tier/Dark pool/ECN enable labels: always white on dark.
+   Explicitly style the option's text Span as well as its Checklist wrapper.
+   Modal markout checkboxes are deliberately unaffected. */
+.channel-enable-checkbox,
+.channel-enable-checkbox label,
+.channel-enable-checkbox .channel-enable-label {
+  color: #ffffff !important;
+  -webkit-text-fill-color: #ffffff !important;
+  opacity: 1 !important;
+}
+
+/* Policy volatility-regime, Tier and ladder-inventory dropdowns: Dash 4 markup.
+
+   Dash 4 renders className on the BUTTON itself:
+       .dash-dropdown-wrapper > button.dash-dropdown.policy-selector-dropdown
+           > .dash-dropdown-trigger > .dash-dropdown-value
+   It does not render .policy-selector-dropdown around .dash-dropdown-wrapper.
+   Previous selectors such as `.policy-selector-dropdown .dash-dropdown-wrapper
+   button *` never matched the visible selected value.
+
+   The outer .policy-selector-field is ours and also scopes the Popover menu,
+   which is a sibling of the button in Dash 4. Legacy React-Select remains
+   supported below; no unrelated dashboard dropdowns are affected.
+*/
+.policy-selector-field {
+  --Dash-Text-Primary: #111821;
+  --Dash-Text-Strong: #111821;
+  --Dash-Text-Weak: #334155;
+  --Dash-Text-Disabled: #536577;
+  --Dash-Text-Secondary: #334155;
+  --Dash-Fill-Inverse-Strong: #ffffff;
+  color-scheme: light;
+}
+/* The className is on the BUTTON in Dash 4, not the wrapper. */
+.policy-selector-field .dash-dropdown-wrapper,
+.policy-selector-field button.dash-dropdown.policy-selector-dropdown,
+.policy-selector-field .dash-dropdown-content,
+.policy-selector-field .Select-control,
+.policy-selector-field .Select-menu-outer,
+.policy-selector-field [class*="-control"] {
+  background: #ffffff !important;
+  color: #111821 !important;
+  border-color: #526172 !important;
+}
+/* Selected value, its actual item spans, and the unsolved placeholder. */
+.policy-selector-field button.dash-dropdown .dash-dropdown-value,
+.policy-selector-field button.dash-dropdown .dash-dropdown-value-item,
+.policy-selector-field button.dash-dropdown .dash-dropdown-value-item *,
+.policy-selector-field button.dash-dropdown .dash-dropdown-placeholder,
+.policy-selector-field .Select-value-label,
+.policy-selector-field .Select-placeholder,
+.policy-selector-field [class*="singleValue"] {
+  color: #111821 !important;
+  -webkit-text-fill-color: #111821 !important;
+  opacity: 1 !important;
+}
+.policy-selector-field button.dash-dropdown .dash-dropdown-trigger-icon {
+  color: #334155 !important;
+  fill: #334155 !important;
+}
+/* Dash 4 popup lives alongside the button; style the complete option tree. */
+.policy-selector-field .dash-dropdown-content,
+.policy-selector-field .dash-dropdown-options,
+.policy-selector-field .dash-dropdown-option,
+.policy-selector-field .dash-dropdown-option *,
+.policy-selector-field .dash-dropdown-search,
+.policy-selector-field .Select-option,
+.policy-selector-field .VirtualizedSelectOption,
+.policy-selector-field [role="option"] {
+  color: #111821 !important;
+  -webkit-text-fill-color: #111821 !important;
+}
+.policy-selector-field .dash-dropdown-option:hover,
+.policy-selector-field .dash-dropdown-option:focus,
+.policy-selector-field .Select-option.is-focused {
+  background: #eef3f8 !important;
+}
+
+/* ECN heatmap controls are local to each diagnostic expander. */
+.ecn-heatmap-toggle {
+  display: inline-flex;
+  align-items: center;
+  margin: 12px 8px 4px;
+  padding: 8px 12px;
+  border: 1px solid #3b526a;
+  border-radius: 8px;
+  background: #182637;
+  color: #f5f7fb;
+  font-size: 13px;
+  font-weight: 600;
+}
+.ecn-heatmap-toggle:hover { border-color: #58a6ff; background: #1d3046; }
+.ecn-heatmap-toggle input { accent-color: #58a6ff; width: 16px; height: 16px; margin: 0 12px 0 0 !important; }
+.ecn-heatmap-toggle-label { color: #f5f7fb; -webkit-text-fill-color: #f5f7fb; }

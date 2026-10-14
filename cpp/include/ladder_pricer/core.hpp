@@ -137,22 +137,6 @@ private:
     double tau_minutes_;
 };
 
-class InternalizationTime {
-public:
-    InternalizationTime(double tau0, double tau1, double tau2)
-        : tau0_(tau0), tau1_(tau1), tau2_(tau2) {}
-
-    double value(double inventory) const noexcept;
-    double tau0() const noexcept { return tau0_; }
-    double tau1() const noexcept { return tau1_; }
-    double tau2() const noexcept { return tau2_; }
-
-private:
-    double tau0_;
-    double tau1_;
-    double tau2_;
-};
-
 class QuadraticPenalty {
 public:
     QuadraticPenalty(double risk_aversion, double sigma);
@@ -170,17 +154,13 @@ class Tier {
 public:
     Tier(std::string name, std::vector<double> sizes, LogisticFlow flow,
          SaturatingMarkout markout, bool use_markout,
-         double delta_min, double delta_max, double fee = 0.0,
-         double rfq_size_step = 1.0);
+         double delta_min, double delta_max, double fee = 0.0);
     Tier(std::string name, std::vector<double> sizes, AggregatedFlow flow,
          SaturatingMarkout markout, bool use_markout,
-         double delta_min, double delta_max, double fee = 0.0,
-         double rfq_size_step = 1.0);
+         double delta_min, double delta_max, double fee = 0.0);
 
     const std::string& name() const noexcept { return name_; }
     const std::vector<double>& sizes() const noexcept { return sizes_; }
-    const std::vector<double>& rfq_sizes() const noexcept { return rfq_sizes_; }
-    double rfq_size_step() const noexcept { return rfq_size_step_; }
     const AggregatedFlow& flow() const noexcept { return flow_; }
     const SaturatingMarkout& markout() const noexcept { return markout_; }
     bool use_markout() const noexcept { return use_markout_; }
@@ -191,8 +171,6 @@ public:
 private:
     std::string name_;
     std::vector<double> sizes_;
-    std::vector<double> rfq_sizes_;
-    double rfq_size_step_ = 1.0;
     AggregatedFlow flow_;
     SaturatingMarkout markout_;
     bool use_markout_;
@@ -389,18 +367,14 @@ class PricingProblem {
 public:
     PricingProblem(std::vector<double> operational_inventory_grid,
                    double spread,
-                   double spot_drift,
                    QuadraticPenalty penalty,
-                   InternalizationTime internalization_time,
                    std::vector<Tier> tiers,
                    std::optional<DarkPool> dark_pool = std::nullopt,
                    std::optional<PassiveECN> passive_ecn = std::nullopt);
 
     const InventoryGrid& grid() const noexcept { return grid_; }
     double spread() const noexcept { return spread_; }
-    double spot_drift() const noexcept { return spot_drift_; }
     const QuadraticPenalty& penalty() const noexcept { return penalty_; }
-    const InternalizationTime& internalization_time() const noexcept { return internalization_time_; }
     const std::vector<Tier>& tiers() const noexcept { return tiers_; }
     const std::optional<DarkPool>& dark_pool() const noexcept { return dark_pool_; }
     const std::optional<PassiveECN>& passive_ecn() const noexcept { return passive_ecn_; }
@@ -413,59 +387,13 @@ private:
 
     InventoryGrid grid_;
     double spread_;
-    double spot_drift_;
     QuadraticPenalty penalty_;
-    InternalizationTime internalization_time_;
     std::vector<Tier> tiers_;
     std::optional<DarkPool> dark_pool_;
     std::optional<PassiveECN> passive_ecn_;
 };
 
-struct SolverDiagnostics {
-    bool converged = false;
-    int iterations = 0;
-    double average_reward = 0.0;
-    double reward_lower_bound = 0.0;
-    double reward_upper_bound = 0.0;
-    std::vector<double> value_change;
-    std::vector<double> bellman_residual;
-};
-
-struct Solution {
-    std::vector<double> q_grid;
-    std::vector<double> value;
-    std::vector<double> solve_q_grid;
-    std::vector<double> value_solve;
-    // Operational policies are convenient for pricing/UI use.
-    std::vector<LadderPolicy> tier_policies;
-    std::optional<DarkPoolPolicy> dark_pool_policy;
-    std::optional<PassiveECNPolicy> passive_ecn_policy;
-
-    // Full hidden-grid policies are retained for simulation and diagnostics.
-    std::vector<LadderPolicy> solve_tier_policies;
-    // Expected gross MTM of won RFQs and incremental won-vs-lost MTM.
-    // Values are in millions of quote currency; pybind converts to EUR.
-    std::vector<LadderPolicy> gross_mtm_tiers;
-    std::vector<LadderPolicy> incremental_mtm_tiers;
-    std::optional<DarkPoolPolicy> solve_dark_pool_policy;
-    std::optional<PassiveECNPolicy> solve_passive_ecn_policy;
-    double average_reward = 0.0;
-    double hard_inventory_limit = 0.0;
-    SolverDiagnostics diagnostics;
-};
-
 class ExpectedMtm;
-
-class BellmanModel {
-public:
-    explicit BellmanModel(const PricingProblem& problem) : problem_(problem) {}
-
-    std::vector<double> rhs(const std::vector<double>& value, const Policy& policy,
-                            const ExpectedMtm& mtm) const;
-
-private:
-    const PricingProblem& problem_;
-};
 
 class PolicyBuilder {
 public:

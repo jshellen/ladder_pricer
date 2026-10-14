@@ -1,8 +1,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "ladder_pricer/solver.hpp"
 #include "ladder_pricer/analytics.hpp"
-#include "ladder_pricer/howard.hpp"
 #include "ladder_pricer/simulation.hpp"
 
 #include <algorithm>
@@ -40,11 +40,6 @@ std::vector<double> numbers(const py::handle& value) {
     return py::cast<std::vector<double>>(value);
 }
 
-std::vector<double> optional_numbers(const py::dict& object, const char* key) {
-    const py::str k(key);
-    return object.contains(k) ? numbers(object[k]) : std::vector<double>{};
-}
-
 std::vector<double> build_grid(const py::dict& spec) {
     const std::string mode = text(spec, "mode");
     if (mode != "uniform") {
@@ -72,27 +67,6 @@ std::vector<double> build_grid(const py::dict& spec) {
 
 
 
-std::vector<double> rfq_size_support(const std::vector<double>& pricing_sizes, double step) {
-    if (pricing_sizes.empty()) throw std::invalid_argument("tier sizes must not be empty");
-    if (!(step > 0.0) || !std::isfinite(step)) {
-        throw std::invalid_argument("RFQ size step must be positive");
-    }
-    const double lo = pricing_sizes.front();
-    const double hi = pricing_sizes.back();
-    std::vector<double> out;
-    for (std::size_t n = 0;; ++n) {
-        const double z = lo + static_cast<double>(n) * step;
-        if (z > hi + 1e-10) break;
-        out.push_back(std::min(z, hi));
-    }
-    if (out.empty() || std::abs(out.back() - hi) > 1e-10) out.push_back(hi);
-    out.insert(out.end(), pricing_sizes.begin(), pricing_sizes.end());
-    std::sort(out.begin(), out.end());
-    out.erase(std::unique(out.begin(), out.end(), [](double a, double b) {
-        return std::abs(a - b) <= 1e-10;
-    }), out.end());
-    return out;
-}
 
 double a0_from_total_rfq_rate(const py::dict& flow,
                                   const std::vector<double>& target_sizes,
@@ -128,8 +102,7 @@ LogisticFlow build_logistic_flow(const py::dict& flow,
 
 AggregatedFlow build_tier_flow(const py::dict& tier, double target_spread_pips) {
     const std::vector<double> pricing_sizes = numbers(tier[py::str("sizes")]);
-    const std::vector<double> target_sizes = rfq_size_support(
-        pricing_sizes, optional_number(tier, "rfqSizeStep", 1.0));
+    const std::vector<double>& target_sizes = pricing_sizes;
     const py::str sources_key("flowSources");
     if (!tier.contains(sources_key)) {
         const py::dict flow = py::cast<py::dict>(tier[py::str("flow")]);
@@ -261,7 +234,7 @@ std::optional<PassiveECN> build_passive_ecn(const py::dict& cfg, double target_s
         number(cfg, "quoteSize"), number(cfg, "makerFeePips") / 10000.0);
 }
 
-PricingProblem build_problem(const py::dict& cfg, std::optional<double> gamma_override = std::nullopt) {
+PricingProblem build_problem(const py::dict& cfg) {
     std::vector<Tier> tiers;
     // Each tier has its own signed adverse EUR/M markout curve, common to
     // every RFQ size inside that tier. Convert to positive quote/base price
@@ -286,23 +259,19 @@ PricingProblem build_problem(const py::dict& cfg, std::optional<double> gamma_ov
             build_tier_flow(tier, number(cfg, "spreadPips")),
             tier_markout,
             boolean(tier, "useMarkout"), number(tier, "deltaMin"), number(tier, "deltaMax"),
-            optional_number(tier, "feePips", 0.0) / 10000.0,
-            optional_number(tier, "rfqSizeStep", 1.0));
+            optional_number(tier, "feePips", 0.0) / 10000.0);
     }
     if (tiers.empty() && !boolean(py::cast<py::dict>(cfg[py::str("darkPool")]), "enabled")
         && !boolean(py::cast<py::dict>(cfg[py::str("passiveEcn")]), "enabled")) {
         throw std::invalid_argument("enable at least one pricing tier, dark pool, or passive ECN");
     }
 
-    const py::dict internal = py::cast<py::dict>(cfg[py::str("internalization")]);
     const double sigma = number(cfg, "sigmaPips") / 10000.0;
-    const double gamma = gamma_override.value_or(number(cfg, "gamma"));
+    const double gamma = number(cfg, "gamma");
     return PricingProblem(
         build_grid(py::cast<py::dict>(cfg[py::str("grid")])),
         number(cfg, "spreadPips") / 10000.0,
-        number(cfg, "spotDrift"),
         QuadraticPenalty(gamma, sigma),
-        InternalizationTime(number(internal, "tau0"), number(internal, "tau1"), number(internal, "tau2")),
         std::move(tiers),
         build_dark_pool(py::cast<py::dict>(cfg[py::str("darkPool")])),
         build_passive_ecn(py::cast<py::dict>(cfg[py::str("passiveEcn")]), number(cfg, "spreadPips")));
@@ -312,122 +281,6 @@ py::list matrix_value(const std::vector<std::vector<double>>& matrix) {
     py::list rows;
     for (const auto& row : matrix) rows.append(row);
     return rows;
-}
-
-py::dict solution_value(const Solution& solution, const PricingProblem& problem, double reference_spot) {
-    py::dict out;
-    out["qGrid"] = solution.q_grid;
-    out["value"] = solution.value;
-    out["averageReward"] = solution.average_reward;
-    out["hardInventoryLimit"] = solution.hard_inventory_limit;
-    out["converged"] = solution.diagnostics.converged;
-    out["iterations"] = solution.diagnostics.iterations;
-    out["residual"] = solution.diagnostics.reward_upper_bound - solution.diagnostics.reward_lower_bound;
-    out["valueChange"] = solution.diagnostics.value_change;
-    out["bellmanResidual"] = solution.diagnostics.bellman_residual;
-
-    py::list tier_values;
-    for (std::size_t k = 0; k < solution.tier_policies.size(); ++k) {
-        py::dict tier;
-        tier["name"] = problem.tiers()[k].name();
-        tier["sizes"] = solution.tier_policies[k].sizes;
-        tier["bid"] = matrix_value(solution.tier_policies[k].bid);
-        tier["ask"] = matrix_value(solution.tier_policies[k].ask);
-        tier["feePips"] = problem.tiers()[k].fee() * 10000.0;
-        tier_values.append(std::move(tier));
-    }
-    out["tiers"] = std::move(tier_values);
-    // Gross event MTM is the entire post-trade inventory exposure; the
-    // incremental (won-vs-lost) value is what enters the HJB reward.
-    py::list mtm_values;
-    for (std::size_t k = 0; k < solution.gross_mtm_tiers.size(); ++k) {
-        const auto& gross = solution.gross_mtm_tiers[k];
-        const auto& inc = solution.incremental_mtm_tiers[k];
-        const double factor = 1e6 / reference_spot;
-        const auto to_eur = [factor](const std::vector<std::vector<double>>& rows) {
-            py::list out_rows;
-            for (const auto& row : rows) {
-                std::vector<double> euros;
-                euros.reserve(row.size());
-                for (double v : row) euros.push_back(v * factor);
-                out_rows.append(euros);
-            }
-            return out_rows;
-        };
-        py::dict item;
-        item["name"] = problem.tiers()[k].name();
-        item["sizes"] = gross.sizes;
-        item["grossBidEur"] = to_eur(gross.bid);
-        item["grossAskEur"] = to_eur(gross.ask);
-        item["incrementalBidEur"] = to_eur(inc.bid);
-        item["incrementalAskEur"] = to_eur(inc.ask);
-        mtm_values.append(std::move(item));
-    }
-    out["expectedMtm"] = std::move(mtm_values);
-    out["expectedMtmUnits"] = "EUR per RFQ event (whole inventory MTM)";
-    out["optimizationMethod"] = "damped policy-dependent MTM best response";
-
-    if (solution.dark_pool_policy && problem.dark_pool()) {
-        const auto& policy = *solution.dark_pool_policy;
-        py::dict dark;
-        dark["qGrid"] = policy.q_grid;
-        dark["bidSize"] = policy.bid_size;
-        dark["askSize"] = policy.ask_size;
-        dark["bidActive"] = policy.bid_active;
-        dark["askActive"] = policy.ask_active;
-        dark["postedSizes"] = problem.dark_pool()->posted_sizes();
-        dark["intensity"] = problem.dark_pool()->arrivals(Side::Bid).arrival_intensity();
-        dark["distribution"] = problem.dark_pool()->arrivals(Side::Bid).name();
-        dark["feePips"] = problem.dark_pool()->fee(Side::Bid) * 10000.0;
-        out["darkPool"] = std::move(dark);
-    } else {
-        out["darkPool"] = py::none();
-    }
-
-    if (solution.passive_ecn_policy && problem.passive_ecn()) {
-        const auto& policy = *solution.passive_ecn_policy;
-        const auto& venue = *problem.passive_ecn();
-        py::dict ecn;
-        ecn["qGrid"] = policy.q_grid;
-        ecn["bidDelta"] = policy.bid_delta;
-        ecn["askDelta"] = policy.ask_delta;
-        ecn["bidActive"] = policy.bid_active;
-        ecn["askActive"] = policy.ask_active;
-        ecn["deltas"] = venue.deltas();
-        std::vector<double> fill_rates;
-        fill_rates.reserve(venue.deltas().size());
-        for (double delta : venue.deltas()) {
-            fill_rates.push_back(venue.flow().arrival_rate(delta));
-        }
-        ecn["fillRates"] = fill_rates;
-        py::list source_values;
-        for (const auto& source : venue.flow().sources()) {
-            py::dict item;
-            item["name"] = source.name();
-            item["A"] = source.flow().a();
-            item["k"] = source.flow().k();
-            item["deltaScale"] = source.delta_scale();
-            item["sourceSizePerTarget"] = source.source_size_per_target();
-            item["tradeSizes"] = source.trade_sizes();
-            item["tradeSizeProbabilities"] = source.trade_size_probabilities();
-            item["meanTradeSize"] = source.mean_trade_size();
-            item["meanTargetTradeSize"] = source.mean_target_trade_size();
-            item["fullFillProbability"] = source.full_fill_probability(venue.quote_size());
-            item["expectedFillSize"] = source.expected_fill_size(venue.quote_size());
-            std::vector<double> source_rates;
-            source_rates.reserve(venue.deltas().size());
-            for (double delta : venue.deltas()) source_rates.push_back(source.arrival_rate(delta));
-            item["fillRates"] = std::move(source_rates);
-            source_values.append(std::move(item));
-        }
-        ecn["flowSources"] = std::move(source_values);
-        ecn["quoteSize"] = venue.quote_size();
-        ecn["makerFeePips"] = venue.maker_fee() * 10000.0;
-        out["passiveEcn"] = std::move(ecn);
-    } else {
-        out["passiveEcn"] = py::none();
-    }
-    return out;
 }
 
 py::dict stats_value(const PnlStatistics& statistics) {
@@ -539,6 +392,7 @@ py::dict path_value(const SamplePath& path) {
     out["spots"] = path.spots;
     out["inventories"] = path.inventories;
     out["cashes"] = path.cashes;
+    out["regimes"] = path.regimes;
     py::list fills;
     for (const auto& fill : path.fills) fills.append(fill_value(fill));
     out["fills"] = std::move(fills);
@@ -561,6 +415,7 @@ py::dict monte_carlo_value(const MonteCarloResult& result, bool compact_result =
         out["finalInventory"] = result.final_inventory;
         out["finalSpot"] = result.final_spot;
         out["tradeCount"] = result.trade_count;
+        out["finalRegime"] = result.final_regime;
     }
     out["times"] = result.sample_times;
     out["inventoryLower"] = result.inventory_lower;
@@ -607,129 +462,299 @@ public:
           problem_(build_problem(config_)) {}
 
     py::dict solve() {
-        {
-            py::gil_scoped_release release;
-            solution_ = HowardSolver(problem_).solve();
+        // A single production solver: joint inventory and volatility regimes.
+        if (!config_.contains(py::str("volatilityRegimes"))) {
+            throw std::invalid_argument("volatilityRegimes is required: the legacy single-volatility solver has been removed");
         }
-        return solution_value(*solution_, problem_, reference_spot_);
+        const py::dict cfg = py::cast<py::dict>(config_[py::str("volatilityRegimes")]);
+        const auto sigma = numbers(cfg[py::str("sigmaPips")]);
+        const auto rates = py::cast<std::vector<std::vector<double>>>(cfg[py::str("ratesPerMinute")]);
+        ensure_solved();
+        const SolverResult& result=*solution_;
+        py::dict out;
+        out["qGrid"] = result.q_grid;
+        out["sigmaPips"] = result.sigma_pips;
+        out["valueByRegime"] = matrix_value(result.values);
+        out["averageReward"] = result.average_reward;
+        out["iterations"] = result.iterations;
+        out["converged"] = result.converged;
+        out["evaluationResidual"] = result.evaluation_residual;
+        py::list regimes;
+        const auto& indices=problem_.grid().operational_indices();
+        const auto& states=problem_.grid().states();
+        const std::size_t hidden_n=states.size();
+        for (std::size_t r=0;r<result.policies.size();++r) {
+            const auto& policy=result.policies[r];
+            py::dict item;
+            item["sigmaPips"]=sigma[r];
+            py::list tiers;
+            for (std::size_t k=0;k<policy.tiers.size();++k) {
+                const auto& ladder=policy.tiers[k];
+                py::dict t;
+                t["name"]=problem_.tiers()[k].name();
+                t["sizes"]=ladder.sizes;
+                t["feePips"]=problem_.tiers()[k].fee()*10000.0;
+                std::vector<std::vector<double>> bid,ask;
+                for (auto i:indices) {bid.push_back(ladder.bid[i]);ask.push_back(ladder.ask[i]);}
+                t["bid"]=matrix_value(bid);
+                t["ask"]=matrix_value(ask);
+                tiers.append(t);
+            }
+            item["tiers"]=tiers;
+            if (policy.passive_ecn) {
+                const auto& e=*policy.passive_ecn;
+                py::dict ecn;
+                std::vector<double> bid,ask;
+                std::vector<bool> bid_active,ask_active;
+                for (auto i:indices) {
+                    bid.push_back(e.bid_delta[i]); ask.push_back(e.ask_delta[i]);
+                    bid_active.push_back(e.bid_active[i]); ask_active.push_back(e.ask_active[i]);
+                }
+                ecn["qGrid"]=result.q_grid;
+                ecn["bidDelta"]=bid;
+                ecn["askDelta"]=ask;
+                ecn["bidActive"]=bid_active;
+                ecn["askActive"]=ask_active;
+                if (problem_.passive_ecn()) {
+                    const auto& venue=*problem_.passive_ecn();
+                    ecn["deltas"]=venue.deltas();
+                    std::vector<double> rates;
+                    for (auto delta:venue.deltas()) rates.push_back(venue.flow().arrival_rate(delta));
+                    ecn["fillRates"]=rates;
+                    ecn["quoteSize"]=venue.quote_size();
+                    ecn["makerFeePips"]=venue.maker_fee()*10000.0;
+                    py::list source_values;
+                    for (const auto& source:venue.flow().sources()) {
+                        py::dict source_value;
+                        source_value["name"]=source.name();
+                        source_value["A"]=source.flow().a();
+                        source_value["k"]=source.flow().k();
+                        source_value["deltaScale"]=source.delta_scale();
+                        source_value["sourceSizePerTarget"]=source.source_size_per_target();
+                        source_value["tradeSizes"]=source.trade_sizes();
+                        source_value["tradeSizeProbabilities"]=source.trade_size_probabilities();
+                        source_value["meanTradeSize"]=source.mean_trade_size();
+                        source_value["meanTargetTradeSize"]=source.mean_target_trade_size();
+                        source_value["fullFillProbability"]=source.full_fill_probability(venue.quote_size());
+                        source_value["expectedFillSize"]=source.expected_fill_size(venue.quote_size());
+                        std::vector<double> source_rates;
+                        for (auto delta:venue.deltas()) source_rates.push_back(source.arrival_rate(delta));
+                        source_value["fillRates"]=source_rates;
+                        source_values.append(source_value);
+                    }
+                    ecn["flowSources"]=source_values;
+                }
+                item["passiveEcn"]=ecn;
+            } else item["passiveEcn"]=py::none();
+            if (policy.dark_pool && problem_.dark_pool()) {
+                const auto& dp=*policy.dark_pool;
+                const auto& venue=*problem_.dark_pool();
+                py::dict dark;
+                std::vector<double> bid,ask;
+                std::vector<bool> ba,aa;
+                for (auto i:indices) {
+                    bid.push_back(dp.bid_size[i]);ask.push_back(dp.ask_size[i]);
+                    ba.push_back(dp.bid_active[i]);aa.push_back(dp.ask_active[i]);
+                }
+                dark["qGrid"]=result.q_grid;
+                dark["bidSize"]=bid;
+                dark["askSize"]=ask;
+                dark["bidActive"]=ba;
+                dark["askActive"]=aa;
+                dark["postedSizes"]=venue.posted_sizes();
+                dark["intensity"]=venue.arrivals(Side::Bid).arrival_intensity();
+                dark["distribution"]=venue.arrivals(Side::Bid).name();
+                dark["feePips"]=venue.fee(Side::Bid)*10000.0;
+                item["darkPool"]=dark;
+            } else item["darkPool"]=py::none();
+
+            // The simple RFQ markout remains a policy-dependent expected MTM
+            // integral, not a third state variable. Include joint regime
+            // switches in each tier's resolvent and expose the middle regime
+            // cross-section in the legacy chart format.
+            std::vector<std::vector<double>> weighted;
+            for (const auto& joined:result.weighted_inventory) {
+                weighted.emplace_back();
+                if (!joined.empty())
+                    weighted.back()={joined.begin()+static_cast<std::ptrdiff_t>(r*hidden_n),
+                                      joined.begin()+static_cast<std::ptrdiff_t>((r+1)*hidden_n)};
+            }
+            ExpectedMtm mtm(problem_,std::move(weighted));
+            py::list mtm_tiers;
+            for (std::size_t k=0;k<problem_.tiers().size();++k) {
+                const auto& tier=problem_.tiers()[k];
+                py::dict m;
+                m["name"]=tier.name();
+                m["sizes"]=tier.sizes();
+                std::vector<std::vector<double>> gb,ga,ib,ia;
+                const double scale=1e6/reference_spot_;
+                for (auto idx:indices) {
+                    const double q=states[idx];
+                    std::vector<double> b0,a0,b1,a1;
+                    for (double z:tier.sizes()) {
+                        b0.push_back(scale*mtm.trade_mtm(k, 1.,q+z));
+                        a0.push_back(scale*mtm.trade_mtm(k,-1.,q-z));
+                        b1.push_back(scale*mtm.win_increment(k, 1.,q,q+z));
+                        a1.push_back(scale*mtm.win_increment(k,-1.,q,q-z));
+                    }
+                    gb.push_back(b0);ga.push_back(a0);ib.push_back(b1);ia.push_back(a1);
+                }
+                m["grossBidEur"]=matrix_value(gb);
+                m["grossAskEur"]=matrix_value(ga);
+                m["incrementalBidEur"]=matrix_value(ib);
+                m["incrementalAskEur"]=matrix_value(ia);
+                mtm_tiers.append(m);
+            }
+            item["expectedMtm"]=mtm_tiers;
+            regimes.append(item);
+        }
+        out["regimes"]=regimes;
+        // Normal-volatility slice for the existing policy and quote diagnostics.
+        // The coupled solution, not a separate single-vol HJB, supplies it.
+        py::dict middle=py::cast<py::dict>(regimes[py::int_(regimes.size()/2)]);
+        out["value"]=result.values[result.values.size()/2];
+        out["tiers"]=middle["tiers"];
+        out["passiveEcn"]=middle["passiveEcn"];
+        out["darkPool"]=middle["darkPool"];
+        out["expectedMtm"]=middle["expectedMtm"];
+        out["expectedMtmUnits"]="EUR per RFQ event";
+        out["residual"]=result.evaluation_residual;
+        out["valueChange"]=std::vector<double>{};
+        out["bellmanResidual"]=std::vector<double>{};
+        out["hardInventoryLimit"]=problem_.grid().hard_limit();
+        out["stateVariables"]=std::vector<std::string>{"inventory", "volatility"};
+        out["optimizationMethod"]="coupled (q,sigma) C++ damped expected-MTM best response";
+        return out;
     }
 
-    py::dict statistics(double horizon_minutes, double initial_inventory = 0.0) {
+    py::dict solve_volatility() { return solve(); }
+
+    py::dict statistics(double horizon, double initial_inventory = 0.0,
+                        int initial_regime = -1) {
         ensure_solved();
-        const double sigma = number(config_, "sigmaPips") / 10000.0;
-        PnlStatistics statistics;
+        const auto cfg=py::cast<py::dict>(config_[py::str("volatilityRegimes")]);
+        const auto switches=py::cast<std::vector<std::vector<double>>>(cfg[py::str("ratesPerMinute")]);
+        PnlStatistics result;
         {
             py::gil_scoped_release release;
-            statistics = PnlAnalytics(problem_, *solution_, reference_spot_)
-                             .statistics(horizon_minutes, sigma, initial_inventory);
+            result=PnlAnalytics(problem_,*solution_,switches,reference_spot_)
+                .statistics(horizon,initial_inventory,initial_regime);
         }
-        return stats_value(statistics);
+        py::dict out=stats_value(result);
+        try {
+            std::vector<double> times;
+            { py::gil_scoped_release release;
+              times=PnlAnalytics(problem_,*solution_,switches,reference_spot_)
+                  .internalization_times(initial_regime); }
+            py::dict times_data;
+            times_data["qGrid"]=solution_->q_grid;
+            times_data["minutes"]=times;
+            out["internalizationTimes"]=times_data;
+        } catch (const std::exception&) {
+            // Some fixed policies have an infinite first-passage expectation.
+            // That diagnostic must not block exact finite-horizon PnL moments.
+        }
+        return out;
     }
 
-    py::dict simulate(double horizon_minutes, int paths, double initial_inventory,
-                      std::uint64_t seed, int retained_paths = 6, int sample_points = 191,
-                      py::object progress_callback = py::none(), bool compact_result = false) {
+    py::dict simulate(double horizon, int paths, double initial_inventory, std::uint64_t seed,
+                      int retained_paths = 6, int sample_points = 191,
+                      py::object progress_callback = py::none(), bool compact_result = false,
+                      int initial_regime = -1) {
         ensure_solved();
-        const double sigma = number(config_, "sigmaPips") / 10000.0;
-        MonteCarloResult result;
-
-        std::function<void(int, int)> progress;
-        if (!progress_callback.is_none()) {
-            py::function callback = py::reinterpret_borrow<py::function>(progress_callback);
-            progress = [callback](int completed, int total) {
-                // The numerical loop runs without the GIL. Reacquire it only for
-                // the sparse progress notifications exposed to the Dash worker.
-                py::gil_scoped_acquire acquire;
-                callback(completed, total);
+        const auto cfg=py::cast<py::dict>(config_[py::str("volatilityRegimes")]);
+        const auto switches=py::cast<std::vector<std::vector<double>>>(cfg[py::str("ratesPerMinute")]);
+        std::function<void(int,int)> progress;
+        if(!progress_callback.is_none()) {
+            py::function callback=py::reinterpret_borrow<py::function>(progress_callback);
+            progress=[callback](int done,int total) {
+                py::gil_scoped_acquire gil;
+                callback(done,total);
             };
         }
-
+        MonteCarloResult result;
         {
             py::gil_scoped_release release;
-            result = MonteCarloSimulator(problem_, *solution_, reference_spot_)
-                         .run(horizon_minutes, paths, sigma, initial_inventory, seed,
-                              retained_paths, sample_points, progress);
+            result=MonteCarloSimulator(problem_,*solution_,switches,reference_spot_)
+                .run(horizon,paths,initial_inventory,seed,retained_paths,sample_points,progress,initial_regime);
         }
-        return monte_carlo_value(result, compact_result);
+        return monte_carlo_value(result,compact_result);
     }
 
-    py::list frontier(const std::vector<double>& gamma_values, double horizon_minutes,
-                      double initial_inventory = 0.0) const {
-        const double sigma = number(config_, "sigmaPips") / 10000.0;
-        struct Point {
-            double gamma;
-            double mean;
-            double std;
-            double ratio;
-            int iterations;
-        };
+    py::list frontier(const std::vector<double>& gamma_values, double horizon,
+                      double initial_inventory = 0.0, int initial_regime = -1) const {
+        const auto cfg=py::cast<py::dict>(config_[py::str("volatilityRegimes")]);
+        const auto sigma=numbers(cfg[py::str("sigmaPips")]);
+        const auto switches=py::cast<std::vector<std::vector<double>>>(cfg[py::str("ratesPerMinute")]);
+        struct Point { double gamma, mean, std, ratio; int iterations; };
         std::vector<Point> points;
         points.reserve(gamma_values.size());
-        for (const double gamma : gamma_values) {
-            // Reading the Python config requires the GIL. Heavy numerical work does not.
-            PricingProblem problem = build_problem(config_, gamma);
-            Solution solution;
-            PnlStatistics statistics;
+        for(const double gamma:gamma_values) {
+            if(gamma<0.0 || !std::isfinite(gamma)) throw std::invalid_argument("invalid gamma");
+            PricingProblem modified(problem_.grid().operational_states(),problem_.spread(),
+                QuadraticPenalty(gamma,problem_.penalty().sigma()),
+                problem_.tiers(),problem_.dark_pool(),problem_.passive_ecn());
+            SolverResult result;
+            PnlStatistics stats;
             {
                 py::gil_scoped_release release;
-                solution = HowardSolver(problem).solve();
-                statistics = PnlAnalytics(problem, solution, reference_spot_)
-                                 .statistics(horizon_minutes, sigma, initial_inventory);
+                result=Solver(modified,sigma,switches).solve();
+                stats=PnlAnalytics(modified,result,switches,reference_spot_)
+                    .statistics(horizon,initial_inventory,initial_regime);
             }
-            points.push_back(Point{
-                gamma,
-                statistics.expected_base_ccy,
-                statistics.std_base_ccy,
-                statistics.std_base_ccy > 0.0
-                    ? statistics.expected_base_ccy / statistics.std_base_ccy
-                    : 0.0,
-                solution.diagnostics.iterations,
-            });
+            points.push_back({gamma,stats.expected_base_ccy,stats.std_base_ccy,
+                stats.std_base_ccy>0.0 ? stats.expected_base_ccy/stats.std_base_ccy : 0.0,
+                result.iterations});
         }
         py::list out;
-        for (const auto& point : points) {
+        for(const auto& p:points) {
             py::dict item;
-            item["gamma"] = point.gamma;
-            item["mean"] = point.mean;
-            item["std"] = point.std;
-            item["ratio"] = point.ratio;
-            item["iterations"] = point.iterations;
-            out.append(std::move(item));
+            item["gamma"]=p.gamma; item["mean"]=p.mean; item["std"]=p.std;
+            item["ratio"]=p.ratio; item["iterations"]=p.iterations;
+            out.append(item);
         }
         return out;
     }
 
 private:
-    void ensure_solved() {
-        if (solution_) return;
-        py::gil_scoped_release release;
-        solution_ = HowardSolver(problem_).solve();
-    }
-
     py::dict config_;
     double reference_spot_;
     PricingProblem problem_;
-    std::optional<Solution> solution_;
+    std::optional<SolverResult> solution_;
+    void ensure_solved() {
+        if(solution_) return;
+        const auto cfg=py::cast<py::dict>(config_[py::str("volatilityRegimes")]);
+        const auto sigma=numbers(cfg[py::str("sigmaPips")]);
+        const auto switches=py::cast<std::vector<std::vector<double>>>(cfg[py::str("ratesPerMinute")]);
+        SolverResult result;
+        { py::gil_scoped_release release; result=Solver(problem_,sigma,switches).solve(); }
+        solution_=std::move(result);
+    }
 };
 
 }  // namespace ladder_pricer::python
 
+
+
 PYBIND11_MODULE(_native, module) {
-    module.doc() = "C++ Howard pricing engine";
+    module.doc() = "C++ coupled inventory-volatility policy iteration engine";
     module.attr("ECN_PARAMETERIZATION_VERSION") = 10;
     // Increment whenever the Python -> native configuration schema changes.
     // Version 2 expects a separate markout object inside each RFQ tier.
-    module.attr("PRICING_CONFIG_SCHEMA_VERSION") = 3;
+    module.attr("PRICING_CONFIG_SCHEMA_VERSION") = 11;
     py::class_<ladder_pricer::python::Engine>(module, "Engine")
         .def(py::init<py::dict>())
         .def("solve", &ladder_pricer::python::Engine::solve)
+        .def("solve_volatility", &ladder_pricer::python::Engine::solve_volatility)
         .def("statistics", &ladder_pricer::python::Engine::statistics,
-             py::arg("horizon_minutes"), py::arg("initial_inventory") = 0.0)
+             py::arg("horizon_minutes"), py::arg("initial_inventory") = 0.0,
+             py::arg("initial_regime") = -1)
         .def("simulate", &ladder_pricer::python::Engine::simulate,
              py::arg("horizon_minutes"), py::arg("paths"), py::arg("initial_inventory"),
              py::arg("seed"), py::arg("retained_paths") = 6, py::arg("sample_points") = 191,
-             py::arg("progress_callback") = py::none(), py::arg("compact_result") = false)
+             py::arg("progress_callback") = py::none(), py::arg("compact_result") = false,
+             py::arg("initial_regime") = -1)
         .def("frontier", &ladder_pricer::python::Engine::frontier,
              py::arg("gamma_values"), py::arg("horizon_minutes"),
-             py::arg("initial_inventory") = 0.0);
+             py::arg("initial_inventory") = 0.0, py::arg("initial_regime") = -1);
 }

@@ -69,25 +69,6 @@ double policy_delta(const LadderPolicy& policy, Side side, std::size_t size_idx,
     return (1.0 - w) * mat[left][size_idx] + w * mat[right][size_idx];
 }
 
-double policy_delta_for_size(const LadderPolicy& policy, Side side, double size, double q) {
-    const auto& sizes = policy.sizes;
-    if (sizes.empty()) throw std::invalid_argument("ladder policy has no pricing sizes");
-    if (size <= sizes.front() + kTol) return policy_delta(policy, side, 0, q);
-    if (size >= sizes.back() - kTol) return policy_delta(policy, side, sizes.size() - 1, q);
-
-    const auto right_it = std::upper_bound(sizes.begin(), sizes.end(), size);
-    const std::size_t right = static_cast<std::size_t>(right_it - sizes.begin());
-    const std::size_t left = right - 1;
-    const double z0 = sizes[left];
-    const double z1 = sizes[right];
-    const double d0 = policy_delta(policy, side, left, q);
-    const double d1 = policy_delta(policy, side, right, q);
-    const double w = (size - z0) / (z1 - z0);
-
-    // Execution price is affine in delta for a fixed side/reference spot, so
-    // linear interpolation of delta is exactly linear interpolation of price.
-    return (1.0 - w) * d0 + w * d1;
-}
 
 double dark_posted(const DarkPoolPolicy& policy, Side side, double q) {
     const auto& grid = policy.q_grid;
@@ -98,14 +79,14 @@ double dark_posted(const DarkPoolPolicy& policy, Side side, double q) {
     return sizes[i];
 }
 
-std::vector<Event> events(const PricingProblem& problem, const Solution& solution, double q, bool record_all_ecn_arrivals) {
+std::vector<Event> events(const PricingProblem& problem, const Policy& policy_for_regime, double q, bool record_all_ecn_arrivals) {
     std::vector<Event> out;
     for (std::size_t k = 0; k < problem.tiers().size(); ++k) {
         const auto& tier = problem.tiers()[k];
         // One exogenous RFQ clock per customer-flow source.  When it rings,
         // customer direction is sampled 50/50 (the current symmetric-flow
         // assumption) and requested size is sampled from the source's
-        // size distribution implied by the calibrated exogenous arrival-intensity curve.
+        // size distribution on the same discrete pricing knots as the HJB.
         for (std::size_t s = 0; s < tier.flow().sources().size(); ++s) {
             const auto& source = tier.flow().sources()[s];
             const double rate = source.total_rfq_rate();
@@ -119,9 +100,9 @@ std::vector<Event> events(const PricingProblem& problem, const Solution& solutio
             out.push_back(event);
         }
     }
-    if (problem.dark_pool() && solution.solve_dark_pool_policy) {
+    if (problem.dark_pool() && policy_for_regime.dark_pool) {
         const auto& venue = *problem.dark_pool();
-        const auto& policy = *solution.solve_dark_pool_policy;
+        const auto& policy = *policy_for_regime.dark_pool;
         for (Side side : {Side::Bid, Side::Ask}) {
             const double dir = direction(side);
             const int u = static_cast<int>(std::llround(dark_posted(policy, side, q)));
@@ -137,9 +118,9 @@ std::vector<Event> events(const PricingProblem& problem, const Solution& solutio
             }
         }
     }
-    if (problem.passive_ecn() && solution.solve_passive_ecn_policy) {
+    if (problem.passive_ecn() && policy_for_regime.passive_ecn) {
         const auto& venue = *problem.passive_ecn();
-        const auto& policy = *solution.solve_passive_ecn_policy;
+        const auto& policy = *policy_for_regime.passive_ecn;
         const std::size_t i = bracket_left(policy.q_grid, q);
         const double z = venue.quote_size();
 
@@ -177,10 +158,10 @@ std::vector<Event> events(const PricingProblem& problem, const Solution& solutio
     return out;
 }
 
-double advance_spot(double spot, double dt, double sigma, double base_drift,
+double advance_spot(double spot, double dt, double sigma,
                     std::map<double, double>& impacts, std::mt19937_64& rng) {
     if (dt <= 0.0) return spot;
-    double deterministic = base_drift * dt;
+    double deterministic = 0.0;
     for (auto it = impacts.begin(); it != impacts.end();) {
         const double tau = it->first;
         const double decay = std::exp(-dt / tau);
@@ -220,18 +201,25 @@ double percentile_select(std::vector<double>& values, double p) {
 
 }  // namespace
 
-MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigma,
+MonteCarloResult MonteCarloSimulator::run(double horizon, int paths,
                                            double q0, std::uint64_t seed,
                                            int retained_paths, int sample_points,
-                                           const std::function<void(int, int)>& progress) const {
-    if (horizon < 0.0 || paths <= 0 || sigma < 0.0 || sample_points < 2) {
+                                           const std::function<void(int, int)>& progress, int initial_regime) const {
+    if (horizon < 0.0 || paths <= 0 || sample_points < 2) {
         throw std::invalid_argument("invalid Monte Carlo settings");
     }
+    const std::size_t R=solution_.policies.size();
+    if(R<2 || switches_.size()!=R || solution_.sigma_pips.size()!=R)
+        throw std::invalid_argument("invalid coupled volatility policy");
+    for(const auto& row:switches_) if(row.size()!=R)
+        throw std::invalid_argument("volatility switch matrix must be square");
+    if(initial_regime<0) initial_regime=static_cast<int>(R/2);
+    if(initial_regime>=static_cast<int>(R)) throw std::invalid_argument("initial regime out of range");
     if (reference_spot_ <= 0.0) throw std::invalid_argument("reference spot must be positive");
 
     // Retained paths use a one-second market clock for the interactive price/quote
     // diagnostics. Non-retained paths can propagate spot exactly from event to event:
-    // with the current Brownian + deterministic drift/markout dynamics, subdividing an
+    // with the current Brownian + transient markout dynamics, subdividing an
     // interval does not change its distribution and would only make large MC runs slower.
     // The clock is independent of the inventory/output sampling grid.
     constexpr double kMarketStepMinutes = 1.0 / 60.0;  // 1 second
@@ -244,6 +232,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
     result.final_inventory.resize(paths);
     result.final_spot.resize(paths);
     result.trade_count.resize(paths);
+    result.final_regime.resize(paths);
     result.sample_times.resize(sample_points);
     for (int s = 0; s < sample_points; ++s) {
         result.sample_times[s] = horizon * static_cast<double>(s) / static_cast<double>(sample_points - 1);
@@ -278,6 +267,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
         std::uniform_real_distribution<double> uniform(0.0, 1.0);
 
         double t = 0.0;
+        std::size_t regime=static_cast<std::size_t>(initial_regime);
         double q = q0;
         double spot = reference_spot_;
         double cash = 0.0;  // million quote currency
@@ -293,6 +283,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
             detailed.spots.push_back(spot);
             detailed.inventories.push_back(q);
             detailed.cashes.push_back(cash);
+            detailed.regimes.push_back(static_cast<int>(regime));
         }
 
         // Inventory is piecewise constant, so confidence-band snapshots do not need
@@ -312,9 +303,11 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
         record_inventory_through(0.0);
 
         while (t < horizon - 1e-12) {
-            const auto ev = events(problem_, solution_, q, retain);
+            const auto ev = events(problem_, solution_.policies[regime], q, retain);
             double total_rate = 0.0;
             for (const auto& e : ev) total_rate += e.rate;
+            const double flow_rate=total_rate;
+            for(std::size_t to=0;to<R;++to) if(to!=regime) total_rate+=switches_[regime][to];
 
             double event_time = horizon;
             bool has_event = false;
@@ -338,7 +331,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                 if (next_market_time >= event_time - 1e-12 || next_market_time > horizon + 1e-12) break;
 
                 record_inventory_before(next_market_time);
-                spot = advance_spot(spot, next_market_time - t, sigma, problem_.spot_drift(), impacts, spot_rng);
+                spot = advance_spot(spot, next_market_time - t, solution_.sigma_pips[regime]/10000.0, impacts, spot_rng);
                 t = next_market_time;
                 ++market_tick;
                 record_inventory_through(t);
@@ -347,12 +340,13 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                     detailed.spots.push_back(spot);
                     detailed.inventories.push_back(q);
                     detailed.cashes.push_back(cash);
+            detailed.regimes.push_back(static_cast<int>(regime));
                 }
             }
 
             record_inventory_before(event_time);
             if (event_time > t + 1e-12) {
-                spot = advance_spot(spot, event_time - t, sigma, problem_.spot_drift(), impacts, spot_rng);
+                spot = advance_spot(spot, event_time - t, solution_.sigma_pips[regime]/10000.0, impacts, spot_rng);
                 t = event_time;
             } else {
                 t = event_time;
@@ -365,11 +359,27 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                     detailed.spots.push_back(spot);
                     detailed.inventories.push_back(q);
                     detailed.cashes.push_back(cash);
+            detailed.regimes.push_back(static_cast<int>(regime));
                 }
                 break;
             }
 
             double draw = uniform(event_rng) * total_rate;
+            // Volatility switches are competing exponential events, not inventory fills.
+            if(draw>=flow_rate) {
+                draw-=flow_rate;
+                for(std::size_t to=0;to<R;++to) if(to!=regime) {
+                    draw-=switches_[regime][to];
+                    if(draw<=0.0) {regime=to; break;}
+                }
+                record_inventory_through(t);
+                if(retain) {
+                    detailed.times.push_back(t); detailed.spots.push_back(spot);
+                    detailed.inventories.push_back(q); detailed.cashes.push_back(cash);
+                    detailed.regimes.push_back(static_cast<int>(regime));
+                }
+                continue;
+            }
             const Event* chosen = &ev.back();
             for (const auto& e : ev) {
                 draw -= e.rate;
@@ -382,11 +392,12 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                 const Side rfq_side = uniform(event_rng) < 0.5 ? Side::Bid : Side::Ask;
                 const double dir = direction(rfq_side);
                 const auto& tier = problem_.tiers()[chosen->tier];
-                const auto& policy = solution_.solve_tier_policies[chosen->tier];
+                const auto& policy = solution_.policies[regime].tiers[chosen->tier];
                 const auto& source = tier.flow().sources().at(chosen->flow_source);
                 const std::size_t size_idx = source.sample_target_size_index(event_rng);
                 const double rfq_size = source.target_sizes().at(size_idx);
-                const double rfq_delta = policy_delta_for_size(policy, rfq_side, rfq_size, q);
+                // The sampled RFQ size index is the pricing-knot index.
+                const double rfq_delta = policy_delta(policy, rfq_side, size_idx, q);
                 const bool admissible = problem_.grid().admissible(q, dir * rfq_size);
                 const double p_win = admissible
                     ? source.win_probability(rfq_delta, rfq_size)
@@ -470,6 +481,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                             detailed.spots.push_back(spot);
                             detailed.inventories.push_back(q);
                             detailed.cashes.push_back(cash);
+            detailed.regimes.push_back(static_cast<int>(regime));
                         }
                         continue;
                     }
@@ -513,6 +525,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                             detailed.spots.push_back(spot);
                             detailed.inventories.push_back(q);
                             detailed.cashes.push_back(cash);
+            detailed.regimes.push_back(static_cast<int>(regime));
                         }
                         continue;
                     }
@@ -559,6 +572,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
                 detailed.spots.push_back(spot);
                 detailed.inventories.push_back(q);
                 detailed.cashes.push_back(cash);
+            detailed.regimes.push_back(static_cast<int>(regime));
             }
             record_inventory_through(t);
         }
@@ -574,6 +588,7 @@ MonteCarloResult MonteCarloSimulator::run(double horizon, int paths, double sigm
         result.final_inventory[path_idx] = q;
         result.final_spot[path_idx] = spot;
         result.trade_count[path_idx] = trades;
+        result.final_regime[path_idx] = static_cast<int>(regime);
         if (retain) result.sample_paths.push_back(std::move(detailed));
 
         // Report genuine completed-path progress at most about 100 times per run.

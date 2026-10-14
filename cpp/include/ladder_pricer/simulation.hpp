@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ladder_pricer/core.hpp"
+#include "ladder_pricer/solver.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -94,6 +94,7 @@ struct SamplePath {
     std::vector<double> spots;
     std::vector<double> inventories;
     std::vector<double> cashes;
+    std::vector<int> regimes;
     std::vector<FillEvent> fills;
     std::vector<RfqEvent> rfq_events;
     std::vector<EcnArrivalEvent> ecn_arrivals;
@@ -105,6 +106,7 @@ struct MonteCarloResult {
     std::vector<double> final_inventory;
     std::vector<double> final_spot;
     std::vector<int> trade_count;
+    std::vector<int> final_regime;
 
     std::vector<double> sample_times;
     std::vector<double> inventory_lower;
@@ -120,18 +122,20 @@ struct MonteCarloResult {
 
 class MonteCarloSimulator {
 public:
-    MonteCarloSimulator(const PricingProblem& problem, const Solution& solution,
+    MonteCarloSimulator(const PricingProblem& problem, const SolverResult& solution,
+                        const std::vector<std::vector<double>>& switches,
                         double reference_spot)
-        : problem_(problem), solution_(solution), reference_spot_(reference_spot) {}
+        : problem_(problem), solution_(solution), switches_(switches), reference_spot_(reference_spot) {}
 
-    MonteCarloResult run(double horizon_minutes, int paths, double sigma,
+    MonteCarloResult run(double horizon_minutes, int paths,
                          double initial_inventory, std::uint64_t seed,
                          int retained_paths = 6, int sample_points = 191,
-                         const std::function<void(int, int)>& progress = {}) const;
+                         const std::function<void(int, int)>& progress = {}, int initial_regime = -1) const;
 
 private:
     const PricingProblem& problem_;
-    const Solution& solution_;
+    const SolverResult& solution_;
+    const std::vector<std::vector<double>>& switches_;
     double reference_spot_;
 };
 

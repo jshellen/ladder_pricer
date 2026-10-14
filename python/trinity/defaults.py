@@ -8,37 +8,89 @@ from copy import deepcopy
 # customer-flow sources.  In production this should be replaced by a market-
 # data/database lookup.  Values are deliberately centralized here so the UI
 # and model configuration never hard-code reference rates.
+# Reference FX pair market data is maintained in fx_pair_defaults.json.
+# These are illustrative offline defaults, not current executable FX quotes.
+# Changing the target pair reloads its spot and spread from that file.
+from pathlib import Path
+import json
+import math
+
+
+def _load_pair_market_defaults() -> dict[str, dict[str, float]]:
+    path = Path(__file__).with_name("fx_pair_defaults.json")
+    with path.open(encoding="utf-8") as file:
+        raw = json.load(file)
+    pairs = raw["pairs"]
+    if not isinstance(pairs, dict) or not pairs:
+        raise ValueError("FX pair market defaults JSON must contain a nonempty 'pairs' object")
+    result: dict[str, dict[str, float]] = {}
+    for pair, values in pairs.items():
+        if len(pair) != 6 or not pair.isalpha() or pair.upper() != pair:
+            raise ValueError(f"Invalid FX pair key in market defaults: {pair!r}")
+        spot = float(values["spot"])
+        spread = float(values["spreadPips"])
+        if not math.isfinite(spot) or spot <= 0 or not math.isfinite(spread) or spread <= 0:
+            raise ValueError(f"Invalid spot or spread in FX pair defaults for {pair}")
+        result[pair] = {"spot": spot, "spreadPips": spread}
+    return result
+
+
+def _validated_volatility_regimes(model: dict, pair: str) -> dict:
+    """Parse 2/3-state Markov volatility parameters from JSON; return a fresh copy."""
+    try:
+        sigma = [float(v) for v in model["sigmaPips"]]
+        rates = [[float(v) for v in row] for row in model["ratesPerMinute"]]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid volatility regimes for {pair}: expected sigmaPips and ratesPerMinute") from exc
+    n = len(sigma)
+    if n not in (2, 3) or len(rates) != n or any(len(row) != n for row in rates):
+        raise ValueError(f"Volatility matrix for {pair} must be 2x2 or 3x3")
+    if any(not math.isfinite(v) or v <= 0 for v in sigma) or any(a >= b for a,b in zip(sigma,sigma[1:])):
+        raise ValueError(f"Volatility sigmas for {pair} must increase strictly and be positive")
+    if any(not math.isfinite(v) or v < 0 for row in rates for v in row):
+        raise ValueError(f"Volatility matrix for {pair} must contain finite, nonnegative rates")
+    if any(abs(rates[i][i]) > 1e-12 for i in range(n)):
+        raise ValueError(f"Volatility matrix diagonal for {pair} must be zero (rates, not generator)")
+    if any(sum(rates[i][j] for j in range(n) if j != i) <= 0 for i in range(n)):
+        raise ValueError(f"Every volatility regime for {pair} needs a positive exit rate")
+    return {"sigmaPips": sigma, "ratesPerMinute": rates}
+
+
+def _load_pair_volatility_defaults(json_path: Path | None = None) -> dict[str, dict]:
+    """An explicit per-pair override or the common JSON default; never UI inputs."""
+    source = json_path or Path(__file__).with_name("fx_pair_defaults.json")
+    with source.open(encoding="utf-8") as file:
+        document = json.load(file)
+    fallback = document["volatilityRegimes"]
+    return {
+        pair: _validated_volatility_regimes(values.get("volatilityRegimes", fallback), pair)
+        for pair, values in document["pairs"].items()
+    }
+
+
+DEFAULT_FX_PAIR_VOLATILITY = _load_pair_volatility_defaults()
+
+
+def default_fx_pair_volatility(pair: str | None) -> dict:
+    """Return exactly the configured volatility model for a target FX pair."""
+    key = str(pair or "").upper().strip()
+    if key not in DEFAULT_FX_PAIR_VOLATILITY:
+        raise ValueError(f"Missing JSON volatility model for target FX pair {key!r}")
+    return deepcopy(DEFAULT_FX_PAIR_VOLATILITY[key])
+
+
+DEFAULT_FX_PAIR_MARKET_DATA = _load_pair_market_defaults()
 DEFAULT_FX_MIDS: dict[str, float] = {
-    "EURSEK": 11.50,
-    "USDSEK": 9.7458,
-    "GBPSEK": 13.0682,
-    "NOKSEK": 0.9914,
-    "DKKSEK": 1.5416,
-    "EURNOK": 11.60,
-    "USDNOK": 9.8305,
-    "GBPNOK": 13.1818,
-    "SEKNOK": 1.0087,
-    "DKKNOK": 1.5549,
-    "EURDKK": 7.46,
-    "USDDKK": 6.3220,
-    "GBPDKK": 8.4773,
-    "SEKDKK": 0.6487,
-    "NOKDKK": 0.6431,
-    "EURUSD": 1.18,
-    "GBPUSD": 1.3409,
-    "AUDUSD": 0.6600,
-    "NZDUSD": 0.5750,
-    "USDCAD": 1.3600,
-    "USDCHF": 0.8000,
-    "USDJPY": 147.00,
-    "EURGBP": 0.8800,
-    "EURCHF": 0.9440,
-    "EURJPY": 173.46,
-    "GBPCHF": 1.0727,
-    "GBPJPY": 197.11,
-    "AUDJPY": 97.02,
-    "NZDJPY": 84.53,
+    pair: values["spot"] for pair, values in DEFAULT_FX_PAIR_MARKET_DATA.items()
 }
+
+
+def default_fx_pair_market_data(pair: str | None) -> dict[str, float] | None:
+    """Pair-specific starting inputs for the target FX pair (fresh copy)."""
+    key = str(pair or "").upper().strip()
+    values = DEFAULT_FX_PAIR_MARKET_DATA.get(key)
+    return dict(values) if values is not None else None
+
 
 
 def default_fx_mid(pair: str | None) -> float | None:
@@ -122,27 +174,26 @@ ECN_DELTA_GRID = ecn_delta_grid(0.0, 0.5)
 
 _DEFAULT_CONFIG = {
     "targetPair": "EURSEK",
-    "spot": 11.5,
-    "spreadPips": 20.0,
-    "spotDrift": 0.0,
-    "sigmaPips": 20.0,
+    "spot": default_fx_pair_market_data("EURSEK")["spot"],
+    "spreadPips": default_fx_pair_market_data("EURSEK")["spreadPips"],
+    "sigmaPips": default_fx_pair_volatility("EURSEK")["sigmaPips"][1],
+    # JSON is authoritative for all target-pair volatility regimes.
+    "volatilityRegimes": default_fx_pair_volatility("EURSEK"),
     "gamma": 0.1,
     "grid": {
         "mode": "uniform",
         "maxAbs": 20.0,
         "step": 1.0,
     },
-    "internalization": {"tau0": 4.0, "tau1": 0.070, "tau2": 0.0084},
     "tiers": [
         {
             "enabled": True,
             "name": "Tier 1",
             "sizes": [1, 2, 3, 5, 10, 20],
-            "rfqSizeStep": 1.0,
             # One-sided exogenous RFQ-arrival intensity curve:
             # lambda_RFQ(z) = A0 * z^(-theta-beta*z).  Monte Carlo evaluates
-            # this curve on the full RFQ-size support (1M steps by default),
-            # independently of the pricing-size knots below.
+            # this curve only on the listed pricing knots; they also define
+            # the possible RFQ sizes.
             "flow": {"A0": 0.0155, "theta": 0.144, "beta": 0.0857, "steepness": 8.42, "shift": 0.52, "volumeShift": 0.026},
             "useMarkout": True,
             # Signed adverse markout, EUR per traded EUR 1M; independent of RFQ size.
@@ -155,21 +206,7 @@ _DEFAULT_CONFIG = {
             "enabled": True,
             "name": "Tier 2",
             "sizes": [1, 2, 3, 5, 10, 20],
-            "rfqSizeStep": 1.0,
             "flow": {"A0": 0.0232, "theta": 0.303, "beta": 0.122, "steepness": 2.86, "shift": 0.48, "volumeShift": 0.020},
-            "useMarkout": True,
-            # Signed adverse markout, EUR per traded EUR 1M; independent of RFQ size.
-            "markout": {"asymptoticEurPerMillion": -50.8, "tauSeconds": 36.7},
-            "feePips": 0.0,
-            "deltaMin": -10.0,
-            "deltaMax": 100.0,
-        },
-        {
-            "enabled": False,
-            "name": "Tier 3",
-            "sizes": [1],
-            "rfqSizeStep": 1.0,
-            "flow": {"A0": 1.0, "theta": 0.144, "beta": 0.0857, "steepness": 20.0, "shift": 0.52, "volumeShift": 0.026},
             "useMarkout": True,
             # Signed adverse markout, EUR per traded EUR 1M; independent of RFQ size.
             "markout": {"asymptoticEurPerMillion": -50.8, "tauSeconds": 36.7},

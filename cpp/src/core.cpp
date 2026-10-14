@@ -429,7 +429,7 @@ void FlowSource::configure_target_sizes(const std::vector<double>& target_sizes)
 
     // The calibrated exogenous arrival-intensity curve itself defines the RFQ
     // size distribution.  For the current discrete rung model, normalize the
-    // curve values across the configured target sizes.  The full two-sided
+    // curve values across pricing knots.  The full two-sided
     // Monte Carlo clock is twice the sum of the one-sided rung intensities.
     double one_side_total = 0.0;
     for (std::size_t i = 0; i < target_sizes_.size(); ++i) {
@@ -592,11 +592,6 @@ double SaturatingMarkout::expected(double minutes) const noexcept {
     return asymptotic_adverse_price_ * (-std::expm1(-minutes / tau_minutes_));
 }
 
-double InternalizationTime::value(double inventory) const noexcept {
-    const double x = std::abs(inventory);
-    return tau0_ + tau1_ * x + tau2_ * x * x;
-}
-
 QuadraticPenalty::QuadraticPenalty(double risk_aversion, double sigma)
     : risk_aversion_(risk_aversion), sigma_(sigma) {
     require(risk_aversion_ >= 0.0, "risk aversion must be nonnegative");
@@ -607,50 +602,23 @@ double QuadraticPenalty::value(double inventory) const noexcept {
     return risk_aversion_ * sigma_ * sigma_ * inventory * inventory;
 }
 
-namespace {
-
-std::vector<double> build_rfq_size_support(const std::vector<double>& pricing_sizes,
-                                           double step) {
-    require(!pricing_sizes.empty(), "tier sizes must not be empty");
-    require(step > 0.0 && std::isfinite(step), "RFQ size step must be positive");
-
-    const double lo = pricing_sizes.front();
-    const double hi = pricing_sizes.back();
-    std::vector<double> out;
-    out.reserve(static_cast<std::size_t>(std::ceil((hi - lo) / step))
-                + pricing_sizes.size() + 2);
-    for (std::size_t n = 0;; ++n) {
-        const double z = lo + static_cast<double>(n) * step;
-        if (z > hi + kTolerance) break;
-        out.push_back(std::min(z, hi));
-    }
-    if (out.empty() || std::abs(out.back() - hi) > kTolerance) out.push_back(hi);
-    out.insert(out.end(), pricing_sizes.begin(), pricing_sizes.end());
-    std::sort(out.begin(), out.end());
-    out.erase(std::unique(out.begin(), out.end(), [](double a, double b) {
-        return std::abs(a - b) <= kTolerance;
-    }), out.end());
-    return out;
-}
-
-} // namespace
 
 Tier::Tier(std::string name, std::vector<double> sizes, LogisticFlow flow,
            SaturatingMarkout markout, bool use_markout,
-           double delta_min, double delta_max, double fee, double rfq_size_step)
+           double delta_min, double delta_max, double fee)
     : Tier(std::move(name), std::move(sizes), AggregatedFlow(std::move(flow)),
-           std::move(markout), use_markout, delta_min, delta_max, fee, rfq_size_step) {}
+           std::move(markout), use_markout, delta_min, delta_max, fee) {}
 
 Tier::Tier(std::string name, std::vector<double> sizes, AggregatedFlow flow,
            SaturatingMarkout markout, bool use_markout,
-           double delta_min, double delta_max, double fee, double rfq_size_step)
-    : name_(std::move(name)), sizes_(std::move(sizes)), rfq_size_step_(rfq_size_step),
+           double delta_min, double delta_max, double fee)
+    : name_(std::move(name)), sizes_(std::move(sizes)),
       flow_(std::move(flow)), markout_(std::move(markout)), use_markout_(use_markout),
       delta_min_(delta_min), delta_max_(delta_max), fee_(fee) {
     require(!name_.empty(), "tier name must not be empty");
     require_positive_increasing(sizes_, "tier sizes");
-    rfq_sizes_ = build_rfq_size_support(sizes_, rfq_size_step_);
-    flow_.configure_target_sizes(rfq_sizes_);
+    // RFQ support equals the quoted pricing knots, for HJB and simulation.
+    flow_.configure_target_sizes(sizes_);
     require(delta_min_ <= delta_max_, "delta_min must not exceed delta_max");
     require(fee_ >= 0.0, "tier fee must be nonnegative");
 }
@@ -793,15 +761,13 @@ double PricingProblem::max_inventory_jump(const std::vector<Tier>& tiers,
 
 PricingProblem::PricingProblem(std::vector<double> operational_inventory_grid,
                                double spread,
-                               double spot_drift,
                                QuadraticPenalty penalty,
-                               InternalizationTime internalization_time,
                                std::vector<Tier> tiers,
                                std::optional<DarkPool> dark_pool,
                                std::optional<PassiveECN> passive_ecn)
     : grid_(std::move(operational_inventory_grid), max_inventory_jump(tiers, dark_pool, passive_ecn)),
-      spread_(spread), spot_drift_(spot_drift), penalty_(std::move(penalty)),
-      internalization_time_(std::move(internalization_time)), tiers_(std::move(tiers)),
+      spread_(spread), penalty_(std::move(penalty)),
+      tiers_(std::move(tiers)),
       dark_pool_(std::move(dark_pool)), passive_ecn_(std::move(passive_ecn)) {
     require(spread_ > 0.0, "spread must be positive");
     require(!tiers_.empty() || dark_pool_.has_value() || passive_ecn_.has_value(),
@@ -1247,93 +1213,6 @@ Policy PolicyBuilder::snap_operational_constraints(const Policy& policy) const {
             ask_bounds.upper = inner_ask;
             out.tiers[k].ask[i] = project_ladder(tier, out.tiers[k].ask[i], ask_bounds);
         }
-    }
-    return out;
-}
-
-// ---------------------------------------------------------------------------
-// Bellman operator
-// ---------------------------------------------------------------------------
-
-std::vector<double> BellmanModel::rhs(const std::vector<double>& value, const Policy& policy,
-                                      const ExpectedMtm& mtm) const {
-    const auto& grid = problem_.grid();
-    const auto& q_grid = grid.states();
-    require(value.size() == q_grid.size(), "value vector does not match solve inventory grid");
-    require(policy.tiers.size() == problem_.tiers().size(), "policy tier count mismatch");
-
-    std::vector<double> out(q_grid.size(), 0.0);
-    for (std::size_t i = 0; i < q_grid.size(); ++i) {
-        const double q = q_grid[i];
-        const double hq = grid.interpolate(value, q);
-        double total = -problem_.penalty().value(q) + problem_.spot_drift() * q;
-
-        for (std::size_t k = 0; k < problem_.tiers().size(); ++k) {
-            const auto& tier = problem_.tiers()[k];
-            const auto& p = policy.tiers[k];
-            for (Side side : {Side::Bid, Side::Ask}) {
-                const auto& row = matrix(p, side, i);
-                for (std::size_t j = 0; j < tier.sizes().size(); ++j) {
-                    const double z = tier.sizes()[j];
-                    const double dq = direction(side) * z;
-                    if (!grid.admissible(q, dq)) {
-                        continue;
-                    }
-                    const double delta = row[j];
-                    const double rate = tier.flow().arrival_rate(delta, z);
-                    const double q_next = q + dq;
-                    // The shock occurs even for a lost RFQ. Symmetric exogenous
-                    // buy/sell flow cancels the unfilled baseline in expectation.
-                    const double impact = mtm.win_increment(k, direction(side), q, q_next);
-                    const double fill_value = z * (problem_.spread() * (0.5 - delta) - tier.fee())
-                                            + impact
-                                            + grid.interpolate(value, q_next) - hq;
-                    total += rate * fill_value;
-                }
-            }
-        }
-
-        if (problem_.dark_pool() && policy.dark_pool) {
-            const auto& venue = *problem_.dark_pool();
-            const auto& p = *policy.dark_pool;
-            for (Side side : {Side::Bid, Side::Ask}) {
-                const bool active = side == Side::Bid ? p.bid_active[i] : p.ask_active[i];
-                const double posted = side == Side::Bid ? p.bid_size[i] : p.ask_size[i];
-                if (!active || posted <= 0.0) {
-                    continue;
-                }
-                const int u = static_cast<int>(std::llround(posted));
-                const double dir = direction(side);
-                for (const auto& [fill, rate] : venue.arrivals(side).fill_rates(u)) {
-                    total += rate * (grid.interpolate(value, q + dir * fill) - hq - venue.fee(side) * fill);
-                }
-            }
-        }
-        if (problem_.passive_ecn() && policy.passive_ecn) {
-            const auto& venue = *problem_.passive_ecn();
-            const auto& p = *policy.passive_ecn;
-            const double z = venue.quote_size();
-            for (Side side : {Side::Bid, Side::Ask}) {
-                const bool active = side == Side::Bid ? p.bid_active[i] : p.ask_active[i];
-                const double delta = side == Side::Bid ? p.bid_delta[i] : p.ask_delta[i];
-                if (!active) continue;
-                const double dir = direction(side);
-                const auto breaks = fill_breakpoints(q_grid, i, dir, z);
-                for (const auto& source : venue.flow().sources()) {
-                    const double hit_rate = source.arrival_rate(delta);
-                    if (hit_rate <= 0.0) continue;
-                    for (const auto& [fill, probability] : source.fill_components(z, breaks)) {
-                        const double rate = hit_rate * probability;
-                        if (rate <= 0.0) continue;
-                        const double edge = fill *
-                            (problem_.spread() * (0.5 - delta) - venue.maker_fee());
-                        total += rate *
-                            (edge + grid.interpolate(value, q + dir * fill) - hq);
-                    }
-                }
-            }
-        }
-        out[i] = total;
     }
     return out;
 }

@@ -7,9 +7,8 @@ def ui_values_from_default():
     cfg = default_config()
     values = {
         "qmax": cfg["grid"]["maxAbs"],
-        "spot": cfg["spot"], "spread": cfg["spreadPips"], "drift": cfg["spotDrift"],
+        "spot": cfg["spot"], "spread": cfg["spreadPips"],
         "sigma": cfg["sigmaPips"], "gamma": cfg["gamma"],
-        "tau0": cfg["internalization"]["tau0"], "tau1": cfg["internalization"]["tau1"], "tau2": cfg["internalization"]["tau2"],
     }
     for i, tier in enumerate(cfg["tiers"]):
         p = f"t{i}"
@@ -17,7 +16,6 @@ def ui_values_from_default():
             f"{p}-enabled": ["on"] if tier["enabled"] else [],
             f"{p}-name": tier["name"],
             f"{p}-sizes": ", ".join(str(x) for x in tier["sizes"]),
-            f"{p}-rfq-size-step": tier.get("rfqSizeStep", 1.0),
             f"{p}-A0": tier["flow"]["A0"],
             f"{p}-theta": tier["flow"]["theta"], f"{p}-beta": tier["flow"]["beta"],
             f"{p}-steep": tier["flow"]["steepness"], f"{p}-shift": tier["flow"]["shift"], f"{p}-vshift": tier["flow"]["volumeShift"],
@@ -58,15 +56,12 @@ def test_tier_markout_curves_and_switches_are_independent():
     values["t0-markout-tau-seconds"] = 42.125
     values["t1-markout-asymptote"] = -20.0
     values["t1-markout-tau-seconds"] = 10.0
-    values["t2-markout-asymptote"] = -80.0
-    values["t2-markout-tau-seconds"] = 90.0
     actual = build_config(values)
     assert actual["tiers"][0]["useMarkout"] is True
     assert actual["tiers"][1]["useMarkout"] is False
     assert [t["markout"] for t in actual["tiers"]] == [
         {"asymptoticEurPerMillion": -60.25, "tauSeconds": 42.125},
         {"asymptoticEurPerMillion": -20.0, "tauSeconds": 10.0},
-        {"asymptoticEurPerMillion": -80.0, "tauSeconds": 90.0},
     ]
     assert "markout" not in actual  # no longer a global parameter
 
@@ -74,7 +69,7 @@ def test_tier_markout_curves_and_switches_are_independent():
 @pytest.mark.parametrize("key,value", [
     ("t0-markout-asymptote", 10.0),
     ("t1-markout-asymptote", float("nan")),
-    ("t2-markout-tau-seconds", 0.0),
+    ("t0-markout-tau-seconds", 0.0),
     ("t1-markout-tau-seconds", float("inf")),
 ])
 def test_invalid_markout_config_rejected(key, value):
@@ -152,6 +147,8 @@ def test_continuous_dash_number_inputs_do_not_impose_step_grid():
     app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
     allowed_discrete = (
         'number_input("Max |q| [M]",',
+        'number_input("X-grid nodes (odd)",',
+        'number_input("Native improvement rounds",',
         'number_input("Min delta",',
         'number_input("Max delta",',
         'number_input("Paths",',
@@ -176,12 +173,8 @@ def test_continuous_parameters_accept_extra_decimal_precision():
     values.update({
         "spot": 11.51234567,
         "spread": 19.375,
-        "drift": 0.000012345,
         "sigma": 20.125,
         "gamma": 0.0144,
-        "tau0": 4.0125,
-        "tau1": 0.00703125,
-        "tau2": 0.00084375,
         "t0-A0": 0.0155123,
         "t0-theta": 0.0144,
         "t0-beta": 0.00857,
@@ -229,8 +222,8 @@ def test_rfq_flow_curve_itself_defines_size_density():
 
     tier = cfg["tiers"][0]
     assert tier["sizes"] == [1, 2, 3, 5, 10, 20]
-    assert tier["rfqSizeStep"] == 1.0
-    rfq_sizes = list(range(1, 21))
+    assert "rfqSizeStep" not in tier
+    rfq_sizes = tier["sizes"]
     weights = [z ** (-flow["theta"] - flow["beta"] * z) for z in rfq_sizes]
     probabilities = [w / sum(weights) for w in weights]
     assert sum(probabilities) == pytest.approx(1.0)
@@ -240,8 +233,8 @@ def test_rfq_flow_curve_itself_defines_size_density():
     assert 'A0 · exogenous intensity scale' in app_source
     assert 'intensity curve itself is the density' in app_source
     assert 'RFQ size probabilities' not in app_source
-    assert 'RFQ size step [EUR M]' in app_source
-    assert 'prices between knots are linearly interpolated' in app_source
+    assert 'RFQ size step [EUR M]' not in app_source
+    assert 'RFQ sizes are exactly the pricing knots.' not in app_source
 
 def test_dark_pool_is_zero_inflated_poisson_only():
     cfg = build_config(ui_values_from_default())
@@ -271,8 +264,8 @@ def test_flow_source_dynamic_buttons_ignore_mount_events():
     from pathlib import Path
 
     app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
-    assert 'if not _remove:\n            return (no_update,) * 20' in app_source
-    assert 'if not _add:\n            return (no_update,) * 20' in app_source
+    assert 'if not _remove:\n            return (no_update,) * 14' in app_source
+    assert 'if not _add:\n            return (no_update,) * 14' in app_source
     assert 'if not triggered_value:\n            return no_update' in app_source
 
 
@@ -350,17 +343,39 @@ def test_mc_completed_job_is_retained_for_late_progress_polls():
     assert 'Returning the same completed payload is intentionally idempotent.' in app_source
 
 
-def test_native_rfq_sampling_is_independent_of_pricing_knots():
+def test_native_rfq_sampling_matches_pricing_knots():
     from pathlib import Path
     root = Path(__file__).resolve().parents[1]
     simulation = (root / "cpp/src/simulation.cpp").read_text()
     core = (root / "cpp/src/core.cpp").read_text()
     bindings = (root / "cpp/src/python_bindings.cpp").read_text()
+    analytics = (root / "cpp/src/analytics.cpp").read_text()
     assert 'source.target_sizes().at(size_idx)' in simulation
-    assert 'policy_delta_for_size(policy, rfq_side, rfq_size, q)' in simulation
-    assert 'linear interpolation of delta is exactly linear interpolation of price' in simulation
-    assert 'build_rfq_size_support' in core
-    assert 'optional_number(tier, "rfqSizeStep", 1.0)' in bindings
+    assert 'policy_delta(policy, rfq_side, size_idx, q)' in simulation
+    assert 'policy_delta_for_size' not in simulation
+    assert 'flow_.configure_target_sizes(sizes_)' in core
+    assert 'build_rfq_size_support' not in core
+    assert 'const std::vector<double>& target_sizes = pricing_sizes;' in bindings
+    assert 'rfqSizeStep' not in bindings
+    assert 'tier.sizes()[j]' in analytics
+    assert 'interpolate_size_row' not in analytics
+
+
+def test_rfq_total_rate_increases_with_added_pricing_knot():
+    import pytest
+    from trinity.defaults import default_config
+    tier = default_config()["tiers"][0]
+    source = tier["flow"]
+    def two_sided_rate(sizes):
+        return 2 * source["A0"] * sum(
+            z ** (-source["theta"] - source["beta"] * z) for z in sizes)
+
+    before = two_sided_rate(tier["sizes"])
+    tier["sizes"] = [1, 2, 3, 4, 5, 10, 20]
+    after = two_sided_rate(tier["sizes"])
+    assert after > before
+    assert after - before == pytest.approx(2 * source["A0"]
+                                          * 4 ** (-source["theta"] - source["beta"] * 4))
 
 
 def test_passive_ecn_trade_size_distribution_is_discrete_and_normalized():
@@ -408,3 +423,92 @@ def test_mc_inventory_quantiles_use_parallel_selection_not_full_sort():
     assert 'std::nth_element' in source
     assert 'std::atomic<int> next_snapshot' in source
     assert 'std::sort(snapshot.begin(), snapshot.end())' not in source
+
+
+def test_dashboard_defaults_only_two_tiers():
+    cfg = build_config(ui_values_from_default())
+    assert [x["name"] for x in cfg["tiers"]] == ["Tier 1", "Tier 2"]
+
+
+def test_volatility_is_json_only_and_ignores_stale_dashboard_values():
+    from trinity.defaults import default_fx_pair_volatility
+    values = ui_values_from_default()
+    values["volatility-model"] = {
+        "sigmaPips": [10., 18., 33.],
+        "ratesPerMinute": [[0., .12, .03], [.04, 0., .05], [.06, .07, 0.]],
+    }
+    cfg = build_config(values)
+    assert cfg["volatilityRegimes"] == default_fx_pair_volatility("EURSEK")
+    assert cfg["sigmaPips"] == 20.
+
+
+@pytest.mark.parametrize("model", [
+    {"sigmaPips": [21., 18.], "ratesPerMinute": [[0, .12], [.04, 0]]},
+    {"sigmaPips": [10., 18.], "ratesPerMinute": [[0, .12], [-.1, 0]]},
+    {"sigmaPips": [10., 18., 33.], "ratesPerMinute": [[0., .12, float("nan")], [.04, 0, .05], [.06, .07, 0]]},
+    {"sigmaPips": [10., 18.], "ratesPerMinute": [[0, 0], [.1, 0]]},
+    {"sigmaPips": [10., 18., 33.], "ratesPerMinute": [[0., .1], [.2, 0.]]},
+    {"sigmaPips": [10., 18.], "ratesPerMinute": [[-.1, .1], [.1, 0.]]},
+])
+def test_invalid_json_volatility_models_rejected(model):
+    from trinity.defaults import _validated_volatility_regimes
+    with pytest.raises(ValueError, match="Volatility|volatility"):
+        _validated_volatility_regimes(model, "TESTPAIR")
+
+
+def test_pair_volatility_json_override_is_isolated_and_supports_two_regimes(monkeypatch):
+    import trinity.defaults as defaults
+    from trinity.defaults import default_fx_pair_volatility
+    import json
+    from pathlib import Path
+    raw = json.loads((Path(__file__).resolve().parents[1] / "python/trinity/fx_pair_defaults.json").read_text())
+    assert default_fx_pair_volatility("EURSEK") == raw["volatilityRegimes"]
+    two = {"sigmaPips": [10., 30.], "ratesPerMinute": [[0., .05], [.1, 0.]]}
+    monkeypatch.setitem(defaults.DEFAULT_FX_PAIR_VOLATILITY, "GBPSEK", two)
+    values = ui_values_from_default()
+    values["target-pair"] = "GBPSEK"
+    assert build_config(values)["volatilityRegimes"] == two
+    copy = default_fx_pair_volatility("GBPSEK")
+    copy["sigmaPips"][0] = -100
+    assert default_fx_pair_volatility("GBPSEK") == two
+    assert default_fx_pair_volatility("EURSEK") == raw["volatilityRegimes"]
+
+
+def test_volatility_per_pair_override_is_loaded_from_json(tmp_path):
+    from trinity.defaults import _load_pair_volatility_defaults
+    from pathlib import Path
+    import json
+    original = json.loads((Path(__file__).resolve().parents[1] / "python/trinity/fx_pair_defaults.json").read_text())
+    original["pairs"]["GBPSEK"]["volatilityRegimes"] = {
+        "sigmaPips": [10., 30.],
+        "ratesPerMinute": [[0., 0.08], [0.04, 0.]],
+    }
+    path = tmp_path / "fx_pair_defaults.json"
+    path.write_text(json.dumps(original))
+    models = _load_pair_volatility_defaults(path)
+    assert models["GBPSEK"]["sigmaPips"] == [10., 30.]
+    assert models["EURSEK"] == original["volatilityRegimes"]
+    assert all(2 <= len(model["sigmaPips"]) <= 3 for model in models.values())
+
+
+def test_pair_market_defaults_read_json_without_mutating_cached_data():
+    from trinity.defaults import default_fx_pair_market_data
+    from pathlib import Path
+    import json
+    path = Path(__file__).resolve().parents[1] / "python/trinity/fx_pair_defaults.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))["pairs"]
+    assert default_fx_pair_market_data("GBPSEK") == raw["GBPSEK"]
+    assert default_fx_pair_market_data("EURUSD") == raw["EURUSD"]
+    result = default_fx_pair_market_data("GBPSEK")
+    result["spreadPips"] = 999.0
+    assert default_fx_pair_market_data("GBPSEK") == raw["GBPSEK"]
+    assert default_fx_pair_market_data("MISSING") is None
+
+
+def test_pricing_knot_edits_propagate_into_solver_config():
+    values = ui_values_from_default()
+    values["t0-sizes"] = "1, 3, 7, 12"
+    values["t1-sizes"] = "2, 4, 8"
+    cfg = build_config(values)
+    assert cfg["tiers"][0]["sizes"] == [1.0, 3.0, 7.0, 12.0]
+    assert cfg["tiers"][1]["sizes"] == [2.0, 4.0, 8.0]

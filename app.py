@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 import plotly.graph_objects as go
 import plotly.io as pio
+from plotly.subplots import make_subplots
 from dash import ALL, Dash, Input, Output, State, ctx, dcc, html, no_update
 
 from trinity.defaults import (
@@ -20,6 +21,7 @@ from trinity.defaults import (
     default_config,
     default_ecn_trade_size_probabilities,
     default_fx_mid,
+    default_fx_pair_market_data, default_fx_pair_volatility,
 )
 from trinity.markout import markout_eur_per_million
 from trinity.service import ENGINES
@@ -251,20 +253,49 @@ def text_input(label: str, component_id: str, value: str):
     ], className="field")
 
 
-def checkbox(label: str, component_id: str, checked: bool):
+def checkbox(label: str, component_id: str, checked: bool, *, channel_enable: bool = False):
+    """Render channel enable text explicitly white on the dark sidebar.
+
+    A checklist's plain-string option label can inherit a dark colour from Dash's
+    component styling. Using a real Span with an inline foreground colour keeps
+    the Tier/Dark pool/ECN labels readable across Dash versions and themes.
+    """
+    visible_label = (
+        html.Span(
+            label,
+            className="channel-enable-label",
+            style={"color": "#ffffff", "WebkitTextFillColor": "#ffffff"},
+        )
+        if channel_enable else label
+    )
     return dcc.Checklist(
         id=component_id,
-        options=[{"label": label, "value": "on"}],
+        options=[{"label": visible_label, "value": "on"}],
         value=["on"] if checked else [],
-        className="checklist",
+        className="checklist channel-enable-checkbox" if channel_enable else "checklist",
+        labelStyle={"color": "#ffffff"} if channel_enable else {},
     )
 
 
 def select(label: str, component_id: str, options, value):
+    # Keep white-background policy dropdowns readable in both Dash 4 and
+    # legacy React-Select. The ladder inventory picker uses the same light
+    # dropdown appearance and therefore needs this class too.
+    policy_selector = component_id.endswith(("-regime", "-rfq-size")) or component_id in {
+        "tier-select", "mc-rfq-tier-select", "ladder-q",
+    }
+    dropdown_class = "field-dropdown policy-selector-dropdown" if policy_selector else "field-dropdown"
+    placeholder = "Solve to select a regime" if component_id.endswith("-regime") else (
+        "Select tier" if component_id in {"tier-select", "mc-rfq-tier-select"} else (
+        "Select RFQ size" if component_id.endswith("-rfq-size") else None)
+    )
     return html.Label([
         html.Span(label, className="field-label"),
-        dcc.Dropdown(id=component_id, options=options, value=value, clearable=False, className="field-dropdown"),
-    ], className="field")
+        dcc.Dropdown(
+            id=component_id, options=options, value=value,
+            clearable=False, className=dropdown_class, placeholder=placeholder,
+        ),
+    ], className="field policy-selector-field" if policy_selector else "field")
 
 
 GRAPH_CONFIG = {"displaylogo": False, "responsive": True}
@@ -302,6 +333,64 @@ def diagnostic_expander(title: str, children, open_: bool = False):
         open=open_,
         className="diagnostic-expander",
     )
+
+
+# Each regime-dependent plot has its own local choice.  These choices affect
+# presentation only: they select an existing (q, sigma) slice of the Solve output.
+POLICY_REGIME_SELECTOR_IDS = (
+    "overview-value-regime",
+    "tier-implied-hit-regime",
+    "tier-quote-inventory-regime",
+    "tier-ladder-regime",
+    "dark-policy-regime",
+    "ecn-implied-hit-regime",
+    "ecn-quote-inventory-regime",
+    "ecn-policy-regime",
+)
+
+
+def regime_selector(component_id: str, *, wrapper_id: str | None = None):
+    """Regime choice directly inside a regime-dependent diagnostics expander."""
+    attrs = {"className": "toolbar regime-local-selector"}
+    if wrapper_id is not None:
+        attrs["id"] = wrapper_id
+    return html.Div([select("Volatility regime", component_id, [], None)], **attrs)
+
+
+def ecn_heatmap_toggle(component_id: str):
+    """Per-expander toggle: the heatmap shows *all* volatility regimes."""
+    return dcc.Checklist(
+        id=component_id,
+        options=[{"label": html.Span("Heatmap", className="ecn-heatmap-toggle-label"),
+                  "value": "heatmap"}],
+        value=[],
+        className="ecn-heatmap-toggle",
+        labelStyle={"display": "flex", "alignItems": "center", "cursor": "pointer"},
+        inputStyle={"marginRight": "12px"},
+    )
+
+
+RFQ_HEATMAP_PREFIXES = (
+    "tier-implied-hit", "tier-quote-inventory",
+)
+
+
+def rfq_heatmap_controls(prefix: str):
+    """An independent view toggle, single-regime selector and RFQ-knot selector."""
+    return [
+        ecn_heatmap_toggle(f"{prefix}-heatmap"),
+        regime_selector(f"{prefix}-regime", wrapper_id=f"{prefix}-regime-wrapper"),
+        html.Div(
+            [select("RFQ size [EUR M]", f"{prefix}-rfq-size", [], None)],
+            id=f"{prefix}-rfq-size-wrapper",
+            className="toolbar regime-local-selector",
+            style={"display": "none"},
+        ),
+    ]
+
+
+def _ecn_heatmap_enabled(value) -> bool:
+    return "heatmap" in (value or [])
 
 
 
@@ -407,62 +496,127 @@ def _dropdown_field(label: str, component_id: str, value: str | None, options: l
     ], className="field")
 
 
-def flow_source_settings_editor(source_key: str, source: dict[str, Any], target_pair: str):
+def volatility_generator_matrix(sigma, rates):
+    """Full Markov-chain generator: off-diagonal arrival rates, diagonal = -row sum."""
+    matrix = np.asarray(rates, dtype=float).copy()
+    n=len(sigma)
+    if n not in (2, 3) or matrix.shape != (n, n):
+        raise ValueError("Expected two or three volatility regimes")
+    for i in range(n):
+        matrix[i, i] = -sum(matrix[i, j] for j in range(n) if i != j)
+    return matrix
+
+
+def readonly_volatility_matrix(volatility: dict[str, Any]):
+    """Render immutable JSON regime levels and the generator Q as numbers."""
+    sigma = volatility["sigmaPips"]
+    rates = volatility["ratesPerMinute"]
+    matrix = volatility_generator_matrix(sigma, rates)
+    names = ("Low", "High") if len(sigma) == 2 else ("Low", "Normal", "High")
+    sigma_table = html.Table([
+        html.Thead(html.Tr([html.Th("Regime"), html.Th("σ [pips/√min]")])),
+        html.Tbody([html.Tr([html.Td(name), html.Td(f"{value:g}")])
+                    for name, value in zip(names, sigma)]),
+    ], className="data-table volatility-readonly-table")
+    generator_table = html.Table([
+        html.Thead(html.Tr([html.Th("From / To"), *[html.Th(n) for n in names]])),
+        html.Tbody([html.Tr([html.Th(label), *[html.Td(f"{float(v):.6f}") for v in row]])
+                    for label, row in zip(names, matrix)]),
+    ], className="data-table volatility-readonly-table")
+    return html.Div([
+        html.Div("Volatility levels", className="subhead"),
+        sigma_table,
+        html.Div("Generator Q [1/min] · rows: from regime, columns: to regime", className="subhead"),
+        generator_table,
+    ], className="volatility-readonly-matrix")
+
+
+def flow_markout_figure(enabled, asymptote, tau_seconds, pair):
+    t = np.linspace(0.0, 300.0, 301)
+    curve = markout_eur_per_million(t, float(asymptote), float(tau_seconds)) if enabled and float(tau_seconds) > 0.0 else np.zeros_like(t)
+    fig = go.Figure(go.Scatter(x=t, y=curve, mode="lines", name=str(pair), line={"color": ASK_COLOR, "width": 3}))
+    fig.add_hline(y=0, line_dash="dot", opacity=0.3)
+    fig.update_layout(xaxis_title="seconds", yaxis_title="EUR / EUR m",
+                      template="trinity_dark",
+                      margin={"l": 65, "r": 20, "t": 25, "b": 45})
+    return fig
+
+
+def flow_source_settings_editor(source_key: str, source: dict[str, Any], target_pair: str,
+                                markout=None):
     flow = source.get("flow", {})
     mapping = source.get("mapping", {})
     direct = source_key == "direct"
+    markout = markout or {"enabled": True, "asymptote": -50.8, "tau": 36.7}
 
-    header = html.Div([
-        html.Div([
-            html.Div(str(source.get("pair") or target_pair), className="flow-source-title"),
-            html.Div("Direct target-pair flow" if direct else "Crossed source", className="muted-note source-kind-note"),
-        ]),
-        None if direct else html.Button(
-            "Remove FX pair",
-            id="flow-source-remove-selected",
-            className="ghost-button danger-ghost-button",
-            n_clicks=0,
-        ),
-    ], className="flow-source-row-head")
-
+    # The target-pair heading remains for Direct; the crossed source is
+    # identified by its dropdowns. Removal now lives next to Add in the footer.
+    header = (
+        html.Div([html.Div(str(source.get("pair") or target_pair), className="flow-source-title")],
+                 className="flow-source-row-head")
+        if direct else html.Div()
+    )
     if direct:
         source_fields = [html.Div([
             dcc.Dropdown(id="flow-edit-pair", value=target_pair, options=FX_PAIR_OPTIONS),
             dcc.Dropdown(id="flow-edit-cross-pair", value=None, options=FX_PAIR_OPTIONS),
             dcc.Input(id="flow-edit-cross-mid", type="number", value=1.0),
             dcc.Input(id="flow-edit-spread", type="number", value=1.0),
-            html.Button("Remove FX pair", id="flow-source-remove-selected", n_clicks=0),
         ], style={"display": "none"})]
     else:
         pair = source.get("pair")
         cross_pair = source.get("crossPair") or _derive_cross_pair(target_pair, pair)
         configured_mid = mapping.get("crossMid")
         cross_mid = configured_mid if configured_mid is not None else default_fx_mid(cross_pair)
-        source_fields = [
-            html.Div([
-                _dropdown_field("Source pair", "flow-edit-pair", pair, _source_pair_options(target_pair)),
-                _dropdown_field("Cross / hedge pair", "flow-edit-cross-pair", cross_pair, _cross_pair_options(target_pair, pair), "Select hedge pair"),
-                number_input("Cross mid", "flow-edit-cross-mid", cross_mid, "any"),
-                number_input("Source spread [pips]", "flow-edit-spread", float(mapping.get("sourceSpreadPips", 20.0)), "any"),
-            ], className="grid-2"),
-            html.Div("Flow calibration", className="subhead"),
-        ]
+        source_fields = [html.Div([
+            _dropdown_field("Crossed pair", "flow-edit-pair", pair, _source_pair_options(target_pair)),
+            _dropdown_field("Crossing pair", "flow-edit-cross-pair", cross_pair, _cross_pair_options(target_pair, pair)),
+        ], className="flow-pair-selectors")]
 
-    return html.Div([
-        header,
-        *source_fields,
-        html.Div(
-            "The exogenous RFQ-arrival curve λ(z)=A0·z^(-θ-βz) defines both the size-specific arrival intensities and the RFQ-size distribution. Monte Carlo samples from the full RFQ-size grid between the smallest and largest pricing knots; prices between knots are linearly interpolated.",
-            className="muted-note modal-note",
-        ),
+    # Crossed-source market data belongs with the other collapsible source
+    # settings, not next to the FX-pair selectors. Keep the existing input IDs
+    # so the pair defaults, Apply action and solver configuration are unchanged.
+    crossed_market_data = diagnostic_expander("Market Data", [
         html.Div([
-            number_input("A0 · exogenous intensity scale", "flow-edit-A0", float(flow.get("A0", 0.01)), "any"),
-            number_input("Size θ", "flow-edit-theta", float(flow.get("theta", 0.144)), "any"),
-            number_input("Size β", "flow-edit-beta", float(flow.get("beta", 0.0857)), "any"),
-            number_input("Steepness", "flow-edit-steep", float(flow.get("steepness", 8.42)), "any"),
-            number_input("Shift", "flow-edit-shift", float(flow.get("shift", 0.52)), "any"),
-            number_input("Volume shift", "flow-edit-vshift", float(flow.get("volumeShift", 0.026)), "any"),
-        ], className="grid-2 flow-calibration-grid"),
+            number_input("Crossing Mid-Rate", "flow-edit-cross-mid", cross_mid, "any"),
+            number_input("Crossing Spread", "flow-edit-spread", float(mapping.get("sourceSpreadPips", 20.0)), "any"),
+        ], className="grid-2"),
+    ]) if not direct else None
+
+    volatility_panel = diagnostic_expander("Volatility", [
+        readonly_volatility_matrix(default_fx_pair_volatility(target_pair)),
+    ]) if direct else None
+
+    # Return header and expanders as separate groups.  The modal places the
+    # persistent Market Data/Pricing Rungs fields between these groups, in the
+    # *same* source card.  Splitting the groups avoids remounting the inputs
+    # whenever a source, Tier or target pair changes.
+    return html.Div([
+        html.Div([header, *source_fields], className="flow-source-header-fields"),
+        html.Div([
+            crossed_market_data,
+            diagnostic_expander("RFQ flow intensities", [
+                html.Div([
+                    number_input("A0 · exogenous intensity scale", "flow-edit-A0", float(flow.get("A0", 0.01)), "any"),
+                    number_input("Size θ", "flow-edit-theta", float(flow.get("theta", 0.144)), "any"),
+                    number_input("Size β", "flow-edit-beta", float(flow.get("beta", 0.0857)), "any"),
+                    number_input("Steepness", "flow-edit-steep", float(flow.get("steepness", 8.42)), "any"),
+                    number_input("Shift", "flow-edit-shift", float(flow.get("shift", 0.52)), "any"),
+                    number_input("Volume shift", "flow-edit-vshift", float(flow.get("volumeShift", 0.026)), "any"),
+                ], className="grid-2 flow-calibration-grid"),
+            ]),
+            volatility_panel,
+            diagnostic_expander("Markouts", [
+                html.Div("Markout is a Tier-level curve shared by the direct pair and its crossed flow sources; the C++ HJB does not support per-source markout.", className="muted-note"),
+                checkbox("Enabled", "flow-edit-markout-enabled", bool(markout["enabled"]), channel_enable=True),
+                html.Div([
+                    number_input("Asymptote [EUR / EUR 1M]", "flow-edit-markout-asymptote", markout["asymptote"], "any"),
+                    number_input("Tau [seconds]", "flow-edit-markout-tau", markout["tau"], "any"),
+                ], className="grid-2"),
+                dcc.Graph(id="flow-markout-preview", figure=flow_markout_figure(markout["enabled"], markout["asymptote"], markout["tau"], source.get("pair") or target_pair),
+                          responsive=True, style={"height": "330px", "width": "100%"}),
+            ]),
+        ], className="flow-source-dynamic-expanders"),
     ], className="flow-source-settings")
 
 def ecn_flow_pair_card(key: str, label: str, selected: bool, removable: bool = False):
@@ -478,36 +632,29 @@ def ecn_flow_pair_card(key: str, label: str, selected: bool, removable: bool = F
     ], className="flow-pair-card-wrap")
 
 
-def _ecn_dropdown_field(label: str, component_id: str, value: str | None, options: list[dict[str, str]], placeholder: str = "Select FX pair"):
-    return html.Label([
-        html.Span(label),
-        dcc.Dropdown(id=component_id, value=value, options=options, placeholder=placeholder, clearable=False, className="field-dropdown", persistence=True, persistence_type="memory"),
-    ], className="field")
-
-
 def ecn_flow_source_settings_editor(source_key: str, source: dict[str, Any], target_pair: str):
+    """Use the same Direct/Crossed pair selectors as the RFQ source editor.
+
+    ECN-specific intensity and trade-size calibration remains unchanged.
+    """
     flow = source.get("flow", {})
     mapping = source.get("mapping", {})
     direct = source_key == "direct"
 
-    header = html.Div([
-        html.Div([
-            html.Div(str(source.get("pair") or target_pair), className="flow-source-title"),
-            html.Div("Direct target-pair ECN flow" if direct else "Crossed ECN source", className="muted-note source-kind-note"),
-        ]),
-        None if direct else html.Button(
-            "Remove FX pair", id="ecn-flow-source-remove-selected",
-            className="ghost-button danger-ghost-button", n_clicks=0,
-        ),
-    ], className="flow-source-row-head")
+    header = (
+        html.Div([html.Div(str(source.get("pair") or target_pair), className="flow-source-title")],
+                 className="flow-source-row-head")
+        if direct else html.Div()
+    )
 
     if direct:
+        # All callback IDs must remain mounted even when editing a direct
+        # source, just as they do in the Tier editor.
         source_fields = [html.Div([
             dcc.Dropdown(id="ecn-flow-edit-pair", value=target_pair, options=FX_PAIR_OPTIONS),
             dcc.Dropdown(id="ecn-flow-edit-cross-pair", value=None, options=FX_PAIR_OPTIONS),
             dcc.Input(id="ecn-flow-edit-cross-mid", type="number", value=1.0),
             dcc.Input(id="ecn-flow-edit-spread", type="number", value=1.0),
-            html.Button("Remove FX pair", id="ecn-flow-source-remove-selected", n_clicks=0),
         ], style={"display": "none"})]
     else:
         pair = source.get("pair")
@@ -516,12 +663,15 @@ def ecn_flow_source_settings_editor(source_key: str, source: dict[str, Any], tar
         cross_mid = configured_mid if configured_mid is not None else default_fx_mid(cross_pair)
         source_fields = [
             html.Div([
-                _ecn_dropdown_field("Source pair", "ecn-flow-edit-pair", pair, _source_pair_options(target_pair)),
-                _ecn_dropdown_field("Cross / hedge pair", "ecn-flow-edit-cross-pair", cross_pair, _cross_pair_options(target_pair, pair), "Select hedge pair"),
+                _dropdown_field("Crossed pair", "ecn-flow-edit-pair", pair,
+                                _source_pair_options(target_pair)),
+                _dropdown_field("Crossing pair", "ecn-flow-edit-cross-pair", cross_pair,
+                                _cross_pair_options(target_pair, pair)),
+            ], className="flow-pair-selectors"),
+            html.Div([
                 number_input("Cross mid", "ecn-flow-edit-cross-mid", cross_mid, "any"),
                 number_input("Source spread [pips]", "ecn-flow-edit-spread", float(mapping.get("sourceSpreadPips", 20.0)), "any"),
             ], className="grid-2"),
-            html.Div("ECN flow calibration", className="subhead"),
         ]
 
     return html.Div([
@@ -541,14 +691,11 @@ def ecn_flow_source_settings_editor(source_key: str, source: dict[str, Any], tar
         html.Div(id="ecn-flow-edit-p100k-note", className="muted-note"),
     ], className="flow-source-settings")
 
-
 def tier_panel(index: int, tier: dict[str, Any], open_: bool = False):
     p = f"t{index}"
     return panel(tier["name"], [
-        checkbox("Enabled", f"{p}-enabled", tier["enabled"]),
+        checkbox("Enabled", f"{p}-enabled", tier["enabled"], channel_enable=True),
         text_input("Name", f"{p}-name", tier["name"]),
-        text_input("Pricing sizes [EUR M]", f"{p}-sizes", ", ".join(str(x) for x in tier["sizes"])),
-        number_input("RFQ size step [EUR M]", f"{p}-rfq-size-step", float(tier.get("rfqSizeStep", 1.0)), "any"),
         html.Div([
             html.Button("Configure flow sources", id={"type": "open-flow-sources", "tier": index}, className="secondary-button compact-button", n_clicks=0),
         ], className="flow-source-config-line"),
@@ -566,13 +713,11 @@ def tier_panel(index: int, tier: dict[str, Any], open_: bool = False):
         html.Div([
             number_input("Fee [pips]", f"{p}-fee", tier.get("feePips", 0.0), "any"),
         ], className="grid-2"),
-        html.Div("RFQ markout", className="subhead"),
-        checkbox("Enabled", f"{p}-markout-enabled", tier["useMarkout"]),
         html.Div([
-            number_input("Asymptote [EUR / EUR 1M]", f"{p}-markout-asymptote", tier["markout"]["asymptoticEurPerMillion"], "any"),
-            number_input("Tau [seconds]", f"{p}-markout-tau-seconds", tier["markout"]["tauSeconds"], "any"),
-        ], className="grid-2"),
-        html.Div("Same EUR/M curve for every RFQ size in this tier. Negative means adverse MTM.", className="muted-note"),
+            checkbox("Enabled", f"{p}-markout-enabled", tier["useMarkout"]),
+            number_input("Asymptote", f"{p}-markout-asymptote", tier["markout"]["asymptoticEurPerMillion"], "any"),
+            number_input("Tau", f"{p}-markout-tau-seconds", tier["markout"]["tauSeconds"], "any"),
+        ], style={"display": "none"}),
         html.Div([
             number_input("Delta min", f"{p}-dmin", tier["deltaMin"], "any"),
             number_input("Delta max", f"{p}-dmax", tier["deltaMax"], "any"),
@@ -637,23 +782,15 @@ def _tier_flow_sources(tier: dict[str, Any]) -> list[dict[str, Any]]:
     return [{"name": tier.get("name", "direct"), "flow": tier["flow"], "mapping": {"type": "identity"}}]
 
 
-def _rfq_size_grid(tier: dict[str, Any]) -> np.ndarray:
-    """Customer RFQ sizes, independent of the pricing-control knots."""
-    pricing = np.asarray(tier["sizes"], dtype=float)
-    if pricing.size == 0 or np.any(pricing <= 0.0):
-        raise ValueError("Pricing sizes must be positive")
-    step = float(tier.get("rfqSizeStep", 1.0))
-    if not np.isfinite(step) or step <= 0.0:
-        raise ValueError("RFQ size step must be positive")
-    lo, hi = float(pricing[0]), float(pricing[-1])
-    regular = np.arange(lo, hi + 0.5 * step, step, dtype=float)
-    regular = regular[regular <= hi + 1e-12]
-    values = np.unique(np.round(np.concatenate([regular, pricing, [hi]]), 12))
-    return values[(values >= lo - 1e-12) & (values <= hi + 1e-12)]
-
+def _rfq_sizes(tier: dict[str, Any]) -> np.ndarray:
+    """The pricing knots are exactly the discrete customer RFQ sizes."""
+    sizes = np.asarray(tier["sizes"], dtype=float)
+    if sizes.size == 0 or np.any(~np.isfinite(sizes)) or np.any(sizes <= 0.0) or np.any(np.diff(sizes) <= 0.0):
+        raise ValueError("RFQ pricing sizes must be finite, positive and strictly increasing")
+    return sizes
 
 def _source_curve_at_sizes(tier: dict[str, Any], source: dict[str, Any], target_sizes) -> np.ndarray:
-    """Unnormalised RFQ-size density implied by the calibrated arrival curve."""
+    """Unnormalised intensity weights on the configured discrete RFQ sizes."""
     sizes = np.asarray(target_sizes, dtype=float) * _source_size_scale(source)
     flow = source["flow"]
     exponent = -float(flow["theta"]) - float(flow["beta"]) * sizes
@@ -664,7 +801,7 @@ def _source_curve_at_sizes(tier: dict[str, Any], source: dict[str, Any], target_
 
 
 def _source_curve_shape(tier: dict[str, Any], source: dict[str, Any]) -> np.ndarray:
-    weights = _source_curve_at_sizes(tier, source, _rfq_size_grid(tier))
+    weights = _source_curve_at_sizes(tier, source, _rfq_sizes(tier))
     if float(np.sum(weights)) <= 0.0:
         raise ValueError("RFQ arrival-intensity curve must have positive mass")
     return weights
@@ -676,7 +813,7 @@ def _source_a0(tier: dict[str, Any], source: dict[str, Any]) -> float:
         return float(flow["A0"])
     if "totalRfqRate" in flow:
         # Compatibility with the short-lived total-rate config format.  Recover
-        # the original one-sided curve scale on the *full* RFQ size support.
+        # the original one-sided curve scale on the pricing knots.
         shape_mass = float(np.sum(_source_curve_shape(tier, source)))
         return float(flow["totalRfqRate"]) / (2.0 * shape_mass)
     raise ValueError("RFQ flow requires A0")
@@ -684,8 +821,7 @@ def _source_a0(tier: dict[str, Any], source: dict[str, Any]) -> float:
 
 def _source_size_distribution(tier: dict[str, Any], source: dict[str, Any]) -> np.ndarray:
     # There is no independent RFQ-size calibration: the exogenous arrival
-    # intensity curve itself is the density.  Normalize it on the full customer
-    # RFQ grid, not only on the pricing-control knots.
+    # intensity curve itself is the density. Normalize it on pricing knots.
     weights = _source_curve_shape(tier, source)
     return weights / float(np.sum(weights))
 
@@ -801,12 +937,12 @@ def flow_curve_figure(tier: dict[str, Any], target_spread_pips: float) -> go.Fig
 
 
 def exogenous_arrival_figure(tier: dict[str, Any]) -> go.Figure:
-    sizes = _rfq_size_grid(tier)
+    sizes = _rfq_sizes(tier)
     rates = np.asarray([_activity(tier, float(z)) for z in sizes], dtype=float)
-    fig = go.Figure(go.Scatter(x=sizes, y=rates, mode="lines+markers", name="RFQ arrivals"))
+    fig = go.Figure(go.Bar(x=[f"{z:g}" for z in sizes], y=rates, name="RFQ arrivals"))
     fig.update_layout(
         title=f"Exogenous RFQ arrival intensity λ_RFQ(z) · {tier['name']}",
-        xaxis_title="RFQ size [EUR M]",
+        xaxis_title="RFQ pricing knot [EUR M]",
         yaxis_title="RFQs / side [1/min]",
         template="trinity_dark",
     )
@@ -867,7 +1003,7 @@ def mc_rfq_validation_figures(
         float(row.get("size", 0.0)): int(row.get("requests", 0))
         for row in size_rows
     }
-    rfq_sizes = np.asarray(_rfq_size_grid(tier), dtype=float)
+    rfq_sizes = np.asarray(_rfq_sizes(tier), dtype=float)
     model_arrivals = np.asarray([_activity(tier, float(z)) for z in rfq_sizes], dtype=float)
     n_paths = len(mc.get("pnlBase", []))
     exposure = 2.0 * float(n_paths) * SESSION_HORIZON
@@ -875,16 +1011,17 @@ def mc_rfq_validation_figures(
         requests_by_size.get(float(z), 0) / exposure if exposure > 0.0 else 0.0
         for z in rfq_sizes
     ], dtype=float)
-    arrival_fig.add_trace(go.Scatter(
-        x=rfq_sizes, y=model_arrivals, mode="lines+markers", name="Model input λ_RFQ(z)",
-        line=dict(width=2.5),
+    rfq_labels = [f"{z:g}" for z in rfq_sizes]
+    arrival_fig.add_trace(go.Bar(
+        x=rfq_labels, y=model_arrivals, name="Model input λ_RFQ(z)",
+        opacity=0.7,
     ))
     arrival_fig.add_trace(go.Scatter(
-        x=rfq_sizes, y=mc_arrivals, mode="markers", name="MC estimate",
+        x=rfq_labels, y=mc_arrivals, mode="markers", name="MC estimate",
         marker=dict(size=9, symbol="circle-open"),
         customdata=np.asarray([requests_by_size.get(float(z), 0) for z in rfq_sizes]),
         hovertemplate=(
-            "RFQ size=%{x:g}M<br>MC λ=%{y:.6f} /min/side"
+            "RFQ size=%{x}M<br>MC λ=%{y:.6f} /min/side"
             "<br>Requests=%{customdata:,.0f}<extra></extra>"
         ),
     ))
@@ -1008,6 +1145,100 @@ def mc_rfq_validation_figures(
     return arrival_fig, win_fig, inventory_fig
 
 
+def rfq_regime_heatmap_figure(
+    solution: dict[str, Any], cfg: dict[str, Any], tier_index: int,
+    rfq_size: float | None, *, metric: str = "quotes",
+) -> go.Figure:
+    """Both RFQ quote sides at one pricing knot, across inventory and volatility regimes.
+
+    The size must be an actual RFQ/pricing knot; it is never interpolated.
+    """
+    if metric not in ("quotes", "win_probability"):
+        raise ValueError(f"Unsupported RFQ heatmap metric: {metric}")
+    tiers = (solution or {}).get("tiers") or []
+    regimes = (solution or {}).get("regimes") or []
+    ti = int(tier_index)
+    if not regimes or ti >= len(tiers):
+        fig = go.Figure()
+        fig.add_annotation(text="Solve to view RFQ policies across volatility regimes", showarrow=False)
+        fig.update_layout(template="trinity_dark")
+        return fig
+    sizes = np.asarray(tiers[ti]["sizes"], dtype=float)
+    if sizes.size == 0:
+        raise ValueError("Tier has no pricing knots")
+    if rfq_size is None:
+        j = 0
+    else:
+        matching = np.flatnonzero(np.isclose(sizes, float(rfq_size), rtol=0, atol=1e-9))
+        if not matching.size:
+            raise ValueError(f"RFQ size {rfq_size:g}M is not a pricing knot in this tier")
+        j = int(matching[0])
+    z = float(sizes[j])
+    q = np.asarray(solution["qGrid"], dtype=float)
+    sigma_names = ("Low", "High") if len(regimes) == 2 else (
+        ("Low", "Normal", "High") if len(regimes) == 3 else
+        tuple(f"Regime {i + 1}" for i in range(len(regimes)))
+    )
+    y_labels = [f"{name} · σ={float(reg['sigmaPips']):g}" for name, reg in zip(sigma_names, regimes)]
+    tier_cfg = _tier_cfg(cfg, ti)
+    spread = float(cfg["spreadPips"])
+    sides = ("bid", "ask")
+    matrices: dict[str, np.ndarray] = {}
+    for direction in sides:
+        rows = []
+        for regime in regimes:
+            r_tier = regime["tiers"][ti]
+            r_sizes = np.asarray(r_tier["sizes"], dtype=float)
+            if r_sizes.shape != sizes.shape or not np.allclose(r_sizes, sizes, rtol=0, atol=1e-9):
+                raise ValueError("RFQ pricing knots differ between volatility regimes")
+            policy = np.asarray(r_tier[direction], dtype=float)
+            if policy.shape != (q.size, sizes.size):
+                raise ValueError("RFQ policy matrix does not match the inventory/knot grid")
+            delta = policy[:, j]
+            if metric == "quotes":
+                values = _quote_vs_mid_pips(delta, direction, spread)
+            else:
+                values = np.asarray(_hit_ratio(tier_cfg, delta, z, spread), dtype=float)
+            rows.append(values)
+        matrices[direction] = np.vstack(rows)
+
+    label = "Quote vs mid [pips]" if metric == "quotes" else "Win probability"
+    headline = "RFQ quotes" if metric == "quotes" else "Implied RFQ win probabilities"
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.18,
+        subplot_titles=("BID", "ASK"),
+    )
+    if metric == "quotes":
+        bound = max((float(np.max(np.abs(array))) for array in matrices.values()), default=0.0)
+        bound = max(bound, 1e-6)
+        cmin, cmax, scale = -bound, bound, "RdBu_r"
+    else:
+        cmin, cmax, scale = 0.0, 1.0, "Viridis"
+
+    for idx, direction in enumerate(sides, start=1):
+        trace = go.Heatmap(
+            x=q, y=y_labels, z=matrices[direction],
+            coloraxis="coloraxis", xgap=0.75, ygap=2,
+            hovertemplate=(
+                f"{direction.upper()} · {z:g}M RFQ<br>Inventory: %{{x:g}}M"
+                f"<br>Regime: %{{y}} pips/√min"
+                f"<br>{label}: %{{z:.4f}}<extra></extra>"
+            ),
+        )
+        fig.add_trace(trace, row=idx, col=1)
+        fig.update_yaxes(title_text="Volatility regime", type="category", row=idx, col=1)
+    fig.update_xaxes(title_text="Inventory q [EUR M]", row=2, col=1)
+    fig.update_layout(
+        title=f"{headline} · {tier_cfg['name']} · {z:g}M",
+        template="trinity_dark",
+        height=610,
+        margin=dict(l=115, r=85, t=82, b=65),
+        coloraxis=dict(colorscale=scale, cmin=cmin, cmax=cmax,
+                       colorbar=dict(title=label, thickness=17, len=0.82)),
+    )
+    return fig
+
+
 def quote_inventory_figure(solution: dict[str, Any], cfg: dict[str, Any], tier_index: int) -> go.Figure:
     tier_sol = solution["tiers"][int(tier_index)]
     tier = _tier_cfg(cfg, int(tier_index))
@@ -1028,27 +1259,6 @@ def quote_inventory_figure(solution: dict[str, Any], cfg: dict[str, Any], tier_i
         ))
     fig.add_hline(y=0, line_dash="dot")
     fig.update_layout(title=f"Quotes vs inventory · {tier['name']}", xaxis_title="Inventory q [EUR M]", yaxis_title="Quote relative to mid [pips]", template="trinity_dark")
-    return fig
-
-
-def quote_surface_figure(solution: dict[str, Any], cfg: dict[str, Any], tier_index: int, side: str) -> go.Figure:
-    tier_sol = solution["tiers"][int(tier_index)]
-    tier = _tier_cfg(cfg, int(tier_index))
-    spread_pips = float(cfg["spreadPips"])
-    matrix = tier_sol[side]
-    surface = []
-    for j, _z in enumerate(tier_sol["sizes"]):
-        deltas = np.asarray([row[j] for row in matrix], dtype=float)
-        surface.append(_quote_vs_mid_pips(deltas, side, spread_pips))
-    fig = go.Figure(go.Surface(
-        x=solution["qGrid"], y=tier_sol["sizes"], z=np.asarray(surface),
-        colorscale="Blues" if side == "bid" else "Reds", showscale=False, opacity=0.9,
-    ))
-    fig.update_layout(
-        title=f"{side.capitalize()} quote surface · {tier['name']}", template="trinity_dark",
-        scene=dict(xaxis_title="Inventory q", yaxis_title="Rung size [M]", zaxis_title="Quote vs mid [pips]"),
-        margin=dict(l=0,r=0,t=45,b=0),
-    )
     return fig
 
 
@@ -1077,13 +1287,11 @@ def ladder_figure(solution: dict[str, Any], cfg: dict[str, Any], tier_index: int
 def flow_parameter_table(tier: dict[str, Any], cfg: dict[str, Any]) -> html.Table:
     rows=[]
     one_side_total = sum(0.5 * _source_total_rfq_rate(tier, source) for source in _tier_flow_sources(tier))
-    pricing = np.asarray(tier["sizes"], dtype=float)
-    for z in _rfq_size_grid(tier):
+    for z in _rfq_sizes(tier):
         rate = _activity(tier, float(z))
         size_share = rate / one_side_total if one_side_total > 0.0 else 0.0
-        is_knot = bool(np.any(np.isclose(pricing, float(z), rtol=0.0, atol=1e-12)))
         rows.append([
-            f"{float(z):g}" + (" · price knot" if is_knot else ""),
+            f"{float(z):g}",
             f"{100.0 * size_share:.2f}%", f"{rate:.6g}", f"{_delta50(tier,float(z)):.4f}",
             f"{float(tier['flow']['steepness']):.4g}", f"{float(tier.get('feePips', 0.0)):.3f}",
             f"{float(_markout_eur_per_million(tier,cfg,60.0)):.2f}",
@@ -1111,15 +1319,6 @@ def ladder_table(solution: dict[str, Any], cfg: dict[str, Any], tier_index: int,
     return _simple_table(["Size [M]","Bid δ","Ask δ","Bid vs mid [pips]","Ask vs mid [pips]","Bid vol prem [pips]","Ask vol prem [pips]"],rows)
 
 
-def internalization_figure(cfg: dict[str, Any]) -> go.Figure:
-    q=np.linspace(0,float(cfg["grid"]["maxAbs"]),300)
-    p=cfg["internalization"]
-    t=float(p["tau0"])+float(p["tau1"])*q+float(p["tau2"])*q*q
-    fig=go.Figure(go.Scatter(x=q,y=t,mode="lines",name="t(|q|)"))
-    fig.update_layout(title="Legacy internalization proxy — not used in HJB",xaxis_title="|q| [EUR M]",yaxis_title="Minutes",template="trinity_dark")
-    return fig
-
-
 def markout_figure(tier: dict[str, Any], cfg: dict[str, Any]) -> go.Figure:
     t = np.linspace(0.0, 300.0, 301)
     fig = go.Figure()
@@ -1141,46 +1340,6 @@ def markout_figure(tier: dict[str, Any], cfg: dict[str, Any]) -> go.Figure:
         yaxis_title="MTM markout [EUR per traded EUR 1M]",
         template="trinity_dark",
     )
-    return fig
-
-
-def expected_mtm_figure(solution: dict[str, Any], tier_index: int) -> go.Figure:
-    """Expected gross RFQ MTM and won-versus-lost increment in EUR/event.
-
-    Gross MTM is the full post-trade inventory exposure. Incremental MTM is
-    the part used in the HJB reward because lost RFQs also move the price.
-    """
-    data = solution.get("expectedMtm", [])[tier_index]
-    q = np.asarray(solution["qGrid"], dtype=float)
-    sizes = np.asarray(data["sizes"], dtype=float)
-    j = int(np.argmin(np.abs(sizes - 5.0)))
-    z = float(sizes[j])
-    fig = go.Figure()
-    for key, label, color, dash in (
-        ("grossBidEur", "Gross MTM · dealer buys", BID_COLOR, "solid"),
-        ("grossAskEur", "Gross MTM · dealer sells", ASK_COLOR, "solid"),
-        ("incrementalBidEur", "Won − lost · dealer buys", BID_COLOR, "dot"),
-        ("incrementalAskEur", "Won − lost · dealer sells", ASK_COLOR, "dot"),
-    ):
-        y = [float(row[j]) for row in data[key]]
-        fig.add_trace(go.Scatter(x=q, y=y, mode="lines", name=label,
-                                 line=dict(color=color, dash=dash)))
-    fig.add_hline(y=0.0, line_dash="dash", opacity=0.35)
-    fig.update_layout(
-        title=f"Expected MTM · {data['name']} · {z:g}M RFQ",
-        xaxis_title="Inventory before RFQ [EUR M]",
-        yaxis_title="Expected MTM [EUR per RFQ event]",
-        template="trinity_dark",
-    )
-    return fig
-
-
-def convergence_figure(values, title: str, ytitle: str) -> go.Figure:
-    fig=go.Figure()
-    if values:
-        y=np.maximum(np.asarray(values,dtype=float),1e-300)
-        fig.add_trace(go.Scatter(x=np.arange(1,len(y)+1),y=y,mode="lines+markers"))
-    fig.update_layout(title=title,xaxis_title="Howard iteration",yaxis_title=ytitle,yaxis_type="log",template="trinity_dark")
     return fig
 
 
@@ -1457,47 +1616,35 @@ def passive_ecn_fill_figure(cfg: dict[str, Any]) -> go.Figure:
     if len(sources) > 1:
         fig.add_trace(go.Scatter(
             x=grid, y=_ecn_arrival_rate(cfg, grid), mode="lines",
-            name="Total ECN", line=dict(width=4),
+            name="Total", legendgroup="total", line=dict(width=4),
         ))
     deltas = np.asarray(e.get("deltas", []), dtype=float)
     if deltas.size:
         fig.add_trace(go.Scatter(
             x=deltas, y=_ecn_arrival_rate(cfg, deltas), mode="markers",
-            name="Total · 1%-point grid", marker=dict(size=5),
+            name="Total", legendgroup="total", showlegend=len(sources) <= 1,
+            marker=dict(size=5),
         ))
     fig.update_layout(
-        title="ECN fill intensity · source curves mapped from master target-pair delta",
-        xaxis_title="Master price-improvement delta d (0 = touch, 0.5 = mid)",
-        yaxis_title="Fill intensity [trades/min]", template="trinity_dark",
+        title="Trade intensity curves",
+        xaxis_title="Target pair price improvement",
+        yaxis_title="trades / min", template="trinity_dark",
     )
     fig.update_xaxes(range=[lo, hi])
     return fig
 
 
-def passive_ecn_hit_ratio_figure(cfg: dict[str, Any]) -> go.Figure:
+def _ecn_max_total_intensity(cfg: dict[str, Any]) -> float:
+    """Maximum aggregate ECN rate on the configured quote-delta interval.
+
+    Each source is a positive exponential in delta, so their sum is convex;
+    its maximum over an interval is attained at one of the two endpoints.
+    Both bid and ask use the same per-side aggregate rate (not twice it).
+    """
     e = cfg.get("passiveEcn", {})
     lo = float(e.get("minDelta", 0.0))
     hi = float(e.get("maxDelta", 0.5))
-    grid = np.linspace(lo, hi, 240)
-    sources = _ecn_flow_sources(cfg)
-    fig = go.Figure()
-    for source in sources:
-        A = float(source["A"])
-        relative = _ecn_source_arrival_rate(source, grid) / A if A > 0.0 else np.zeros_like(grid)
-        fig.add_trace(go.Scatter(x=grid, y=relative, mode="lines", name=str(source["name"])))
-    total_mid = sum(float(s["A"]) for s in sources)
-    if len(sources) > 1 and total_mid > 0.0:
-        fig.add_trace(go.Scatter(
-            x=grid, y=_ecn_arrival_rate(cfg, grid) / total_mid, mode="lines",
-            name="Total / total mid intensity", line=dict(width=4),
-        ))
-    fig.update_layout(
-        title="ECN relative intensity by flow source",
-        xaxis_title="Master price-improvement delta d (0 = touch, 0.5 = mid)",
-        yaxis_title="Intensity relative to source mid", template="trinity_dark",
-    )
-    fig.update_xaxes(range=[lo, hi])
-    return fig
+    return max(float(_ecn_arrival_rate(cfg, lo)), float(_ecn_arrival_rate(cfg, hi)))
 
 
 def passive_ecn_implied_hit_ratio_figure(solution: dict[str, Any], cfg: dict[str, Any]) -> go.Figure:
@@ -1515,7 +1662,13 @@ def passive_ecn_implied_hit_ratio_figure(solution: dict[str, Any], cfg: dict[str
         ask_lam = np.where(ask_active, _ecn_arrival_rate(cfg, ask_delta), np.nan)
         _add_ecn_inventory_trace(fig, q, bid_lam, bid_active, "Bid hedge", BID_COLOR, "bid")
         _add_ecn_inventory_trace(fig, q, ask_lam, ask_active, "Ask hedge", ASK_COLOR, "ask")
-    fig.update_layout(title="Fill intensity vs inventory · Passive ECN", xaxis_title="Inventory q [EUR M]", yaxis_title="Trade intensity [trades/min]", template="trinity_dark")
+    fig.update_layout(
+        title="Targeted trade intensity", xaxis_title="Inventory EURm",
+        yaxis_title="trades / min", template="trinity_dark",
+    )
+    # Match the total ECN arrival-intensity ceiling in Trade intensity curves.
+    max_total = _ecn_max_total_intensity(cfg)
+    fig.update_yaxes(range=[0.0, max(max_total, 1e-9)], autorange=False)
     return fig
 
 
@@ -1554,7 +1707,112 @@ def passive_ecn_policy_figure(solution: dict[str, Any]) -> go.Figure:
         _add_ecn_inventory_trace(fig, q, bid, bid_active, "Bid hedge", BID_COLOR, "bid")
         _add_ecn_inventory_trace(fig, q, ask, ask_active, "Ask hedge", ASK_COLOR, "ask")
     fig.update_layout(title="Optimal passive ECN delta vs inventory",xaxis_title="Inventory q [EUR M]",yaxis_title="Price-improvement delta d",template="trinity_dark")
+    # Use the full 0..0.5 pricing-improvement scale on every volatility regime.
+    fig.update_yaxes(range=[0.0, 0.5], autorange=False)
     return fig
+
+def passive_ecn_regime_heatmap_figure(
+    solution: dict[str, Any], cfg: dict[str, Any], metric: str,
+) -> go.Figure:
+    """Visualize both ECN sides on the (inventory, volatility-regime) grid.
+
+    Disabled quotes are masked, not represented by zero delta or zero intensity.
+    Every side and regime shares the same scale, so colour is comparable.
+    """
+    quantities = {
+        "delta": ("Optimal ECN price-improvement delta", "Delta d"),
+        "quotes": ("ECN quote relative to mid", "Pips"),
+        "intensity": ("Targeted trade intensity", "trades / min"),
+    }
+    if metric not in quantities:
+        raise ValueError(f"Unknown ECN heatmap metric: {metric}")
+    heading, colorbar_title = quantities[metric]
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.18,
+        subplot_titles=("BID · hedge short inventory", "ASK · hedge long inventory"),
+    )
+    regimes = (solution or {}).get("regimes") or []
+    if not regimes or not all(regime.get("passiveEcn") for regime in regimes):
+        fig.add_annotation(text="Solve with passive ECN enabled to see the policy",
+                           showarrow=False)
+        fig.update_layout(title=heading, template="trinity_dark")
+        return fig
+
+    q = np.asarray(regimes[0]["passiveEcn"]["qGrid"], dtype=float)
+    names = ("Low", "High") if len(regimes) == 2 else (
+        ("Low", "Normal", "High") if len(regimes) == 3 else
+        tuple(f"Regime {i+1}" for i in range(len(regimes)))
+    )
+    y_labels = [f"{name} · σ={float(r['sigmaPips']):g}" for name, r in zip(names, regimes)]
+    spread_pips = float(cfg.get("spreadPips", 0.0))
+    matrices = {}
+    for side in ("bid", "ask"):
+        rows = []
+        for regime in regimes:
+            policy = regime["passiveEcn"]
+            q_regime = np.asarray(policy["qGrid"], dtype=float)
+            if q_regime.shape != q.shape or not np.array_equal(q_regime, q):
+                raise ValueError("All ECN volatility regimes must share the same inventory grid")
+            delta = np.asarray(policy[f"{side}Delta"], dtype=float)
+            active = np.asarray(policy[f"{side}Active"], dtype=bool)
+            if delta.shape != q.shape or active.shape != q.shape:
+                raise ValueError("ECN quote arrays must match the inventory grid")
+            if metric == "delta":
+                z = delta
+            elif metric == "quotes":
+                z = spread_pips * (0.5 - delta) * (-1.0 if side == "bid" else 1.0)
+            else:
+                z = np.asarray(_ecn_arrival_rate(cfg, delta), dtype=float)
+            rows.append(np.where(active, z, np.nan))
+        matrices[side] = np.vstack(rows)
+
+    if metric == "delta":
+        config = cfg.get("passiveEcn", {})
+        cmin = float(config.get("minDelta", 0.0))
+        cmax = float(config.get("maxDelta", 0.5))
+        colorscale = "Viridis"
+    elif metric == "quotes":
+        bound = max(0.5 * abs(spread_pips), 1e-6)
+        cmin, cmax, colorscale = -bound, bound, "RdBu_r"
+    else:
+        # Keep the intensity colour scale consistent with the line-chart axis.
+        cmin = 0.0
+        cmax = max(_ecn_max_total_intensity(cfg), 1e-9)
+        colorscale = "Viridis"
+    if cmax <= cmin:
+        cmax = cmin + 1e-9
+
+    for row, side in enumerate(("bid", "ask"), start=1):
+        fig.add_trace(go.Heatmap(
+            x=q, y=y_labels, z=matrices[side],
+            coloraxis="coloraxis", xgap=0.8, ygap=2,
+            hovertemplate=(
+                f"{side.upper()}<br>Inventory: %{{x:g}}M"
+                f"<br>Regime: %{{y}} pips/√min"
+                f"<br>{colorbar_title}: %{{z:.4f}}<extra></extra>"
+            ),
+        ), row=row, col=1)
+        fig.update_yaxes(title_text="Volatility regime", type="category", row=row, col=1)
+
+    fig.update_xaxes(title_text="Inventory EURm" if metric == "intensity" else "Inventory q [EUR M]", row=2, col=1)
+    fig.update_layout(
+        title=f"{heading} · all volatility regimes",
+        template="trinity_dark",
+        plot_bgcolor="#202c38",  # slate indicates OFF/no resting quote
+        height=610,
+        margin=dict(l=115, r=80, t=82, b=80),
+        coloraxis=dict(
+            colorscale=colorscale, cmin=cmin, cmax=cmax,
+            colorbar=dict(title=colorbar_title, thickness=16, len=0.85),
+        ),
+    )
+    fig.add_annotation(
+        text="Slate cells = no active ECN quote", x=0, y=-0.13,
+        xref="paper", yref="paper", showarrow=False,
+        font=dict(color=PLOT_MUTED, size=11), xanchor="left",
+    )
+    return fig
+
 
 def passive_ecn_table(solution: dict[str, Any]) -> html.Table | html.Div:
     e=solution.get("passiveEcn") if solution else None
@@ -1574,30 +1832,16 @@ sidebar = html.Aside([
         html.Div([html.Strong("FX Ladder Pricer")], className="brand-copy"),
     ], className="brand"),
     panel("Global", [
+        _dropdown_field("Target FX pair", "global-target-pair", DEFAULT["targetPair"], FX_PAIR_OPTIONS),
         html.Div([
             number_input("Max |q| [M]", "qmax", DEFAULT["grid"]["maxAbs"], 1.0),
-        ], className="grid-2"),
-    ], True),
-    panel("Spot & risk", [
-        html.Div([
-            number_input("EURSEK spot", "spot", DEFAULT["spot"], "any"),
-            number_input("Spread [pips]", "spread", DEFAULT["spreadPips"], "any"),
-            number_input("Drift / min", "drift", DEFAULT["spotDrift"], "any"),
-            number_input("Vol [pips / √min]", "sigma", DEFAULT["sigmaPips"], "any"),
             number_input("Gamma / φ", "gamma", DEFAULT["gamma"], "any"),
         ], className="grid-2"),
     ], True),
-    panel("Legacy internalization proxy (inactive in HJB)", [
-        html.Div([
-            number_input("Tau 0 [min]", "tau0", DEFAULT["internalization"]["tau0"], "any"),
-            number_input("Tau 1", "tau1", DEFAULT["internalization"]["tau1"], "any"),
-            number_input("Tau 2", "tau2", DEFAULT["internalization"]["tau2"], "any"),
-        ], className="grid-2"),
-    ]),
     html.Div("Pricing tiers", className="section-title"),
     *[tier_panel(i, t, open_=(i == 0)) for i, t in enumerate(DEFAULT["tiers"])],
     panel("Dark pool", [
-        checkbox("Enabled", "dp-enabled", DEFAULT["darkPool"]["enabled"]),
+        checkbox("Enabled", "dp-enabled", DEFAULT["darkPool"]["enabled"], channel_enable=True),
         html.Div("Zero-inflated Poisson fill-size model", className="muted-note"),
         html.Div([
             number_input("λ / side / min", "dp-lambda", DEFAULT["darkPool"]["lambda"], "any"),
@@ -1609,7 +1853,7 @@ sidebar = html.Aside([
         text_input("Posted sizes", "dp-sizes", ", ".join(str(x) for x in DEFAULT["darkPool"]["postedSizes"])),
     ]),
     panel("ECN", [
-        checkbox("Enabled", "ecn-enabled", DEFAULT["passiveEcn"]["enabled"]),
+        checkbox("Enabled", "ecn-enabled", DEFAULT["passiveEcn"]["enabled"], channel_enable=True),
         html.Div([
             html.Button("Configure flow sources", id="open-ecn-flow-sources", className="secondary-button compact-button", n_clicks=0),
         ], className="flow-source-config-line"),
@@ -1636,32 +1880,33 @@ policy_tab = html.Div([
         card("Converged", "m-converged"),
         card("Best-response iterations", "m-iterations"),
         card("Average reward", "m-rho"),
-        card("Frozen best-response residual", "m-residual"),
     ], className="metrics-row"),
     dcc.Tabs(id="policy-subtabs", value="overview", children=[
         dcc.Tab(label="Overview", value="overview", children=html.Div([
-            diagnostic_expander("Continuation value h(q)", graph("value-chart"), open_=True),
-            diagnostic_expander("Legacy internalization proxy (not used by HJB)", graph("internalization-chart")),
-            diagnostic_expander("Frozen best-response residual (not an optimality certificate)", graph("residual-chart")),
-            diagnostic_expander("Value-function change", graph("value-change-chart")),
+            diagnostic_expander("Continuation value h(q)", [
+                regime_selector("overview-value-regime"),
+                graph("value-chart"),
+            ], open_=True),
         ], className="subtab-inner diagnostics-stack"), className="dash-tab", selected_className="dash-tab dash-tab-selected"),
         dcc.Tab(label="Tier diagnostics", value="tiers", children=html.Div([
-            html.Div([
-                select("Tier", "tier-select", [], None),
-            ], className="toolbar toolbar-wide"),
+            html.Div([select("Tier", "tier-select", [], None)], className="toolbar toolbar-wide"),
             diagnostic_expander("Tier parameters", [
                 html.Div(id="flow-parameter-table", className="table-wrap"),
             ]),
             diagnostic_expander("Exogenous RFQ arrival intensity", graph("rfq-arrival-chart")),
             diagnostic_expander("Won-trade intensity", graph("flow-chart")),
             diagnostic_expander("Win probabilities", graph("hit-ratio-chart")),
-            diagnostic_expander("Implied hit ratios vs inventory", graph("implied-hit-chart")),
+            diagnostic_expander("Implied hit ratios vs inventory", [
+                *rfq_heatmap_controls("tier-implied-hit"),
+                graph("implied-hit-chart"),
+            ]),
             diagnostic_expander("Markouts", graph("markout-chart")),
-            diagnostic_expander("Expected whole-inventory MTM · 5M RFQ", graph("expected-mtm-chart")),
-            diagnostic_expander("Quotes vs inventory", graph("quote-inventory-chart")),
-            diagnostic_expander("Bid quote surface (3D)", graph("bid-surface-chart", height=500)),
-            diagnostic_expander("Ask quote surface (3D)", graph("ask-surface-chart", height=500)),
+            diagnostic_expander("Quotes vs inventory", [
+                *rfq_heatmap_controls("tier-quote-inventory"),
+                graph("quote-inventory-chart"),
+            ]),
             diagnostic_expander("Volume premium", [
+                regime_selector("tier-ladder-regime"),
                 html.Div([select("Inventory level for ladder", "ladder-q", [], None)], className="toolbar"),
                 graph("ladder-chart"),
                 html.Div("Ladder at selected inventory", className="card-title table-section-title"),
@@ -1672,6 +1917,7 @@ policy_tab = html.Div([
             diagnostic_expander("Arrival size density", graph("dp-arrival-chart")),
             diagnostic_expander("P(full fill) by posted size", graph("dp-full-fill-chart")),
             diagnostic_expander("Dark pool policy", [
+                regime_selector("dark-policy-regime"),
                 graph("dp-policy-chart"),
                 html.Div("Dark-pool policy", className="card-title table-section-title"),
                 html.Div(id="dp-policy-table", className="table-wrap tall-table"),
@@ -1681,23 +1927,36 @@ policy_tab = html.Div([
             diagnostic_expander("ECN parameters", [
                 html.Div(id="ecn-parameter-table", className="table-wrap"),
             ]),
-            diagnostic_expander("Flow curves", graph("ecn-fill-chart")),
-            diagnostic_expander("Relative intensity", graph("ecn-hit-ratio-chart")),
-            diagnostic_expander("Fill intensity vs inventory", graph("ecn-implied-hit-chart")),
-            diagnostic_expander("Quotes vs inventory", graph("ecn-quote-inventory-chart")),
+            diagnostic_expander("Trade intensity curves", graph("ecn-fill-chart")),
+            diagnostic_expander("Targeted trade intensity", [
+                ecn_heatmap_toggle("ecn-implied-hit-heatmap"),
+                regime_selector("ecn-implied-hit-regime", wrapper_id="ecn-implied-hit-regime-wrapper"),
+                graph("ecn-implied-hit-chart"),
+            ]),
+            diagnostic_expander("Quotes vs inventory", [
+                ecn_heatmap_toggle("ecn-quote-inventory-heatmap"),
+                regime_selector("ecn-quote-inventory-regime", wrapper_id="ecn-quote-inventory-regime-wrapper"),
+                graph("ecn-quote-inventory-chart"),
+            ]),
             diagnostic_expander("Optimal quote delta", [
+                ecn_heatmap_toggle("ecn-policy-heatmap"),
+                regime_selector("ecn-policy-regime", wrapper_id="ecn-policy-regime-wrapper"),
                 graph("ecn-policy-chart"),
-                html.Div("Passive ECN policy", className="card-title table-section-title"),
-                html.Div(id="ecn-policy-table", className="table-wrap tall-table"),
+                html.Div([
+                    html.Div("Passive ECN policy", className="card-title table-section-title"),
+                    html.Div(id="ecn-policy-table", className="table-wrap tall-table"),
+                ], id="ecn-policy-table-wrapper"),
             ]),
         ], className="subtab-inner tier-diagnostics-stack"), className="dash-tab", selected_className="dash-tab dash-tab-selected"),
     ], className="tabs policy-tabs"),
 ], className="tab-inner")
 
 mc_tab = html.Div([
+    html.Div("Monte Carlo simulates volatility switching and changes pricing policy after every regime transition.", className="muted-note"),
     html.Div([
         number_input("Paths", "mc-paths", 1000, 1),
         number_input("Initial inventory [M]", "mc-q0", 0.0, "any"),
+        select("Initial volatility regime", "mc-initial-regime", [], None),
         number_input("Random seed", "mc-seed", 12345, 1),
         html.Button("Run Monte Carlo", id="run-mc", className="secondary-button"),
     ], className="toolbar toolbar-wide"),
@@ -1768,6 +2027,7 @@ mc_tab = html.Div([
 ], className="tab-inner")
 
 frontier_tab = html.Div([
+    html.Div("Regime-aware efficient frontier: each risk parameter re-solves the joint HJB and evaluates finite-horizon PnL moments.", className="muted-note"),
     html.Div([
         number_input("φ min", "frontier-min", 0.01, "any"),
         number_input("φ max", "frontier-max", 0.5, "any"),
@@ -1782,6 +2042,7 @@ frontier_tab = html.Div([
     ], className="diagnostics-stack frontier-diagnostics-stack"),
 ], className="tab-inner")
 
+
 app.layout = html.Div([
     dcc.Store(id="config-store"),
     dcc.Store(id="solution-store"),
@@ -1790,7 +2051,7 @@ app.layout = html.Div([
     dcc.Store(id="frontier-store"),
     dcc.Store(id="mc-job-store"),
     dcc.Interval(id="mc-progress-poll", interval=250, n_intervals=0, disabled=True),
-    dcc.Store(id="extra-flow-sources-store", data={"0": [], "1": [], "2": []}),
+    dcc.Store(id="extra-flow-sources-store", data={"0": [], "1": []}),
     dcc.Store(id="flow-source-tier-store", data=None),
     dcc.Store(id="flow-source-selected-store", data="direct"),
     dcc.Store(id="flow-source-modal-open-store", data=False),
@@ -1803,26 +2064,85 @@ app.layout = html.Div([
             html.Div([
                 html.Div([
                     html.H2("Configure flow sources", className="modal-title"),
-                    html.Div("Choose the target FX pair, then add the FX pairs whose customer flow should be mapped into that target risk.", className="muted-note modal-note"),
+                    html.Div("The target FX pair is set in Global. Configure its direct flow or add crossed FX pairs here.", className="muted-note modal-note"),
                 ]),
                 html.Button("×", id="flow-source-close", className="modal-close", n_clicks=0),
             ], className="modal-head"),
-            html.Div(id="flow-source-tier-label", className="flow-source-target-label"),
-            html.Div([
-                html.Label([
-                    html.Span("Target / priced FX pair"),
-                    dcc.Dropdown(id="flow-target-pair", options=FX_PAIR_OPTIONS, value=DEFAULT.get("targetPair", "EURSEK"), placeholder="Select target FX pair", clearable=False, className="field-dropdown", persistence=True, persistence_type="memory"),
-                ], className="field"),
-            ], className="flow-target-picker"),
             html.Div([
                 html.Div(id="flow-source-cards", className="flow-pair-cards"),
-                html.Div(id="flow-source-settings"),
+                # One visually unified source card: the header and dynamic
+                # RFQ/volatility/markout controls surround these stable inputs.
+                # Keep both Tier size fields mounted exactly once so switching
+                # sources or Tiers cannot discard unsaved edits.
+                html.Div([
+                    html.Div(id="flow-source-heading"),
+                    # Keep the locked target display mounted at all times: crossed
+                    # source calculations and Solve read the same value.  The
+                    # Direct card shows a disabled crossing selector in the
+                    # same position where crossed sources expose the active one.
+                    html.Div([
+                        html.Label([
+                            html.Span("Target pair"),
+                            dcc.Dropdown(
+                                id="flow-direct-target-display", value=DEFAULT["targetPair"],
+                                options=FX_PAIR_OPTIONS, disabled=True, clearable=False,
+                                className="field-dropdown",
+                            ),
+                        ], className="field"),
+                        html.Label([
+                            html.Span("Crossing pair"),
+                            dcc.Dropdown(
+                                id="flow-direct-crossing-placeholder",
+                                options=FX_PAIR_OPTIONS,
+                                value=None,
+                                placeholder="Select FX pair",
+                                disabled=True,
+                                clearable=False,
+                                className="field-dropdown",
+                            ),
+                        ], className="field"),
+                    ], id="flow-target-picker-container",
+                       className="flow-target-picker flow-pair-selectors"),
+                    html.Div([
+                        diagnostic_expander("Market Data", [
+                            html.Div([
+                                html.Div([
+                                    html.Label([
+                                        html.Span("Mid-rate", className="field-label"),
+                                        dcc.Input(id="spot", type="number", value=DEFAULT["spot"],
+                                                  step="any", className="field-input"),
+                                    ], className="field"),
+                                    number_input("Spread [pips]", "spread", DEFAULT["spreadPips"], "any"),
+                                ], className="grid-2"),
+                            ], className="flow-target-market-data"),
+                        ]),
+                        diagnostic_expander("Pricing Rungs", [
+                            html.Div([
+                                html.Div(
+                                    text_input("Base M",
+                                               f"t{i}-sizes", ", ".join(str(z) for z in tier["sizes"])),
+                                    id=f"flow-target-tier-knots-{i}",
+                                    className="flow-target-tier-knots",
+                                    style={"display": "none"},
+                                )
+                                for i, tier in enumerate(DEFAULT["tiers"])
+                            ], className="flow-target-pricing-knots"),
+                        ]),
+                    ], id="flow-target-direct-settings", className="flow-target-direct-settings",
+                       style={"display": "none"}),
+                    html.Div(id="flow-source-settings"),
+                ], id="flow-source-active-card", className="flow-source-settings"),
             ], id="flow-source-editor", className="flow-source-editor"),
             html.Div([
-                html.Button("+ Add FX pair", id="flow-source-add", className="secondary-button", n_clicks=0),
                 html.Div([
-                    html.Button("Close", id="flow-source-cancel", className="ghost-button", n_clicks=0),
-                    html.Button("Apply", id="flow-source-apply", className="primary-button", n_clicks=0),
+                    html.Button("+ Add FX pair", id="flow-source-add", className="secondary-button", n_clicks=0),
+                    html.Button("Remove FX pair", id="flow-source-remove-selected",
+                                className="modal-remove-button", n_clicks=0,
+                                disabled=True, style={"display": "none"}),
+                ], className="modal-actions-left"),
+                html.Div([
+                    html.Button("Close", id="flow-source-cancel", className="modal-action-button modal-action-danger", n_clicks=0),
+                    html.Button("Apply", id="flow-source-apply", className="modal-action-button modal-action-apply", n_clicks=0),
                 ], className="modal-actions-right"),
             ], className="modal-actions"),
         ], className="flow-source-modal-card"),
@@ -1832,20 +2152,48 @@ app.layout = html.Div([
             html.Div([
                 html.Div([
                     html.H2("Configure ECN flow sources", className="modal-title"),
-                    html.Div("The ECN optimizer chooses one master delta on the target pair. Crossed ECN pairs inherit that quote through the same FX transformation used by Tier flow sources, while keeping their own A, k and discrete 1M/750k/500k/250k/100k trade-size probabilities.", className="muted-note modal-note"),
                 ]),
                 html.Button("×", id="ecn-flow-source-close", className="modal-close", n_clicks=0),
             ], className="modal-head"),
-            html.Div(id="ecn-flow-source-target-label", className="flow-source-target-label"),
             html.Div([
                 html.Div(id="ecn-flow-source-cards", className="flow-pair-cards"),
+                # Keep the read-only direct target display mounted while a crossed
+                # source is selected. The same global target is shared with Tier flow.
+                html.Div([
+                    html.Label([
+                        html.Span("Target pair"),
+                        dcc.Dropdown(
+                            id="ecn-direct-target-display", value=DEFAULT["targetPair"],
+                            options=FX_PAIR_OPTIONS, disabled=True, clearable=False,
+                            className="field-dropdown",
+                        ),
+                    ], className="field"),
+                    html.Label([
+                        html.Span("Crossing pair"),
+                        dcc.Dropdown(
+                            id="ecn-direct-crossing-placeholder",
+                            options=FX_PAIR_OPTIONS,
+                            value=None,
+                            placeholder="Select FX pair",
+                            disabled=True,
+                            clearable=False,
+                            className="field-dropdown",
+                        ),
+                    ], className="field"),
+                ], id="ecn-target-picker-container",
+                   className="flow-target-picker flow-pair-selectors"),
                 html.Div(id="ecn-flow-source-settings"),
             ], className="flow-source-editor"),
             html.Div([
-                html.Button("+ Add FX pair", id="ecn-flow-source-add", className="secondary-button", n_clicks=0),
                 html.Div([
-                    html.Button("Close", id="ecn-flow-source-cancel", className="ghost-button", n_clicks=0),
-                    html.Button("Apply", id="ecn-flow-source-apply", className="primary-button", n_clicks=0),
+                    html.Button("+ Add FX pair", id="ecn-flow-source-add", className="secondary-button", n_clicks=0),
+                    html.Button("Remove FX pair", id="ecn-flow-source-remove-selected",
+                                className="modal-remove-button", n_clicks=0,
+                                disabled=True, style={"display": "none"}),
+                ], className="modal-actions-left"),
+                html.Div([
+                    html.Button("Close", id="ecn-flow-source-cancel", className="modal-action-button modal-action-danger", n_clicks=0),
+                    html.Button("Apply", id="ecn-flow-source-apply", className="modal-action-button modal-action-apply", n_clicks=0),
                 ], className="modal-actions-right"),
             ], className="modal-actions"),
         ], className="flow-source-modal-card"),
@@ -1890,14 +2238,13 @@ app.layout = html.Div([
 
 CONFIG_FIELDS = [
     ("qmax", State("qmax", "value")),
-    ("spot", State("spot", "value")), ("spread", State("spread", "value")), ("drift", State("drift", "value")),
-    ("sigma", State("sigma", "value")), ("gamma", State("gamma", "value")), ("tau0", State("tau0", "value")),
-    ("tau1", State("tau1", "value")), ("tau2", State("tau2", "value")),
+    ("spot", State("spot", "value")), ("spread", State("spread", "value")),
+    ("gamma", State("gamma", "value")),
 ]
-for i in range(3):
+for i in range(len(DEFAULT["tiers"])):
     p = f"t{i}"
     for suffix in (
-        "enabled", "name", "sizes", "rfq-size-step", "A0", "theta", "beta", "steep", "shift", "vshift",
+        "enabled", "name", "sizes", "A0", "theta", "beta", "steep", "shift", "vshift",
         "fee", "markout-enabled", "markout-asymptote", "markout-tau-seconds", "dmin", "dmax",
     ):
         CONFIG_FIELDS.append((f"{p}-{suffix}", State(f"{p}-{suffix}", "value")))
@@ -1916,8 +2263,27 @@ CONFIG_STATES = [state for _, state in CONFIG_FIELDS]
 
 
 @app.callback(
+    Output("spot", "value"),
+    Output("spread", "value"),
+    Input("global-target-pair", "value"),
+)
+def update_target_market_defaults(target_pair):
+    """Load both target-pair market inputs from the packaged JSON defaults.
+
+    Only changes in Global reset the editable inputs. Manual spot/spread
+    edits do not trigger this callback or get overwritten when solving.
+    """
+    if not target_pair:
+        return no_update, no_update
+    market_data = default_fx_pair_market_data(target_pair)
+    if market_data is None:
+        raise ValueError(f"Missing default FX pair market data for {target_pair}")
+    return market_data["spot"], market_data["spreadPips"]
+
+
+@app.callback(
     Output("flow-source-add", "disabled"),
-    Input("flow-target-pair", "value"),
+    Input("global-target-pair", "value"),
 )
 def disable_add_flow_source_without_target(target_pair):
     return not bool(target_pair)
@@ -1960,13 +2326,13 @@ def render_flow_source_modal_visibility(is_open):
 @app.callback(
     Output("flow-source-selected-store", "data"),
     Input("flow-source-tier-store", "data"),
-    Input("flow-target-pair", "value"),
+    Input("global-target-pair", "value"),
     Input({"type": "flow-pair-select", "key": ALL}, "n_clicks"),
     State("flow-source-selected-store", "data"),
 )
 def select_flow_source(_tier_index, _target_pair, _clicks, selected):
     trigger = ctx.triggered_id
-    if trigger in ("flow-source-tier-store", "flow-target-pair"):
+    if trigger in ("flow-source-tier-store", "global-target-pair"):
         return "direct"
     if isinstance(trigger, dict) and trigger.get("type") == "flow-pair-select":
         # Pattern-matching Inputs are also triggered when a newly-rendered card
@@ -1981,10 +2347,22 @@ def select_flow_source(_tier_index, _target_pair, _clicks, selected):
 
 
 @app.callback(
+    Output("flow-target-picker-container", "style"),
+    Input("flow-source-selected-store", "data"),
+)
+def show_target_pair_picker(selected):
+    """Show the read-only target pair only while editing the direct source.
+
+    Crossed sources use the Global target pair,
+    so their mapping and Solve configuration continue to use the same target.
+    """
+    return {"display": "none"} if selected not in (None, "direct") else {"display": "flex"}
+
+
+@app.callback(
     Output("flow-source-cards", "children"),
-    Output("flow-source-tier-label", "children"),
     Input("flow-source-tier-store", "data"),
-    Input("flow-target-pair", "value"),
+    Input("global-target-pair", "value"),
     Input("flow-source-selected-store", "data"),
     Input("extra-flow-sources-store", "data"),
 )
@@ -1996,11 +2374,9 @@ def render_flow_source_cards(tier_index, target_pair, selected, data):
     settings form is deliberately rendered by a separate callback so editing a
     dropdown never destroys and remounts that dropdown mid-selection.
     """
-    if tier_index is None:
-        return [], ""
+    if tier_index is None or not target_pair:
+        return []
     ti = int(tier_index)
-    if not target_pair:
-        return [], f"Tier {ti + 1}"
 
     extras = (data or {}).get(str(ti), [])
     selected = selected or "direct"
@@ -2008,16 +2384,63 @@ def render_flow_source_cards(tier_index, target_pair, selected, data):
     for i, source in enumerate(extras):
         key = f"extra-{i}"
         cards.append(flow_pair_card(key, str(source.get("pair") or "Select FX pair"), selected == key, removable=True))
-    return cards, f"Tier {ti + 1} · target risk {target_pair}"
+    return cards
 
 
 @app.callback(
+    Output("flow-target-direct-settings", "style"),
+    *[Output(f"flow-target-tier-knots-{i}", "style") for i in range(len(DEFAULT["tiers"]))],
+    Input("flow-source-tier-store", "data"),
+    Input("flow-source-selected-store", "data"),
+)
+def show_target_pair_settings_for_tier(tier_index, selected):
+    """Show only the active Tier's RFQ knots, without unmounting either field.
+
+    Target-pair market data and pricing knots are configured on the direct
+    source card.  Crossed sources have their own separate flow parameters.
+    """
+    direct = tier_index is not None and (selected or "direct") == "direct"
+    tier = int(tier_index) if direct else -1
+    return (
+        {"display": "block"} if direct and 0 <= tier < len(DEFAULT["tiers"]) else {"display": "none"},
+        *({"display": "block"} if direct and i == tier else {"display": "none"}
+          for i in range(len(DEFAULT["tiers"]))),
+    )
+
+
+def _removable_crossed_source(selected, sources) -> bool:
+    """Only a currently selected, existing crossed source may be removed."""
+    try:
+        if not isinstance(selected, str) or not selected.startswith("extra-"):
+            return False
+        index = int(selected.split("-", 1)[1])
+        return 0 <= index < len(sources or [])
+    except (ValueError, TypeError):
+        return False
+
+
+@app.callback(
+    Output("flow-source-remove-selected", "style"),
+    Output("flow-source-remove-selected", "disabled"),
+    Input("flow-source-selected-store", "data"),
+    Input("flow-source-tier-store", "data"),
+    Input("extra-flow-sources-store", "data"),
+)
+def show_flow_source_remove_button(selected, tier_index, data):
+    sources = (data or {}).get(str(tier_index), []) if tier_index is not None else []
+    visible = _removable_crossed_source(selected, sources)
+    return ({"display": "inline-flex"} if visible else {"display": "none"}), not visible
+
+
+@app.callback(
+    Output("flow-source-heading", "children"),
     Output("flow-source-settings", "children"),
     Input("flow-source-tier-store", "data"),
-    Input("flow-target-pair", "value"),
+    Input("global-target-pair", "value"),
     Input("flow-source-selected-store", "data"),
     State("extra-flow-sources-store", "data"),
-    *[State(f"t{i}-{suffix}", "value") for i in range(3) for suffix in ("A0", "theta", "beta", "steep", "shift", "vshift")],
+    *[State(f"t{i}-{suffix}", "value") for i in range(len(DEFAULT["tiers"])) for suffix in ("A0", "theta", "beta", "steep", "shift", "vshift")],
+    *[State(f"t{i}-{suffix}", "value") for i in range(len(DEFAULT["tiers"])) for suffix in ("markout-enabled", "markout-asymptote", "markout-tau-seconds")],
 )
 def render_flow_source_settings(tier_index, target_pair, selected, data, *direct_values):
     """Render the settings form only when its identity changes.
@@ -2027,16 +2450,17 @@ def render_flow_source_settings(tier_index, target_pair, selected, data, *direct
     remounting the form that the user is currently interacting with.
     """
     if tier_index is None:
-        return []
+        return [], []
     ti = int(tier_index)
     if not target_pair:
         return html.Div(
-            "Select the target / priced FX pair above to configure its direct flow and add crossed flow sources.",
+            "Choose the target FX pair in Global to configure flow sources.",
             className="muted-note flow-source-empty",
-        )
+        ), []
 
     extras = (data or {}).get(str(ti), [])
     selected = selected or "direct"
+    tier_count = len(DEFAULT["tiers"])
     offset = ti * 6
     vals = direct_values[offset:offset + 6]
     direct_flow = {
@@ -2054,13 +2478,18 @@ def render_flow_source_settings(tier_index, target_pair, selected, data, *direct
             source = _direct_flow_source(direct_flow, str(target_pair))
             selected = "direct"
 
-    return flow_source_settings_editor(selected, source, str(target_pair))
+    mo_offset = 6 * tier_count + ti * 3
+    markout_vals = direct_values[mo_offset:mo_offset + 3]
+    markout = {"enabled": checked(markout_vals[0]), "asymptote": markout_vals[1], "tau": markout_vals[2]}
+    editor = flow_source_settings_editor(selected, source, str(target_pair), markout)
+    heading, expanders = editor.children
+    return heading, expanders
 
 
 @app.callback(
     Output("flow-edit-cross-pair", "value"),
     Input("flow-edit-pair", "value"),
-    State("flow-target-pair", "value"),
+    State("global-target-pair", "value"),
     prevent_initial_call=True,
 )
 def derive_flow_source_cross_pair(source_pair, target_pair):
@@ -2086,24 +2515,23 @@ def populate_flow_source_cross_mid(cross_pair):
     Output("flow-source-selected-store", "data", allow_duplicate=True),
     Output("t0-A0", "value"), Output("t0-theta", "value"), Output("t0-beta", "value"), Output("t0-steep", "value"), Output("t0-shift", "value"), Output("t0-vshift", "value"),
     Output("t1-A0", "value"), Output("t1-theta", "value"), Output("t1-beta", "value"), Output("t1-steep", "value"), Output("t1-shift", "value"), Output("t1-vshift", "value"),
-    Output("t2-A0", "value"), Output("t2-theta", "value"), Output("t2-beta", "value"), Output("t2-steep", "value"), Output("t2-shift", "value"), Output("t2-vshift", "value"),
     Input("flow-source-add", "n_clicks"),
     Input("flow-source-remove-selected", "n_clicks"),
     Input("flow-edit-pair", "value"), Input("flow-edit-cross-pair", "value"),
     Input("flow-edit-cross-mid", "value"), Input("flow-edit-spread", "value"),
     Input("flow-edit-A0", "value"), Input("flow-edit-theta", "value"), Input("flow-edit-beta", "value"),
     Input("flow-edit-steep", "value"), Input("flow-edit-shift", "value"), Input("flow-edit-vshift", "value"),
-    State("flow-source-tier-store", "data"), State("flow-target-pair", "value"), State("flow-source-selected-store", "data"), State("extra-flow-sources-store", "data"),
-    *[State(f"t{i}-{suffix}", "value") for i in range(3) for suffix in ("A0", "theta", "beta", "steep", "shift", "vshift")],
+    State("flow-source-tier-store", "data"), State("global-target-pair", "value"), State("flow-source-selected-store", "data"), State("extra-flow-sources-store", "data"),
+    *[State(f"t{i}-{suffix}", "value") for i in range(len(DEFAULT["tiers"])) for suffix in ("A0", "theta", "beta", "steep", "shift", "vshift")],
     prevent_initial_call=True,
 )
 def update_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, spread, A0, theta, beta, steep, shift, vshift,
                               tier_index, target_pair, selected, data, *direct_values):
     if tier_index is None:
-        return (no_update,) * 20
+        return (no_update,) * 14
     ti = int(tier_index)
     key = str(ti)
-    out = deepcopy(data or {"0": [], "1": [], "2": []})
+    out = deepcopy(data or {"0": [], "1": []})
     direct = list(direct_values)
     selected = selected or "direct"
     trigger = ctx.triggered_id
@@ -2112,7 +2540,7 @@ def update_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, spread
         # n_clicks=0 can be observed during component initialisation; only a
         # positive click count represents an actual Add action.
         if not _add:
-            return (no_update,) * 20
+            return (no_update,) * 14
         if not target_pair:
             return out, selected, *direct
         out.setdefault(key, []).append(_default_cross_flow_source(len(out.get(key, [])), target_pair))
@@ -2120,11 +2548,10 @@ def update_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, spread
         return out, new_selected, *direct
 
     if trigger == "flow-source-remove-selected":
-        # The Remove button is dynamically mounted when a crossed source is
-        # selected. Dash can fire the callback once on that mount with
-        # n_clicks=0. Treat only a positive click count as a removal.
+        # The persistent footer action is only enabled for a crossed source.
+        # Ignore callback initialisation (n_clicks=0).
         if not _remove:
-            return (no_update,) * 20
+            return (no_update,) * 14
         if selected.startswith("extra-"):
             idx = int(selected.split("-", 1)[1])
             if 0 <= idx < len(out.get(key, [])):
@@ -2196,7 +2623,7 @@ def render_ecn_flow_source_modal_visibility(is_open):
 
 @app.callback(
     Output("ecn-flow-source-add", "disabled"),
-    Input("flow-target-pair", "value"),
+    Input("global-target-pair", "value"),
 )
 def disable_add_ecn_flow_source_without_target(target_pair):
     return not bool(target_pair)
@@ -2204,13 +2631,13 @@ def disable_add_ecn_flow_source_without_target(target_pair):
 
 @app.callback(
     Output("ecn-flow-source-selected-store", "data"),
-    Input("flow-target-pair", "value"),
+    Input("global-target-pair", "value"),
     Input({"type": "ecn-flow-pair-select", "key": ALL}, "n_clicks"),
     State("ecn-flow-source-selected-store", "data"),
 )
 def select_ecn_flow_source(_target_pair, _clicks, selected):
     trigger = ctx.triggered_id
-    if trigger == "flow-target-pair":
+    if trigger == "global-target-pair":
         return "direct"
     if isinstance(trigger, dict) and trigger.get("type") == "ecn-flow-pair-select":
         triggered_value = ctx.triggered[0].get("value") if ctx.triggered else None
@@ -2221,27 +2648,70 @@ def select_ecn_flow_source(_target_pair, _clicks, selected):
 
 
 @app.callback(
+    Output("flow-direct-target-display", "value"),
+    Output("ecn-direct-target-display", "value"),
+    Input("global-target-pair", "value"),
+)
+def show_global_target_in_flow_editors(target_pair):
+    """Read-only reflections of the only editable target FX pair."""
+    return target_pair, target_pair
+
+
+@app.callback(
+    Output("extra-flow-sources-store", "data", allow_duplicate=True),
+    Output("ecn-extra-flow-sources-store", "data", allow_duplicate=True),
+    Input("global-target-pair", "value"),
+    prevent_initial_call=True,
+)
+def clear_crossed_sources_on_target_change(_target_pair):
+    """Old crosses can be incompatible with the new target base/quote.
+
+    Do not silently reinterpret an old crossMid or source flow under a new
+    target FX pair: require explicitly re-adding crossed sources instead.
+    """
+    return {str(i): [] for i in range(len(DEFAULT["tiers"]))}, []
+
+
+@app.callback(
+    Output("ecn-target-picker-container", "style"),
+    Input("ecn-flow-source-selected-store", "data"),
+)
+def show_ecn_target_pair_picker(selected):
+    return {"display": "none"} if selected not in (None, "direct") else {"display": "flex"}
+
+
+@app.callback(
     Output("ecn-flow-source-cards", "children"),
-    Output("ecn-flow-source-target-label", "children"),
-    Input("flow-target-pair", "value"),
+    Input("global-target-pair", "value"),
     Input("ecn-flow-source-selected-store", "data"),
     Input("ecn-extra-flow-sources-store", "data"),
 )
 def render_ecn_flow_source_cards(target_pair, selected, data):
     if not target_pair:
-        return [], "Select the target / priced FX pair in a Tier flow-source dialog first"
+        return []
     extras = data or []
     selected = selected or "direct"
     cards = [ecn_flow_pair_card("direct", str(target_pair), selected == "direct")]
     for i, source in enumerate(extras):
         key = f"extra-{i}"
         cards.append(ecn_flow_pair_card(key, str(source.get("pair") or "Select FX pair"), selected == key, removable=True))
-    return cards, f"ECN · target risk {target_pair}"
+    return cards
+
+
+@app.callback(
+    Output("ecn-flow-source-remove-selected", "style"),
+    Output("ecn-flow-source-remove-selected", "disabled"),
+    Input("ecn-flow-source-selected-store", "data"),
+    Input("ecn-extra-flow-sources-store", "data"),
+)
+def show_ecn_flow_source_remove_button(selected, data):
+    visible = _removable_crossed_source(selected, data)
+    return ({"display": "inline-flex"} if visible else {"display": "none"}), not visible
 
 
 @app.callback(
     Output("ecn-flow-source-settings", "children"),
-    Input("flow-target-pair", "value"),
+    Input("global-target-pair", "value"),
     Input("ecn-flow-source-selected-store", "data"),
     State("ecn-extra-flow-sources-store", "data"),
     State("ecn-A", "value"), State("ecn-k", "value"), State("ecn-direct-size-probs-store", "data"),
@@ -2249,7 +2719,7 @@ def render_ecn_flow_source_cards(target_pair, selected, data):
 def render_ecn_flow_source_settings(target_pair, selected, data, direct_A, direct_k, direct_size_probs):
     if not target_pair:
         return html.Div(
-            "Select the target / priced FX pair in a Tier flow-source dialog first.",
+            "Choose the target FX pair in Global to configure ECN flow sources.",
             className="muted-note flow-source-empty",
         )
     extras = data or []
@@ -2291,7 +2761,7 @@ def populate_ecn_trade_size_defaults(source_pair, selected):
 @app.callback(
     Output("ecn-flow-edit-cross-pair", "value"),
     Input("ecn-flow-edit-pair", "value"),
-    State("flow-target-pair", "value"),
+    State("global-target-pair", "value"),
     prevent_initial_call=True,
 )
 def derive_ecn_flow_source_cross_pair(source_pair, target_pair):
@@ -2334,7 +2804,7 @@ def render_ecn_100k_residual(p1m, p750k, p500k, p250k):
     Input("ecn-flow-edit-A", "value"), Input("ecn-flow-edit-k", "value"),
     Input("ecn-flow-edit-p1m", "value"), Input("ecn-flow-edit-p750k", "value"),
     Input("ecn-flow-edit-p500k", "value"), Input("ecn-flow-edit-p250k", "value"),
-    State("flow-target-pair", "value"), State("ecn-flow-source-selected-store", "data"),
+    State("global-target-pair", "value"), State("ecn-flow-source-selected-store", "data"),
     State("ecn-extra-flow-sources-store", "data"), State("ecn-A", "value"), State("ecn-k", "value"),
     State("ecn-direct-size-probs-store", "data"),
     prevent_initial_call=True,
@@ -2412,12 +2882,14 @@ def update_ecn_flow_source_editor(_add, _remove, pair, cross_pair, cross_mid, sp
     Output("config-store", "data"), Output("solution-store", "data"), Output("status", "children"), Output("status", "className"),
     Input("solve", "n_clicks"), *CONFIG_STATES,
     State("extra-flow-sources-store", "data"), State("ecn-extra-flow-sources-store", "data"),
-    State("flow-target-pair", "value"), prevent_initial_call=True,
+    State("global-target-pair", "value"), prevent_initial_call=True,
 )
 def solve_model(_clicks, *values):
     try:
         *field_values, extra_sources, ecn_extra_sources, target_pair = values
-        cfg = build_config(dict(zip(CONFIG_KEYS, field_values, strict=True)))
+        named_values = dict(zip(CONFIG_KEYS, field_values, strict=True))
+        named_values["target-pair"] = target_pair
+        cfg = build_config(named_values)
         for i, tier in enumerate(cfg.get("tiers", [])):
             extras = (extra_sources or {}).get(str(i), [])
             if extras:
@@ -2469,44 +2941,61 @@ def solve_model(_clicks, *values):
         if target_pair:
             cfg["targetPair"] = str(target_pair)
         solution = ENGINES.get(cfg).solve()
-        return cfg, solution, f"Solved · {solution['iterations']} Howard iterations", "status ready"
+        method = "Production C++ (q, σ)"
+        return cfg, solution, f"Solved · {method} · {solution['iterations']} iterations", "status ready"
     except Exception as exc:
         return no_update, no_update, f"Solve failed · {exc}", "status error"
 
 
 @app.callback(
-    Output("m-converged", "children"), Output("m-iterations", "children"), Output("m-rho", "children"), Output("m-residual", "children"),
-    Output("value-chart", "figure"), Output("residual-chart", "figure"), Output("value-change-chart", "figure"), Output("internalization-chart", "figure"),
-    Output("tier-select", "options"), Output("tier-select", "value"), Output("ladder-q", "options"), Output("ladder-q", "value"),
-    Input("solution-store", "data"), Input("config-store", "data"),
+    Output("m-converged", "children"), Output("m-iterations", "children"), Output("m-rho", "children"),
+    Output("tier-select", "options"), Output("tier-select", "value"),
+    Output("ladder-q", "options"), Output("ladder-q", "value"),
+    Input("solution-store", "data"),
 )
-def render_solution(solution, cfg):
-    if not solution or not cfg:
-        return "—", "—", "—", "—", go.Figure(), go.Figure(), go.Figure(), go.Figure(), [], None, [], None
-    fig = go.Figure(go.Scatter(x=solution["qGrid"], y=solution["value"], mode="lines+markers", name="h(q)"))
-    fig.update_layout(title="Continuation value h(q)", xaxis_title="Inventory q [EUR M]", yaxis_title="h(q)", template="trinity_dark")
-    residual_fig = convergence_figure(solution.get("bellmanResidual", []), "Frozen best-response residual", "max |R(q) - ρ|")
-    value_change_fig = convergence_figure(solution.get("valueChange", []), "Value-function change", "max |Δh|")
-    internal_fig = internalization_figure(cfg)
+def render_solution_summary(solution):
+    if not solution:
+        return "—", "—", "—", [], None, [], None
     opts = [{"label": t["name"], "value": i} for i, t in enumerate(solution["tiers"])]
     qopts = [{"label": f"{float(q):g}M", "value": float(q)} for q in solution["qGrid"]]
     q0 = min((float(q) for q in solution["qGrid"]), key=abs) if qopts else None
     return (
         "Yes" if solution["converged"] else "No", str(solution["iterations"]),
-        f"{solution['averageReward']:.6g}", f"{solution['residual']:.3g}", fig, residual_fig, value_change_fig, internal_fig,
-        opts, (0 if opts else None), qopts, q0,
+        f"{solution['averageReward']:.6g}", opts, (0 if opts else None), qopts, q0,
     )
 
 
 @app.callback(
+    Output("value-chart", "figure"),
+    Input("solution-store", "data"), Input("overview-value-regime", "value"),
+)
+def render_continuation_value(solution, regime_index):
+    if not solution:
+        return go.Figure()
+    current = select_policy_regime(solution, regime_index)
+    fig = go.Figure(go.Scatter(x=current["qGrid"], y=current["value"], mode="lines+markers", name="h(q)"))
+    fig.update_layout(
+        title=f"Continuation value h(q, σ={current.get('selectedSigmaPips', '')} pips/√min)",
+        xaxis_title="Inventory q [EUR M]", yaxis_title="h(q)", template="trinity_dark",
+    )
+    return fig
+
+
+@app.callback(
     Output("rfq-arrival-chart", "figure"), Output("flow-chart", "figure"), Output("hit-ratio-chart", "figure"), Output("implied-hit-chart", "figure"),
-    Output("markout-chart", "figure"), Output("expected-mtm-chart", "figure"), Output("quote-inventory-chart", "figure"),
-    Output("bid-surface-chart", "figure"), Output("ask-surface-chart", "figure"), Output("ladder-chart", "figure"),
+    Output("markout-chart", "figure"), Output("quote-inventory-chart", "figure"),
+    Output("ladder-chart", "figure"),
     Output("flow-parameter-table", "children"), Output("ladder-table", "children"),
     Input("solution-store", "data"), Input("config-store", "data"), Input("tier-select", "value"), Input("ladder-q", "value"),
+    *[Input(component_id, "value") for component_id in POLICY_REGIME_SELECTOR_IDS[1:4]],
+    *[Input(f"{prefix}-heatmap", "value") for prefix in RFQ_HEATMAP_PREFIXES],
+    *[Input(f"{prefix}-rfq-size", "value") for prefix in RFQ_HEATMAP_PREFIXES],
 )
-def render_tier_diagnostics(solution, cfg, tier_index, q_value):
-    empty = (go.Figure(),) * 10 + (html.Div("Solve the model first"), html.Div("Solve the model first"))
+def render_tier_diagnostics(solution, cfg, tier_index, q_value, implied_regime,
+                            quotes_regime, ladder_regime,
+                            implied_heatmap=None, quotes_heatmap=None,
+                            implied_size=None, quotes_size=None):
+    empty = (go.Figure(),) * 7 + (html.Div("Solve the model first"), html.Div("Solve the model first"))
     if not solution or not cfg or tier_index is None:
         return empty
     try:
@@ -2517,27 +3006,74 @@ def render_tier_diagnostics(solution, cfg, tier_index, q_value):
             exogenous_arrival_figure(tier),
             flow_curve_figure(tier, float(cfg["spreadPips"])),
             hit_ratio_figure(tier, float(cfg["spreadPips"])),
-            implied_hit_ratio_figure(solution, cfg, ti),
+            (rfq_regime_heatmap_figure(solution, cfg, ti, implied_size, metric="win_probability")
+             if _ecn_heatmap_enabled(implied_heatmap) else
+             implied_hit_ratio_figure(select_policy_regime(solution, implied_regime), cfg, ti)),
             markout_figure(tier, cfg),
-            expected_mtm_figure(solution, ti),
-            quote_inventory_figure(solution, cfg, ti),
-            quote_surface_figure(solution, cfg, ti, "bid"),
-            quote_surface_figure(solution, cfg, ti, "ask"),
-            ladder_figure(solution, cfg, ti, qv),
+            (rfq_regime_heatmap_figure(solution, cfg, ti, quotes_size)
+             if _ecn_heatmap_enabled(quotes_heatmap) else
+             quote_inventory_figure(select_policy_regime(solution, quotes_regime), cfg, ti)),
+            ladder_figure(select_policy_regime(solution, ladder_regime), cfg, ti, qv),
             flow_parameter_table(tier, cfg),
-            ladder_table(solution, cfg, ti, qv),
+            ladder_table(select_policy_regime(solution, ladder_regime), cfg, ti, qv),
         )
     except Exception as exc:
         err = html.Div(f"Tier diagnostic failed: {exc}", className="error-note")
-        return (go.Figure(),) * 10 + (err, err)
+        return (go.Figure(),) * 7 + (err, err)
+
+
+# Every RFQ heatmap has its own display toggle and knot-size dropdown.
+# The dropdowns share the selected Tier's available actual RFQ sizes.
+
+
+@app.callback(
+    *[Output(f"{prefix}-rfq-size", "options") for prefix in RFQ_HEATMAP_PREFIXES],
+    *[Output(f"{prefix}-rfq-size", "value") for prefix in RFQ_HEATMAP_PREFIXES],
+    Input("solution-store", "data"), Input("tier-select", "value"),
+    *[State(f"{prefix}-rfq-size", "value") for prefix in RFQ_HEATMAP_PREFIXES],
+)
+def update_tier_heatmap_sizes(solution, tier_index, *current_sizes):
+    count = len(RFQ_HEATMAP_PREFIXES)
+    if not solution or tier_index is None:
+        return (*([[]] * count), *([None] * count))
+    tiers = solution.get("tiers") or []
+    ti = int(tier_index)
+    if not (0 <= ti < len(tiers)):
+        return (*([[]] * count), *([None] * count))
+    sizes = [float(size) for size in tiers[ti].get("sizes", [])]
+    options = [{"label": f"{size:g}M", "value": size} for size in sizes]
+    selected = [
+        next((size for size in sizes if choice is not None and abs(size - float(choice)) < 1e-9),
+             sizes[0] if sizes else None)
+        for choice in current_sizes
+    ]
+    return (*([options] * count), *selected)
+
+
+@app.callback(
+    *[Output(f"{prefix}-regime-wrapper", "style") for prefix in RFQ_HEATMAP_PREFIXES],
+    *[Output(f"{prefix}-rfq-size-wrapper", "style") for prefix in RFQ_HEATMAP_PREFIXES],
+    *[Output(chart_id, "style") for chart_id in
+      ("implied-hit-chart", "quote-inventory-chart")],
+    *[Input(f"{prefix}-heatmap", "value") for prefix in RFQ_HEATMAP_PREFIXES],
+)
+def toggle_tier_regime_heatmaps(*toggles):
+    enabled = [_ecn_heatmap_enabled(value) for value in toggles]
+    regime_styles = [{"display": "none"} if active else {} for active in enabled]
+    size_styles = [{} if active else {"display": "none"} for active in enabled]
+    chart_styles = [
+        {"height": f"{610 if active else 420}px", "width": "100%"}
+        for active in enabled
+    ]
+    return (*regime_styles, *size_styles, *chart_styles)
 
 
 @app.callback(
     Output("dp-arrival-chart", "figure"), Output("dp-full-fill-chart", "figure"),
     Output("dp-policy-chart", "figure"), Output("dp-policy-table", "children"),
-    Input("solution-store", "data"), Input("config-store", "data"),
+    Input("solution-store", "data"), Input("config-store", "data"), Input("dark-policy-regime", "value"),
 )
-def render_dark_pool_diagnostics(solution, cfg):
+def render_dark_pool_diagnostics(solution, cfg, regime_index):
     if not solution or not cfg:
         return go.Figure(), go.Figure(), go.Figure(), html.Div("Solve the model first")
     if not cfg.get("darkPool", {}).get("enabled", False):
@@ -2545,209 +3081,69 @@ def render_dark_pool_diagnostics(solution, cfg):
         disabled.add_annotation(text="Dark pool disabled", showarrow=False)
         disabled.update_layout(template="trinity_dark")
         return disabled, disabled, disabled, html.Div("Dark pool disabled", className="muted-note")
+    selected = select_policy_regime(solution, regime_index)
     return (
         dark_pool_arrival_figure(cfg), dark_pool_full_fill_figure(cfg),
-        dark_pool_policy_figure(solution), dark_pool_table(solution),
+        dark_pool_policy_figure(selected), dark_pool_table(selected),
     )
 
 
-def expected_internalization_times(solution: dict[str, Any] | None, cfg: dict[str, Any] | None) -> dict[str, list[float]]:
-    """Expected first-passage time to q=0 under the solved fixed policy.
-
-    This builds the inventory CTMC from exactly the same policy-dependent event
-    intensities used by the native model, then solves -Q_T tau = 1 with q=0
-    absorbing. Off-grid fills use the same linear inventory-state interpolation
-    as the C++ generator.
-    """
-    if not solution or not cfg:
-        return {"qGrid": [], "minutes": []}
-    q_grid = np.asarray(solution.get("qGrid", []), dtype=float)
-    if q_grid.size == 0:
-        return {"qGrid": [], "minutes": []}
-
-    def state_index(x: float) -> int:
-        j = int(np.argmin(np.abs(q_grid - x)))
-        if abs(float(q_grid[j]) - float(x)) > 1e-8:
-            raise ValueError(f"Inventory grid does not contain required state {x:g}")
-        return j
-
-    zero = state_index(0.0)
-    n = len(q_grid)
-    Q = np.zeros((n, n), dtype=float)
-
-    enabled_tiers = {t["name"]: t for t in cfg.get("tiers", []) if t.get("enabled", False)}
-
-    def source_won_rate(tier_cfg: dict[str, Any], source: dict[str, Any],
-                        delta: float, size: float, size_index: int) -> float:
-        flow = source["flow"]
-        mapping = source.get("mapping", {}) or {}
-        mapping_type = str(mapping.get("type", "identity"))
-        size_scale = _source_size_scale(source)
-        delta_scale = 1.0
-        if mapping_type == "crossed":
-            cross_mid = float(mapping.get("crossMid", 0.0))
-            source_spread = float(mapping.get("sourceSpreadPips", 0.0))
-            if cross_mid <= 0.0 or source_spread <= 0.0:
-                raise ValueError("Crossed RFQ source requires positive cross mid and source spread")
-            delta_scale = float(cfg["spreadPips"]) / (cross_mid * source_spread)
-        elif mapping_type == "affine":
-            delta_scale = float(mapping.get("deltaScale", 1.0))
-        elif mapping_type != "identity":
-            raise ValueError(f"Unsupported RFQ flow-source mapping {mapping_type}")
-
-        source_delta = 0.5 + delta_scale * (delta - 0.5)
-        source_size = size * size_scale
-        center = float(flow["shift"]) - float(flow["volumeShift"]) * (source_size - 1.0)
-        y = float(flow["steepness"]) * (source_delta - center)
-        if y >= 0.0:
-            e = math.exp(-y) if y < 745.0 else 0.0
-            hit = 1.0 / (1.0 + e)
-        else:
-            e = math.exp(y) if y > -745.0 else 0.0
-            hit = e / (1.0 + e)
-
-        exogenous_rate = float(_source_rfq_rates_per_side(tier_cfg, source)[size_index])
-        return exogenous_rate * hit
-
-    def add_transition(i: int, q2: float, rate: float) -> None:
-        if rate <= 0.0:
-            return
-        q2 = float(np.clip(q2, q_grid[0], q_grid[-1]))
-        right = int(np.searchsorted(q_grid, q2, side="left"))
-        if right <= 0:
-            weights = [(0, 1.0)]
-        elif right >= n:
-            weights = [(n - 1, 1.0)]
-        elif abs(float(q_grid[right]) - q2) <= 1e-10:
-            weights = [(right, 1.0)]
-        else:
-            left = right - 1
-            width = float(q_grid[right] - q_grid[left])
-            wr = (q2 - float(q_grid[left])) / width
-            weights = [(left, 1.0 - wr), (right, wr)]
-        for j, weight in weights:
-            Q[i, j] += rate * weight
-        Q[i, i] -= rate
-
-    def ecn_fill_components(source: dict[str, Any], i: int, direction: float, posted: float) -> list[tuple[float, float]]:
-        # The native HJB now uses the exact five-point ECN size distribution.
-        # No continuous interval approximation / breakpoint integration is needed.
-        del i, direction
-        return _ecn_source_fill_distribution(source, posted)
-
-
-    # Customer tiers.
-    for tier_policy in solution.get("tiers", []):
-        tier_cfg = enabled_tiers.get(tier_policy.get("name"))
-        if not tier_cfg:
-            continue
-        sizes = [float(z) for z in tier_policy.get("sizes", [])]
-        sources = _tier_flow_sources(tier_cfg)
-        for i, q in enumerate(q_grid):
-            for side, direction in (("bid", 1.0), ("ask", -1.0)):
-                row = tier_policy[side][i]
-                for j, z in enumerate(sizes):
-                    q2 = float(q) + direction * z
-                    if q2 < q_grid[0] - 1e-8 or q2 > q_grid[-1] + 1e-8:
-                        continue
-                    delta = float(row[j])
-                    rate = sum(source_won_rate(tier_cfg, source, delta, z, j) for source in sources)
-                    add_transition(i, q2, rate)
-
-    # Dark-pool fills.
-    dark_policy = solution.get("darkPool")
-    dark_cfg = cfg.get("darkPool", {})
-    if dark_policy and dark_cfg.get("enabled", False):
-
-        def dark_fill_rates(side: str, posted: int) -> list[tuple[int, float]]:
-            intensity = float(dark_cfg["lambda"])
-            mu = float(dark_cfg["mu"])
-            p0 = float(dark_cfg["p0"])
-            positive_norm = 1.0 - math.exp(-mu)
-            if posted <= 0 or intensity <= 0.0 or positive_norm <= 1e-15:
-                return []
-            positive_mass = 1.0 - p0
-            out=[]
-            cumulative=0.0
-            for k in range(1, posted):
-                pk=math.exp(-mu+k*math.log(mu)-math.lgamma(k+1))/positive_norm
-                cumulative += pk
-                out.append((k, intensity*positive_mass*pk))
-            out.append((posted, intensity*positive_mass*max(0.0,1.0-cumulative)))
-            return out
-
-        for i, q in enumerate(q_grid):
-            for side, direction in (("bid", 1.0), ("ask", -1.0)):
-                active = bool(dark_policy[f"{side}Active"][i])
-                if not active:
-                    continue
-                posted = int(round(float(dark_policy[f"{side}Size"][i])))
-                if posted <= 0:
-                    continue
-                for fill, rate in dark_fill_rates(side, posted):
-                    q2 = float(q) + direction * float(fill)
-                    if q_grid[0] - 1e-8 <= q2 <= q_grid[-1] + 1e-8:
-                        add_transition(i, q2, rate)
-
-    # Passive ECN hedge.
-    ecn_policy = solution.get("passiveEcn")
-    ecn_cfg = cfg.get("passiveEcn", {})
-    if ecn_policy and ecn_cfg.get("enabled", False):
-        z = float(ecn_cfg["quoteSize"])
-        sources = _ecn_flow_sources(cfg)
-        for i, q in enumerate(q_grid):
-            for side, direction in (("bid", 1.0), ("ask", -1.0)):
-                if not bool(ecn_policy[f"{side}Active"][i]):
-                    continue
-                delta = float(ecn_policy[f"{side}Delta"][i])
-                for source in sources:
-                    hit_rate = float(_ecn_source_arrival_rate(source, delta))
-                    for fill, probability in ecn_fill_components(source, i, direction, z):
-                        add_transition(i, float(q) + direction * fill, hit_rate * probability)
-
-    transient = [i for i in range(n) if i != zero]
-    minus_q = -Q[np.ix_(transient, transient)]
-    rhs = np.ones(len(transient), dtype=float)
-    try:
-        tau_transient = np.linalg.solve(minus_q, rhs)
-    except np.linalg.LinAlgError as exc:
-        raise ValueError("Internalization time is not finite for the current policy") from exc
-
-    tau = np.zeros(n, dtype=float)
-    tau[transient] = np.maximum(0.0, tau_transient)
-    qmax = float(cfg.get("grid", {}).get("maxAbs", np.max(np.abs(q_grid))))
-    operational = np.abs(q_grid) <= qmax + 1e-8
-    return {
-        "qGrid": q_grid[operational].tolist(),
-        "minutes": tau[operational].tolist(),
-    }
-
-
 @app.callback(
-    Output("ecn-fill-chart", "figure"), Output("ecn-hit-ratio-chart", "figure"),
-    Output("ecn-implied-hit-chart", "figure"), Output("ecn-quote-inventory-chart", "figure"),
+    Output("ecn-fill-chart", "figure"), Output("ecn-implied-hit-chart", "figure"), Output("ecn-quote-inventory-chart", "figure"),
     Output("ecn-policy-chart", "figure"), Output("ecn-parameter-table", "children"),
     Output("ecn-policy-table", "children"),
     Input("solution-store", "data"), Input("config-store", "data"),
+    Input("ecn-implied-hit-regime", "value"), Input("ecn-quote-inventory-regime", "value"),
+    Input("ecn-policy-regime", "value"),
+    Input("ecn-implied-hit-heatmap", "value"),
+    Input("ecn-quote-inventory-heatmap", "value"),
+    Input("ecn-policy-heatmap", "value"),
 )
-def render_passive_ecn_diagnostics(solution, cfg):
+def render_passive_ecn_diagnostics(solution, cfg, implied_regime, quotes_regime, policy_regime,
+                                   implied_heatmap=None, quotes_heatmap=None, policy_heatmap=None):
     if not solution or not cfg:
-        return (go.Figure(),) * 5 + (html.Div("Solve the model first"), html.Div("Solve the model first"))
+        return (go.Figure(),) * 4 + (html.Div("Solve the model first"), html.Div("Solve the model first"))
     if not cfg.get("passiveEcn", {}).get("enabled", False):
         disabled = go.Figure()
         disabled.add_annotation(text="Passive ECN disabled", showarrow=False)
         disabled.update_layout(template="trinity_dark")
         note = html.Div("Passive ECN disabled", className="muted-note")
-        return disabled, disabled, disabled, disabled, disabled, note, note
+        return disabled, disabled, disabled, disabled, note, note
     return (
         passive_ecn_fill_figure(cfg),
-        passive_ecn_hit_ratio_figure(cfg),
-        passive_ecn_implied_hit_ratio_figure(solution, cfg),
-        passive_ecn_quote_inventory_figure(solution, cfg),
-        passive_ecn_policy_figure(solution),
+        (passive_ecn_regime_heatmap_figure(solution, cfg, "intensity")
+         if _ecn_heatmap_enabled(implied_heatmap) else
+         passive_ecn_implied_hit_ratio_figure(select_policy_regime(solution, implied_regime), cfg)),
+        (passive_ecn_regime_heatmap_figure(solution, cfg, "quotes")
+         if _ecn_heatmap_enabled(quotes_heatmap) else
+         passive_ecn_quote_inventory_figure(select_policy_regime(solution, quotes_regime), cfg)),
+        (passive_ecn_regime_heatmap_figure(solution, cfg, "delta")
+         if _ecn_heatmap_enabled(policy_heatmap) else
+         passive_ecn_policy_figure(select_policy_regime(solution, policy_regime))),
         passive_ecn_parameter_table(cfg),
-        passive_ecn_table(solution),
+        passive_ecn_table(select_policy_regime(solution, policy_regime)),
     )
+
+
+@app.callback(
+    Output("ecn-implied-hit-regime-wrapper", "style"),
+    Output("ecn-quote-inventory-regime-wrapper", "style"),
+    Output("ecn-policy-regime-wrapper", "style"),
+    Output("ecn-implied-hit-chart", "style"),
+    Output("ecn-quote-inventory-chart", "style"),
+    Output("ecn-policy-chart", "style"),
+    Output("ecn-policy-table-wrapper", "style"),
+    Input("ecn-implied-hit-heatmap", "value"),
+    Input("ecn-quote-inventory-heatmap", "value"),
+    Input("ecn-policy-heatmap", "value"),
+)
+def toggle_ecn_regime_heatmaps(implied, quotes, policy):
+    """Hide a selector only for its heatmap, preserving its choice for line view."""
+    enabled = [_ecn_heatmap_enabled(value) for value in (implied, quotes, policy)]
+    selectors = [{"display": "none"} if active else {} for active in enabled]
+    chart_styles = [{"height": "610px" if active else "420px", "width": "100%"}
+                    for active in enabled]
+    return (*selectors, *chart_styles, {"display": "none"} if enabled[2] else {})
 
 
 @app.callback(
@@ -2762,25 +3158,23 @@ def update_path_quote_sizes(solution):
     return opts, (sizes[0] if sizes else None)
 
 
-def _mc_analytics_cache_key(cfg: dict[str, Any], q0: float) -> str:
+def _mc_analytics_cache_key(cfg: dict[str, Any], q0: float, initial_regime: int = -1) -> str:
     return json.dumps(
-        {"cfg": cfg, "horizon": SESSION_HORIZON, "q0": float(q0)},
+        {"cfg": cfg, "horizon": SESSION_HORIZON, "q0": float(q0), "regime": int(initial_regime)},
         sort_keys=True, separators=(",", ":"), allow_nan=False,
     )
 
 
 def _compute_mc_analytics(engine, cfg: dict[str, Any], solution: dict[str, Any] | None,
-                          q0: float) -> dict[str, Any]:
+                          q0: float, initial_regime: int = -1) -> dict[str, Any]:
     """Return deterministic analytical benchmarks, reusing them across MC runs."""
-    key = _mc_analytics_cache_key(cfg, q0)
+    key = _mc_analytics_cache_key(cfg, q0, initial_regime)
     with _MC_ANALYTICS_CACHE_LOCK:
         cached = _MC_ANALYTICS_CACHE.get(key)
         if cached is not None:
             return deepcopy(cached)
 
-    stats = engine.statistics(SESSION_HORIZON, q0)
-    if solution:
-        stats["internalizationTimes"] = expected_internalization_times(solution, cfg)
+    stats = engine.statistics(SESSION_HORIZON, q0, initial_regime=initial_regime)
 
     with _MC_ANALYTICS_CACHE_LOCK:
         # Dict insertion order is sufficient for this tiny FIFO cache.  The
@@ -2793,7 +3187,7 @@ def _compute_mc_analytics(engine, cfg: dict[str, Any], solution: dict[str, Any] 
 
 
 def _run_mc_job(job_id: str, cfg: dict[str, Any], solution: dict[str, Any] | None,
-                paths: int, q0: float, seed: int) -> None:
+                paths: int, q0: float, seed: int, initial_regime: int) -> None:
     """Execute MC and deterministic analytics concurrently, publishing progress."""
     try:
         engine = ENGINES.get(cfg)
@@ -2829,7 +3223,7 @@ def _run_mc_job(job_id: str, cfg: dict[str, Any], solution: dict[str, Any] | Non
             max_workers=1, thread_name_prefix=f"mc-analytics-{job_id[:8]}"
         ) as analytics_pool:
             analytics_future = analytics_pool.submit(
-                _compute_mc_analytics, engine, cfg, solution, q0
+                _compute_mc_analytics, engine, cfg, solution, q0, initial_regime
             )
 
             mc = engine.simulate(
@@ -2837,6 +3231,7 @@ def _run_mc_job(job_id: str, cfg: dict[str, Any], solution: dict[str, Any] | Non
                 retained_paths=8, sample_points=381,
                 progress_callback=report_progress,
                 compact_result=True,
+                initial_regime=initial_regime,
             )
 
             with _MC_JOBS_LOCK:
@@ -2878,6 +3273,20 @@ def _run_mc_job(job_id: str, cfg: dict[str, Any], solution: dict[str, Any] | Non
 
 
 @app.callback(
+    Output("mc-initial-regime", "options"), Output("mc-initial-regime", "value"),
+    Input("solution-store", "data"),
+)
+def mc_volatility_regime_options(solution):
+    if not solution or not solution.get("regimes"):
+        return [], None
+    sigmas=solution.get("sigmaPips", [])
+    names=("Low", "High") if len(sigmas)==2 else ("Low", "Normal", "High")
+    options=[{"label": f"{name} · σ={float(sigma):g} pips/√min", "value": i}
+             for i,(name,sigma) in enumerate(zip(names,sigmas))]
+    return options, len(options)//2
+
+
+@app.callback(
     Output("mc-job-store", "data"),
     Output("mc-progress-modal", "style"),
     Output("mc-progress-poll", "disabled"),
@@ -2891,9 +3300,10 @@ def _run_mc_job(job_id: str, cfg: dict[str, Any], solution: dict[str, Any] | Non
     Input("run-mc", "n_clicks"),
     State("config-store", "data"), State("solution-store", "data"),
     State("mc-paths", "value"), State("mc-q0", "value"), State("mc-seed", "value"),
+    State("mc-initial-regime", "value"),
     prevent_initial_call=True,
 )
-def start_mc(_clicks, cfg, solution, paths, q0, seed):
+def start_mc(_clicks, cfg, solution, paths, q0, seed, initial_regime):
     if not cfg:
         return (
             no_update, {"display": "none"}, True, False, "0",
@@ -2930,7 +3340,8 @@ def start_mc(_clicks, cfg, solution, paths, q0, seed):
 
     worker = threading.Thread(
         target=_run_mc_job,
-        args=(job_id, cfg_copy, solution_copy, paths, q0, seed),
+        args=(job_id, cfg_copy, solution_copy, paths, q0, seed,
+              int(initial_regime) if initial_regime is not None else -1),
         name=f"mc-{job_id[:8]}",
         daemon=True,
     )
@@ -3159,7 +3570,10 @@ def render_path(mc, path_index, quote_size, fill_tier_metric, solution, cfg):
         inventories = np.asarray(path["inventories"], dtype=float)
         spots = np.asarray(path["spots"], dtype=float)
         q_grid = solution["qGrid"]
-        for tier in solution.get("tiers", []):
+        sample_regimes = np.asarray(path.get("regimes", [len(solution.get("regimes", []))//2] * len(inventories)), dtype=int)
+        if len(sample_regimes) != len(inventories):
+            sample_regimes = np.full(len(inventories), len(solution.get("regimes", []))//2, dtype=int)
+        for tier_idx, tier in enumerate(solution.get("tiers", [])):
             sizes = [float(z) for z in tier.get("sizes", [])]
             matches = [j for j,z in enumerate(sizes) if math.isclose(z, float(quote_size), rel_tol=0.0, abs_tol=1e-12)]
             if not matches:
@@ -3167,8 +3581,15 @@ def render_path(mc, path_index, quote_size, fill_tier_metric, solution, cfg):
             j = matches[0]
             bid_col = [row[j] for row in tier["bid"]]
             ask_col = [row[j] for row in tier["ask"]]
-            bid_delta = np.asarray([_interp_policy(q_grid, bid_col, q) for q in inventories])
-            ask_delta = np.asarray([_interp_policy(q_grid, ask_col, q) for q in inventories])
+            if solution.get("regimes"):
+                regime_tiers=[r["tiers"][tier_idx] for r in solution["regimes"]]
+                bid_delta = np.asarray([_interp_policy(q_grid, [row[j] for row in regime_tiers[int(regime)]["bid"]], q)
+                    for q, regime in zip(inventories, sample_regimes)])
+                ask_delta = np.asarray([_interp_policy(q_grid, [row[j] for row in regime_tiers[int(regime)]["ask"]], q)
+                    for q, regime in zip(inventories, sample_regimes)])
+            else:
+                bid_delta = np.asarray([_interp_policy(q_grid, bid_col, q) for q in inventories])
+                ask_delta = np.asarray([_interp_policy(q_grid, ask_col, q) for q in inventories])
             bid_px = spots - spread * (0.5 - bid_delta)
             ask_px = spots + spread * (0.5 - ask_delta)
             spot_fig.add_trace(go.Scatter(x=path_clock, y=bid_px, mode="lines", name=f"{tier['name']} bid {float(quote_size):g}M", opacity=.72, line=dict(color=BID_COLOR), line_shape="hv"))
@@ -3193,10 +3614,17 @@ def render_path(mc, path_index, quote_size, fill_tier_metric, solution, cfg):
                 return idx.astype(int)
 
             ecn_idx = ecn_state_indices(inventories)
-            ecn_bid_delta = bid_delta_grid[ecn_idx]
-            ecn_ask_delta = ask_delta_grid[ecn_idx]
-            ecn_bid_active = bid_active_grid[ecn_idx]
-            ecn_ask_active = ask_active_grid[ecn_idx]
+            if solution.get("regimes"):
+                ecn_policies=[r.get("passiveEcn") for r in solution["regimes"]]
+                ecn_bid_delta = np.asarray([float(ecn_policies[r]["bidDelta"][i]) for r,i in zip(sample_regimes, ecn_idx)])
+                ecn_ask_delta = np.asarray([float(ecn_policies[r]["askDelta"][i]) for r,i in zip(sample_regimes, ecn_idx)])
+                ecn_bid_active = np.asarray([bool(ecn_policies[r]["bidActive"][i]) for r,i in zip(sample_regimes, ecn_idx)])
+                ecn_ask_active = np.asarray([bool(ecn_policies[r]["askActive"][i]) for r,i in zip(sample_regimes, ecn_idx)])
+            else:
+                ecn_bid_delta = bid_delta_grid[ecn_idx]
+                ecn_ask_delta = ask_delta_grid[ecn_idx]
+                ecn_bid_active = bid_active_grid[ecn_idx]
+                ecn_ask_active = ask_active_grid[ecn_idx]
             ecn_bid_px = np.where(ecn_bid_active, spots - spread * (0.5 - ecn_bid_delta), np.nan)
             ecn_ask_px = np.where(ecn_ask_active, spots + spread * (0.5 - ecn_ask_delta), np.nan)
             ecn_size = float(ecn["quoteSize"])
@@ -3398,9 +3826,10 @@ def render_path(mc, path_index, quote_size, fill_tier_metric, solution, cfg):
 @app.callback(
     Output("frontier-store", "data"), Output("status", "children", allow_duplicate=True), Output("status", "className", allow_duplicate=True),
     Input("run-frontier", "n_clicks"), State("config-store", "data"), State("frontier-min", "value"), State("frontier-max", "value"),
-    State("frontier-points", "value"), State("frontier-log", "value"), State("mc-q0", "value"), prevent_initial_call=True,
+    State("frontier-points", "value"), State("frontier-log", "value"), State("mc-q0", "value"),
+    State("mc-initial-regime", "value"), prevent_initial_call=True,
 )
-def run_frontier(_clicks, cfg, lo, hi, points, log_values, q0):
+def run_frontier(_clicks, cfg, lo, hi, points, log_values, q0, initial_regime):
     if not cfg:
         return no_update, "Solve the model first", "status error"
     try:
@@ -3409,7 +3838,8 @@ def run_frontier(_clicks, cfg, lo, hi, points, log_values, q0):
             raise ValueError("Require 0 < φ min < φ max and at least 3 points")
         gammas = np.geomspace(lo, hi, n) if checked(log_values) else np.linspace(lo, hi, n)
         gammas = np.unique(np.append(gammas, float(cfg["gamma"]))).tolist()
-        frontier = ENGINES.get(cfg).frontier(gammas, SESSION_HORIZON, float(q0))
+        frontier = ENGINES.get(cfg).frontier(gammas, SESSION_HORIZON, float(q0),
+                                            initial_regime=int(initial_regime) if initial_regime is not None else -1)
         return frontier, "Efficient frontier complete", "status ready"
     except Exception as exc:
         return no_update, f"Frontier failed · {exc}", "status error"
@@ -3430,9 +3860,80 @@ def render_frontier(frontier, cfg):
     ratio = go.Figure(go.Scatter(x=[x["gamma"] for x in ordered], y=[x["ratio"] for x in ordered], mode="lines+markers", name="Mean / stdev"))
     ratio.update_layout(title="Risk-adjusted PnL vs φ", xaxis_title="φ (risk aversion)", yaxis_title="Expected PnL / stdev", template="trinity_dark")
 
-    header = html.Thead(html.Tr([html.Th(x) for x in ["φ", "Expected PnL", "Stdev", "Mean / stdev", "Howard iters"]]))
+    header = html.Thead(html.Tr([html.Th(x) for x in ["φ", "Expected PnL", "Stdev", "Mean / stdev", "Policy iterations"]]))
     rows = [html.Tr([html.Td(f"{x['gamma']:.5g}"), html.Td(format_ccy(x["mean"])), html.Td(format_ccy(x["std"])), html.Td(f"{x['ratio']:.4f}"), html.Td(str(x["iterations"]))]) for x in ordered]
     return fig, ratio, html.Table([header, html.Tbody(rows)], className="data-table")
+
+
+@app.callback(
+    Output("flow-markout-preview", "figure"),
+    Input("flow-edit-markout-enabled", "value"),
+    Input("flow-edit-markout-asymptote", "value"),
+    Input("flow-edit-markout-tau", "value"),
+    State("global-target-pair", "value"),
+    prevent_initial_call=True,
+)
+def preview_flow_markout(enabled, asymptote, tau, pair):
+    return flow_markout_figure(checked(enabled), asymptote if asymptote is not None else 0.,
+                               tau if tau is not None else 1., pair or "target")
+
+
+@app.callback(
+    *[Output(f"t{i}-{suffix}", "value") for i in range(len(DEFAULT["tiers"]))
+      for suffix in ("markout-enabled", "markout-asymptote", "markout-tau-seconds")],
+    Input("flow-edit-markout-enabled", "value"),
+    Input("flow-edit-markout-asymptote", "value"),
+    Input("flow-edit-markout-tau", "value"),
+    State("flow-source-tier-store", "data"),
+    *[State(f"t{i}-{suffix}", "value") for i in range(len(DEFAULT["tiers"]))
+      for suffix in ("markout-enabled", "markout-asymptote", "markout-tau-seconds")],
+    prevent_initial_call=True,
+)
+def sync_markout_from_flow_modal(enabled, asymptote, tau, tier_index, *existing):
+    if tier_index is None or any(v is None for v in (asymptote, tau)):
+        return (no_update,) * (3 * len(DEFAULT["tiers"]))
+    # Modal input values are not a new configuration when an editor is mounted.
+    if not ctx.triggered or ctx.triggered_id not in {
+        "flow-edit-markout-enabled", "flow-edit-markout-asymptote", "flow-edit-markout-tau"
+    }:
+        return (no_update,) * (3 * len(DEFAULT["tiers"]))
+    values = list(existing)
+    offset = 3 * int(tier_index)
+    values[offset:offset + 3] = [enabled, asymptote, tau]
+    return tuple(values)
+
+
+@app.callback(
+    *[Output(component_id, "options") for component_id in POLICY_REGIME_SELECTOR_IDS],
+    *[Output(component_id, "value") for component_id in POLICY_REGIME_SELECTOR_IDS],
+    Input("solution-store", "data"),
+)
+def regime_dropdown_options(solution):
+    count = len(POLICY_REGIME_SELECTOR_IDS)
+    if not solution or not solution.get("regimes"):
+        return (*([[]] * count), *([None] * count))
+    sigmas = [regime["sigmaPips"] for regime in solution["regimes"]]
+    names=("Low", "High") if len(sigmas)==2 else ("Low", "Normal", "High")
+    opts = [{"label": f"{name} · σ={float(sigma):g} pips/√min", "value": i}
+            for i, (name, sigma) in enumerate(zip(names, sigmas))]
+    normal = len(opts) // 2
+    return (*([opts] * count), *([normal] * count))
+
+
+def select_policy_regime(solution, index):
+    """Expose a selected stochastic-volatility policy in legacy plot schema."""
+    if not solution or not solution.get("regimes"):
+        return solution
+    regimes = solution["regimes"]
+    i = len(regimes) // 2 if index is None else int(index)
+    if not 0 <= i < len(regimes):
+        i = len(regimes) // 2
+    selected = dict(solution)
+    selected.update({key: regimes[i][key]
+                     for key in ("tiers", "passiveEcn", "darkPool", "expectedMtm")})
+    selected["value"] = solution["valueByRegime"][i]
+    selected["selectedSigmaPips"] = regimes[i]["sigmaPips"]
+    return selected
 
 
 if __name__ == "__main__":

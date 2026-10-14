@@ -19,6 +19,8 @@ namespace ladder_pricer {
 class ExpectedMtm {
 public:
     ExpectedMtm(const PricingProblem& problem, const DenseMatrix& generator);
+    // Build a regime-specific MTM view from the JOINT regime/inventory resolvents.
+    ExpectedMtm(const PricingProblem& problem, std::vector<std::vector<double>> weighted_inventories);
 
     double weighted_inventory(std::size_t tier, double inventory) const;
     double trade_mtm(std::size_t tier, double direction, double inventory_after) const;

@@ -8,7 +8,7 @@ from typing import Any, Callable, Iterable
 from . import _native
 
 
-_EXPECTED_PRICING_CONFIG_SCHEMA_VERSION = 3  # Policy-dependent expected MTM (per-tier curves)
+_EXPECTED_PRICING_CONFIG_SCHEMA_VERSION = 11  # single joint (q, sigma) Solver
 
 
 def _check_pricing_schema(native_module: Any) -> None:
@@ -17,7 +17,7 @@ def _check_pricing_schema(native_module: Any) -> None:
     if actual != _EXPECTED_PRICING_CONFIG_SCHEMA_VERSION:
         raise RuntimeError(
             "The compiled trinity._native extension does not support the "
-            "policy-dependent expected MTM model (native schema: " + str(actual) + "). "
+            "current pricing configuration (native schema: " + str(actual) + "). "
             "Rebuild it from this directory with "
             "`python3 -m pip install -e . --no-deps --force-reinstall` and "
             "restart the dashboard. Alternatively run `./run_dash.sh`, "
@@ -37,12 +37,9 @@ if getattr(_native, "ECN_PARAMETERIZATION_VERSION", None) != _EXPECTED_ECN_PARAM
 
 
 class Engine:
-    """Small Python façade around the C++ pricing engine.
+    """Python façade around the single joint inventory-volatility C++ Solver.
 
-    The solved native policy is immutable for statistics/simulation calls.
-    A small reader/writer gate therefore allows multiple read-only numerical
-    jobs (notably Monte Carlo + closed-form analytics) to run concurrently,
-    while ``solve`` remains exclusive.
+    Numerical Solve calls are serialized; analytics uses the same cached joint policy.
     """
 
     def __init__(self, config: dict[str, Any]):
@@ -96,10 +93,15 @@ class Engine:
             self._solved = True
             return result
 
-    def statistics(self, horizon_minutes: float = 570.0, initial_inventory: float = 0.0) -> dict[str, Any]:
+    def solve_volatility(self) -> dict[str, Any]:
+        """Solve the coupled (inventory, volatility) production HJB."""
+        with self._write_access():
+            return self._native.solve_volatility()
+
+    def statistics(self, horizon_minutes: float = 570.0, initial_inventory: float = 0.0, initial_regime: int = -1) -> dict[str, Any]:
         self._ensure_solved()
         with self._read_access():
-            return self._native.statistics(float(horizon_minutes), float(initial_inventory))
+            return self._native.statistics(float(horizon_minutes), float(initial_inventory), int(initial_regime))
 
     def simulate(
         self,
@@ -111,12 +113,13 @@ class Engine:
         sample_points: int = 191,
         progress_callback: Callable[[int, int], None] | None = None,
         compact_result: bool = False,
+        initial_regime: int = -1,
     ) -> dict[str, Any]:
         self._ensure_solved()
         with self._read_access():
             return self._native.simulate(
                 float(horizon_minutes), int(paths), float(initial_inventory), int(seed),
-                int(retained_paths), int(sample_points), progress_callback, bool(compact_result),
+                int(retained_paths), int(sample_points), progress_callback, bool(compact_result), int(initial_regime),
             )
 
     def frontier(
@@ -124,10 +127,11 @@ class Engine:
         gamma_values: Iterable[float],
         horizon_minutes: float = 570.0,
         initial_inventory: float = 0.0,
+        initial_regime: int = -1,
     ) -> list[dict[str, Any]]:
         self._ensure_solved()
         with self._read_access():
             return self._native.frontier(
-                [float(x) for x in gamma_values], float(horizon_minutes), float(initial_inventory)
+                [float(x) for x in gamma_values], float(horizon_minutes), float(initial_inventory), int(initial_regime)
             )
 

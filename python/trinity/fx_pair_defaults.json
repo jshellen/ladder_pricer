@@ -1,0 +1,145 @@
+{
+  "description": "Illustrative offline FX market and volatility-regime defaults, NOT live data or calibrated parameters. The top-level volatilityRegimes is shared unless a pair has a volatilityRegimes override. Edit this JSON to use calibrated parameters.",
+  "pairs": {
+    "EURSEK": {
+      "spot": 11.5,
+      "spreadPips": 20.0
+    },
+    "USDSEK": {
+      "spot": 9.7458,
+      "spreadPips": 18.0
+    },
+    "GBPSEK": {
+      "spot": 13.0682,
+      "spreadPips": 25.0
+    },
+    "NOKSEK": {
+      "spot": 0.9914,
+      "spreadPips": 12.0
+    },
+    "DKKSEK": {
+      "spot": 1.5416,
+      "spreadPips": 8.0
+    },
+    "EURNOK": {
+      "spot": 11.6,
+      "spreadPips": 20.0
+    },
+    "USDNOK": {
+      "spot": 9.8305,
+      "spreadPips": 22.0
+    },
+    "GBPNOK": {
+      "spot": 13.1818,
+      "spreadPips": 25.0
+    },
+    "SEKNOK": {
+      "spot": 1.0087,
+      "spreadPips": 12.0
+    },
+    "DKKNOK": {
+      "spot": 1.5549,
+      "spreadPips": 10.0
+    },
+    "EURDKK": {
+      "spot": 7.46,
+      "spreadPips": 2.0
+    },
+    "USDDKK": {
+      "spot": 6.322,
+      "spreadPips": 10.0
+    },
+    "GBPDKK": {
+      "spot": 8.4773,
+      "spreadPips": 14.0
+    },
+    "SEKDKK": {
+      "spot": 0.6487,
+      "spreadPips": 10.0
+    },
+    "NOKDKK": {
+      "spot": 0.6431,
+      "spreadPips": 10.0
+    },
+    "EURUSD": {
+      "spot": 1.18,
+      "spreadPips": 1.5
+    },
+    "GBPUSD": {
+      "spot": 1.3409,
+      "spreadPips": 2.0
+    },
+    "AUDUSD": {
+      "spot": 0.66,
+      "spreadPips": 2.0
+    },
+    "NZDUSD": {
+      "spot": 0.575,
+      "spreadPips": 2.5
+    },
+    "USDCAD": {
+      "spot": 1.36,
+      "spreadPips": 2.0
+    },
+    "USDCHF": {
+      "spot": 0.8,
+      "spreadPips": 2.0
+    },
+    "USDJPY": {
+      "spot": 147.0,
+      "spreadPips": 2.0
+    },
+    "EURGBP": {
+      "spot": 0.88,
+      "spreadPips": 2.0
+    },
+    "EURCHF": {
+      "spot": 0.944,
+      "spreadPips": 2.5
+    },
+    "EURJPY": {
+      "spot": 173.46,
+      "spreadPips": 3.0
+    },
+    "GBPCHF": {
+      "spot": 1.0727,
+      "spreadPips": 3.0
+    },
+    "GBPJPY": {
+      "spot": 197.11,
+      "spreadPips": 4.0
+    },
+    "AUDJPY": {
+      "spot": 97.02,
+      "spreadPips": 3.5
+    },
+    "NZDJPY": {
+      "spot": 84.53,
+      "spreadPips": 4.0
+    }
+  },
+  "volatilityRegimes": {
+    "sigmaPips": [
+      12.0,
+      20.0,
+      35.0
+    ],
+    "ratesPerMinute": [
+      [
+        0.0,
+        0.03333333333333333,
+        0.0
+      ],
+      [
+        0.04,
+        0.0,
+        0.02857142857142857
+      ],
+      [
+        0.0,
+        0.08333333333333333,
+        0.0
+      ]
+    ]
+  }
+}

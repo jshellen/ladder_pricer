@@ -44,6 +44,17 @@ ExpectedMtm::ExpectedMtm(const PricingProblem& problem, const DenseMatrix& gener
     }
 }
 
+ExpectedMtm::ExpectedMtm(const PricingProblem& problem,
+                         std::vector<std::vector<double>> weighted_inventories)
+    : problem_(problem), weighted_inventories_(std::move(weighted_inventories)) {
+    if (weighted_inventories_.size() != problem_.tiers().size())
+        throw std::invalid_argument("expected MTM tier count mismatch");
+    for (const auto& values : weighted_inventories_) {
+        if (!values.empty() && values.size() != problem_.grid().states().size())
+            throw std::invalid_argument("expected MTM regime inventory grid mismatch");
+    }
+}
+
 double ExpectedMtm::weighted_inventory(std::size_t tier, double inventory) const {
     if (weighted_inventories_.at(tier).empty()) return 0.0;
     return problem_.grid().interpolate(weighted_inventories_[tier], inventory);

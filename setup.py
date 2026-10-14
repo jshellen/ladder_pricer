@@ -7,8 +7,9 @@ sources = [
     "cpp/src/python_bindings.cpp",
     "cpp/src/matrix.cpp",
     "cpp/src/core.cpp",
-    "cpp/src/howard.cpp",
+    "cpp/src/policy_operator.cpp",
     "cpp/src/expected_mtm.cpp",
+    "cpp/src/solver.cpp",
     "cpp/src/analytics.cpp",
     "cpp/src/simulation.cpp",
 ]
@@ -26,12 +27,13 @@ ext_modules = [
 setup(
     name="trinity-ladder-pricer",
     version="0.1.0",
-    description="FX ladder pricer: C++ Howard engine with Dash UI",
+    description="FX ladder pricer: C++ inventory-volatility Solver with Dash UI",
     package_dir={"": "python"},
     packages=find_packages("python"),
+    package_data={"trinity": ["fx_pair_defaults.json"]},
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
     python_requires=">=3.10",
-    install_requires=["dash>=3.0", "plotly>=6.0", "numpy>=1.24"],
+    install_requires=["dash>=3.0", "plotly>=6.0", "numpy>=1.24", "scipy>=1.10", "pandas>=2.0"],
     extras_require={"test": ["pytest>=8"]},
 )

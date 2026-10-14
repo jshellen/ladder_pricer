@@ -1,616 +1,363 @@
-# FX Ladder Pricer — C++ Howard engine + Python + Dash
 
-This is the Python/Dash application architecture for the FX ladder pricer:
+## One global target FX pair (Tier, dark pool and ECN)
 
-```text
-C++ pricing engine
-      ↓ pybind11
-thin Python façade
-      ↓
-Dash + Plotly UI
-```
+Select **Target FX pair** under the sidebar **Global** expander. It is now the
+only editable direct / priced pair selector, used by **Tier 1, Tier 2, dark
+pool, ECN, HJB Solve, Monte Carlo and the frontier**. In both Configure flow
+sources popups the Direct pair is displayed with a **disabled** dropdown;
+Crossed pair and Crossing pair remain editable on a crossed source card.
 
-All pricing mathematics remain in C++. Python owns application state/caching and Dash owns presentation.
+Changing the Global pair reloads its spot and spread from
+`python/trinity/fx_pair_defaults.json`, and the stochastic-volatility matrix
+is read from the same JSON through the existing solver configuration. The
+previously configured RFQ and ECN **crossed sources are cleared** whenever the
+global target pair changes: their crossing mapping and spread/mid assumptions
+may be invalid for the new FX risk. Add them again after changing the target.
+Manual changes to Mid-rate and Spread remain possible for the selected pair.
 
-The repository also preserves the last trusted pure-Python numerical implementation under `python_reference/`. It is isolated from the production import path and is kept only as a readable reference/regression oracle and emergency fallback.
+### Flow source pair selectors (October 2026)
 
-## Numerical core
+The **Tier** and **ECN** Configure flow sources dialogs use the same pair-selection layout. The Direct/Crossed source cards precede the pair selectors. The direct source displays the **globally selected Target pair as disabled**, with a disabled **Crossing pair** field underneath. Selecting **+ Add FX pair** creates a crossed source and opens enabled **Crossed pair** and **Crossing pair** selectors. There is no editable direct pair in either modal; the sole editable direct pair is in Global. ECN-specific calibration and RFQ-specific expander contents remain separate.
 
-The C++17 library contains:
+# Ladder Pricing — Coupled inventory and stochastic volatility
 
-- stationary continuous-time HJB;
-- Howard policy iteration;
-- analytical logistic/Lambert-W quote improvement;
-- inventory ladder level/gap constraints;
-- hidden inventory solve buffer;
-- independent two-parameter adverse-selection markout curve for each RFQ tier (EUR / traded EUR 1M);
-- per-tier trading fees that enter quote optimization, analytical PnL and Monte Carlo PnL;
-- dark-pool controls;
-- optional Crisafi-style passive ECN hedge control: `NONE` or a Tier-style price-improvement delta `d`. Here `d=0` is the same-side touch and `d=0.5` is mid; the default action grid is 0.00 to 0.50 in 0.01 increments, and ECN fills are strictly risk-reducing;
-- event-driven fills with an independent continuous market-price process;
-- corrected impact-aware closed-form terminal PnL mean and standard deviation.
+This version removes the separate **outstanding markout state X** from the C++ pricing engine. The production HJB solved by the ordinary Dash **Solve** button uses the joint state **(inventory q, volatility regime σ)**. The old 3D markout-state solvers, research models, chart callbacks and their Eigen requirement have been removed.
 
-The Dash layer does **not** implement pricing mathematics.
+## Model
 
-### RFQ markout: simplified curve, independently calibrated by tier
+- Inventory q evolves through RFQ wins, ECN fills and optional dark-pool executions; existing quoted-price and size constraints are retained.
+- σ is an exogenous finite-state continuous-time Markov chain with off-diagonal rates `volatilityRegimes.ratesPerMinute` in 1/minute. Its own jump does not change inventory. Configured defaults are 12, 20 and 35 pips/√minute, with rates configured in `python/trinity/fx_pair_defaults.json`.
+- Inventory risk penalty in regime r is **γ σ_r² q²** (per-minute reward convention of the existing solver).
+- Customer RFQ markout is still supported, with each tier's existing exponential markout curve (asymptote and time constant). It does **not** create an additional state. For a fixed joint `(q,σ)` policy, the solver computes the expected post-event inventory using the resolvent
 
-Every RFQ tier now has its **own** two-parameter markout curve, configured
-inside `config["tiers"][i]["markout"]`:
+  `(I - τ G_π) u_τ = q`,
 
-`m_i(t_seconds) = m_inf_i * (1 - exp(-t_seconds / tau_seconds_i))`
+  where `G_π` is the **joint inventory/volatility generator** and τ is the tier's exponential markout time constant in minutes. The incremental RFQ markout reward is calculated from the **won-versus-lost difference** using `u_τ`. Markout is recomputed during policy evaluation and improvement.
+- RFQ and ECN quote decisions depend on `(q,σ)`; dark pool posted-size decisions also depend on `(q,σ)`. **No control depends on X**.
+- The engine solves the **stationary ergodic** Poisson/HJB equation and uses damped policy improvement with policy-dependent expected MTM. Convergence/stalling is not a guarantee of global optimality.
 
-`m_inf_i` is a **negative** adverse markout in EUR per traded EUR 1M, and
-`tau_seconds_i > 0` is the curve's time constant in seconds. Each tier's
-curve is **independent of RFQ size within that tier**. Its existing `useMarkout`
-toggle still enables/disables that tier's markout.
-
-All three tiers initially use the same empirical defaults (`-50.8 EUR/M`,
-`36.7 seconds`) for a common starting calibration. The optimized policies
-will differ from the previous fixed-internalization-time reward model. Configure different
-values in **Pricing tiers → Tier N → RFQ markout**. The tier diagnostics chart
-plots the selected tier's curve and overlays other enabled tiers as dashed lines.
-
-The native builder converts each tier's magnitude into quote/base price units:
-`-m_inf_i * spot / 1e6` (e.g. `50 EUR/M * 11.5 SEK/EUR / 1e6 =
-0.000575 SEK/EUR`). A customer buy generates an upward price impact and a
-customer sell a downward price impact, as before. Each native Tier owns its
-own `SaturatingMarkout`, and the existing HJB, Monte Carlo and analytical PnL
-code use each tier's curve. `tau_seconds_i` is converted into minutes for C++.
-
-### Policy-dependent expected MTM (active C++ solver)
-
-The HJB no longer uses `tau0/tau1/tau2` as a proxy for the post-trade
-markout holding period. Those input fields remain visible only as a clearly
-labelled **legacy/inactive** diagnostic; they have no effect on the HJB policy.
-
-For every fixed policy π the combined RFQ, ECN and dark-pool inventory
-transition generator is G^π. For each distinct tier markout time constant τ,
-we solve the resolvent:
-
-```text
-(I - τ G^π) u_τ = q_grid.
-```
-
-Here `u_τ(q) = E_q[Q_E]` for an independent exponentially distributed time
-E with mean τ. In particular, this incorporates *all future inventory fills*
-without estimating an exogenous average internalization time or adding a new
-HJB state variable.
-
-Using dealer inventory direction `d = +1` for a customer SELL (dealer BID)
-and `d = -1` for a customer BUY (dealer ASK), the gross expected MTM of a
-won RFQ after changing inventory q -> q+d*z is
-
-```text
-MTM_gross = -d * M_inf_tier * u_τ(q+d*z)
-```
-
-where M_inf_tier >= 0 is the native, positive adverse price-change magnitude.
-Gross MTM is in *millions of quote currency*. It can be positive when the
-client's directional markout helps an existing position that remains after
-a risk-reducing fill. The public solve output converts this to EUR/event
-using 1e6/spot.
-
-**Critical comparison: the price moves even when we LOSE an RFQ.** As with
-Monte Carlo, an unfilled customer RFQ affects the market price but does not
-change inventory. The native model assumes exogenous buys/sells arrive with
-identical intensities, so the two unfilled baseline price shifts cancel in
-expectation. Therefore the reward improvement from *winning instead of
-losing* a specific RFQ is
-
-```text
-MTM_increment = -d * M_inf_tier * [u_τ(q+d*z) - u_τ(q)].
-```
-
-That is the term entering the quote Hamiltonian and expected HJB reward;
-`MTM_gross` is **not** subtracted once again or multiplied by z. Otherwise
-the model would double-charge the same information shock or ignore lost
-RFQs. In `solution["expectedMtm"]`, both arrays appear for every active tier,
-RFQ pricing size, inventory state, and bid/ask direction: `grossBidEur`,
-`grossAskEur`, `incrementalBidEur`, and `incrementalAskEur`.
-The dashboard plots gross/incremental effects for the available pricing size
-nearest 5M, in the tier diagnostics.
-
-**Policy-dependent optimization:** For a FIXED policy the resolvent and
-average reward are exact for this model. Since the incremental MTM also
-depends on future policies, ordinary Howard improvement is NOT the exact
-global optimizer of the policy-dependent objective. The C++ solver now uses
-a damped, actual-reward-checked best-response iteration: after a proposed
-policy it recomputes the entire generator, MTM and average reward; if the
-proposal worsens actual average reward it also tests conservative RFQ ladder
-interpolations, retaining only improving candidates. `converged` means this
-local improvement search settled or policy changes reached tolerance, **not**
-that a global mathematical optimum has been proven. Do not treat the old
-Bellman residual as an optimality bound in this new policy-dependent model.
-
-Monte Carlo already simulated information shocks from all requests. The
-analytical PnL moments have been made consistent: both won AND lost RFQs
-now contribute impact shocks, and only won RFQs alter cash/inventory.
-The HJB still uses the configured pricing knots rather than the complete
-interpolated RFQ size support (a previously known approximation).
-
-The `python_reference/` directory is a legacy independent implementation and
-is not the active C++ solver; its historical markout representation and
-comparison helper have not been migrated to this interface.
-
-
-### Aggregating customer flow into one target FX risk
-
-A customer tier can now be driven by several FX-pair flow sources while the HJB keeps a
-single target-pair quote control and inventory state. Existing configs that provide only
-`tier["flow"]` are unchanged. To combine EURSEK and crossed USDSEK flow, use
-`tier["flowSources"]` instead:
-
-```python
-config["tiers"][0]["flowSources"] = [
-    {
-        "name": "EURSEK",
-        "flow": config["tiers"][0]["flow"],
-        "mapping": {"type": "identity"},
-    },
-    {
-        "name": "USDSEK",
-        "flow": {
-            # One-sided exogenous RFQ intensity curve
-            # lambda_RFQ(z) = A0 * z^(-theta-beta*z).
-            "A0": 0.02,
-            "theta": 0.20,
-            "beta": 0.08,
-            "steepness": 7.0,
-            "shift": 0.50,
-            "volumeShift": 0.02,
-        },
-        "mapping": {
-            "type": "crossed",
-            "crossMid": 1.18,          # EURUSD: USD per EUR
-            "sourceSpreadPips": 18.0, # USDSEK full customer spread
-        },
-    },
-]
-```
-
-For a crossed source the target EURSEK delta is converted to the source-pair delta by
-
-```text
-source_delta = 0.5 + delta_scale * (target_delta - 0.5)
-delta_scale  = target_spread / (cross_mid * source_spread)
-```
-
-and a target EUR-equivalent size `z` is evaluated on the source hit-ratio curve at
-`source_size = cross_mid * z`. The calibrated exogenous intensity curve itself defines the
-RFQ-size distribution. Customer RFQ sizes are independent of the pricing-control knots:
-by default Monte Carlo evaluates the curve on a 1M grid from the smallest to the largest
-pricing size, normalizes those values into probabilities, and samples the requested size
-from that full support.  Quotes for customer sizes between pricing knots are obtained by
-linear interpolation of the neighboring prices.
-
-Because several transformed logistic curves no longer have the single-curve Lambert-W
-optimum, aggregated tiers use a bounded one-dimensional numerical quote optimization.
-Single-source legacy tiers retain the original analytical fast path.
-
-## Python API
-
-The public Python boundary is intentionally small:
-
-```python
-from trinity import Engine, default_config
-
-config = default_config()
-engine = Engine(config)
-
-solution = engine.solve()
-stats = engine.statistics(570, initial_inventory=0)
-mc = engine.simulate(570, paths=1000, initial_inventory=0, seed=12345)
-frontier = engine.frontier([0.01, 0.03, 0.1, 0.3], 570, initial_inventory=0)
-```
-
-`Engine` is a thin façade over the native pybind11 extension. Heavy calls release the Python GIL. A small Dash-side cache keeps solved engines alive across UI callbacks.
-
-## Dash application
-
-The application has three main work areas:
-
-### Policy
-
-- convergence diagnostics;
-- continuation value `h(q)` and internalization-time overview;
-- Streamlit-style Tier Diagnostics presented as a single vertical stack of collapsible sections;
-- diagnostic order: tier parameters → exogenous RFQ arrival intensity → won-trade intensity → win probabilities → implied win probabilities → markouts → quotes vs inventory → bid surface → ask surface → volume premium / ladder table;
-- consistent side colors throughout diagnostics: **bid = blue**, **ask = red**;
-- each tier exposes a configurable **Fee [pips]**. The fill edge is `size * (spread * (0.5 - delta) - fee)`, so fees directly influence the solved quote ladder as well as realized/analytical PnL.
-
-### Passive ECN hedge
-
-The optional passive ECN module is deliberately reduced-form and does not use `xfills`.
-ECN quotes use the same normalized price-improvement convention as customer tiers: `d=0` is
-the same-side touch and `d=0.5` is mid. If `S` is the full spread, the quote depth from mid
-is `S * (0.5-d)`.
-
-The ECN can now aggregate several streamed FX pairs into one target-risk quote control. The
-direct target pair and every crossed ECN source have their own exponential price-reach curve
-`lambda_s(d_s)=A_s exp(-k_s(0.5-d_s))` and their own discrete parent-trade size distribution.
-The size pillars are fixed at `1.00M, 0.75M, 0.50M, 0.25M, 0.10M` in the source pair's base currency.
-The first four probabilities are configured explicitly and the 100k probability is the residual `1 - sum(other probabilities)`. The
-optimizer still chooses only one master target-pair delta `d`. For a crossed source,
-
-```text
-d_source   = 0.5 + alpha * (d_target - 0.5)
-alpha      = target_spread / (cross_mid * source_spread)
-sourceSize = cross_mid * targetSize
-```
-
-so EURSEK can be the master quote while USDSEK and GBPSEK inherit economically equivalent
-quotes derived through EURUSD and EURGBP. If `V_s` is the source-pair parent trade size and
-`c_s = sourceSizePerTarget`, the target-equivalent executed size is
-
-```text
-V_s in {1.00, 0.75, 0.50, 0.25, 0.10} source-base millions
-P(V_s = 0.10) = 1 - P(1.00) - P(0.75) - P(0.50) - P(0.25)
-fill_target = min(V_s, c_s * quoteSize_target) / c_s
-```
-
-so a posted 1M target quote can fill only at the mapped/capped discrete pillar sizes and can never fill above
-1M. The HJB sums each source's capped discrete size distribution when evaluating continuation
-value, spread capture and fees. Monte Carlo samples the same distribution directly. Source
-`s` still has parent trade intensity `A_s`, independent price reach `X_s ~ Exp(k_s)`, and the
-quote is hit when `X_s >= alpha_s * (0.5-d_target)`. Retained paths record the source parent
-trade size and realized target fill size for ECN arrivals.
-
-The optimizer evaluates `NONE` plus a 0.01 grid between configurable `minDelta` and `maxDelta`,
-defaulting to 0.00 and 0.50. One 0.01 step is one percentage point of spread. At every
-inventory state the Howard improvement compares `NONE` with every allowed delta. ECN quotes
-are hedge-only: positive inventory may only post an ask, negative inventory may only post a
-bid, flat inventory posts nothing, and the posted size itself must be risk reducing so no
-realized partial or full fill can cross through zero and create opposite-side risk. A realized
-passive ECN fill of size `v` at target delta `d` earns
-`v * (spread * (0.5-d) - maker fee)` before continuation-value effects.
-
-### Monte Carlo
-
-- MC mean and standard deviation;
-- exact closed-form mean and standard deviation;
-- PnL histogram;
-- inventory median + 95% interval;
-- retained path inventory and spot/fill plots;
-- retained spot paths evolve on an internal one-second market clock even between fills;
-- separate event/spot RNG streams keep fills and PnL invariant to UI sampling density;
-- a modal progress bar reports genuinely completed native paths during long runs;
-- fill composition is aggregated over every simulated path and shown as percentage
-  shares of all trades or all executed volume by tier/venue and side;
-- realized RFQ hit ratios pool wins and RFQ requests over every simulated path for
-  each RFQ size, rather than relying on the small retained-path sample;
-- fill tape.
-
-## Monte Carlo market clock
-
-RFQ and dark-pool fills remain asynchronous continuous-time events, but the spot
-process is not tied to those events. Retained paths shown in the UI advance spot
-on an internal one-second market clock using the configured Brownian volatility,
-exogenous drift and outstanding exponential markout impulses. Fill events can
-occur between those one-second ticks and are inserted at their exact event times.
-
-For performance, non-retained Monte Carlo paths propagate spot directly from one
-fill event to the next. Under the current Brownian + deterministic drift/markout
-dynamics this is mathematically equivalent in distribution to subdividing every
-interval into one-second steps, while avoiding a large runtime penalty.
-
-The event-arrival RNG and spot RNG are independent. The regular inventory/output
-sampling grid therefore affects only what is returned to the UI; changing
-`sample_points` cannot change the fill sequence, terminal inventory, terminal
-spot or path PnL for a fixed seed.
-
-## Efficient frontier
-
-- closed-form PnL standard deviation vs expected PnL;
-- risk parameter `φ` / `γ` vs `E[PnL] / Std[PnL]`;
-- underlying frontier table and Howard iteration counts.
-
-## Fix for `Solve failed · 'markout'` after upgrading
-
-This error occurs when an old compiled C++ extension (expecting a global
-`config["markout"]`) is loaded alongside newer Python code (which puts a markout
-curve inside each RFQ tier). **This is a stale extension, not HJB non-convergence.**
-
-Start the app using `./run_dash.sh`: it now detects this mismatch and rebuilds
-an outdated native extension automatically (using pip's isolated build so
-pybind11 need not be installed separately). If you prefer `python3 app.py`, run
-this once from the extracted project directory, using the same Python
-interpreter/virtual environment as the dashboard:
-
-```bash
-python3 -m pip install -e . --no-deps --force-reinstall
-python3 app.py
-```
-
-The native engine now also checks `PRICING_CONFIG_SCHEMA_VERSION` at import, so
-an outdated extension reports explicit rebuild instructions instead of failing
-inside the solve callback with a misleading `markout` key error.
-
-## Install
-
-A normal Python environment with a C++17 compiler is enough. No Emscripten, Node, React, Boost, Eigen or SciPy are required.
-
-On macOS, install Xcode command-line tools if needed:
-
-```bash
-xcode-select --install
-```
-
-Then from the project directory:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e .
-```
-
-`pip install -e .` installs Dash/Plotly/NumPy, installs pybind11 as a build dependency, and compiles the native C++ extension for your machine.
+For the default 41 operational inventory nodes and three volatility regimes, the output contains **123 operational (q,σ) combinations** (plus internal inventory buffer states used numerically). The **Policy** tab now has **individual regime selectors inside each regime-dependent diagnostics expander** in Overview, Tier diagnostics, Dark pool and Passive ECN. Each visualization uses its own chosen volatility cross-section independently of other expanders. The ordinary Solve button reads the regime parameters from `fx_pair_defaults.json`, displayed read-only in **Tier → Configure flow sources → direct target pair → Stochastic volatility**.
 
 ## Run
 
 ```bash
-source .venv/bin/activate
+python3 -m pip install -e .
 ./run_dash.sh
 ```
 
-or:
+`pybind11` is installed by the Python build workflow; no Eigen headers are needed. To run the native regression suite:
 
 ```bash
-python app.py
-```
-
-Then open:
-
-```text
-http://127.0.0.1:8050
-```
-
-## Native C++ regression tests
-
-The numerical core can also be tested without Python:
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTRINITY_BUILD_TESTS=ON
 cmake --build build -j
-./build/test_howard
-./build/test_analytics
-./build/test_simulation
+ctest --test-dir build --output-on-failure
 ```
 
-Expected reference outputs for the Tier-3 EURSEK stress calibration are approximately:
+## Internalization-time cleanup
 
-```text
-rho        = 5.01762e-05
-mean PnL   = 4603.94 EUR
-PnL stdev  = 12451.4 EUR
-```
+The previous inactive legacy proxy `tau(q) = tau0 + tau1*abs(q) + tau2*q*q`
+was removed completely from the native PricingProblem API, Python defaults/configuration,
+Dash controls/diagnostics and tests. It was not part of the HJB reward or transition
+operator, so removing it does not alter policies or the coupled volatility model.
 
-## Project layout
+The separate **per-tier RFQ markout time constant** (`markout.tauSeconds`) is
+still a model input. The dashboard now computes the **policy-implied expected time to hit zero inventory** using
+the same joint (inventory, volatility) transition generator, with zero inventory absorbing.
+No legacy time proxy is used.
 
-```text
-cpp/
-  include/ladder_pricer/     # clean C++ domain/numerics API
-  src/                       # implementation + pybind11 adapter
-  tests/                     # native regression tests
-python/trinity/
-  engine.py                  # tiny Python façade
-  service.py                 # server-side engine cache
-  defaults.py                # UI defaults
-assets/
-  style.css                  # Dash application styling
-app.py                       # Dash layout and callbacks
-setup.py                     # native extension build
-pyproject.toml               # build dependencies
-```
+## Single production solver
 
-## Pure-Python reference solver
+`Solver` (`cpp/include/ladder_pricer/solver.hpp`, `cpp/src/solver.cpp`) is the **only** HJB optimizer.
+It requires `volatilityRegimes` and optimizes joint `(inventory, volatility regime)` policies.
+The old `HowardSolver` and its q-only solve path were deleted. Its reusable fixed-policy
+RFQ/ECN/dark-pool operator was moved without changing the equations into
+`policy_operator.hpp/.cpp`. The results of accepted candidate evaluation are now reused,
+so one redundant joint policy evaluation per accepted iteration is eliminated.
 
-The production backend remains C++, but the previous numerical Python implementation is retained deliberately:
+The previous single-volatility analytics and Monte Carlo were generalized to use the
+**same joint (q, sigma) pricing policy** as the one production `Solver`. The C++
+analytics and simulation implementations are now linked into the native extension.
+No old HJB/Howard solver or q-only fallback is used. Native schema version is **10**;
+rebuild the Python extension when upgrading this project.
 
-```text
-python_reference/
-├── ladder_pricer/__init__.py   # complete pure-Python Howard engine
-├── tests/                      # original numerical regression tests
-├── compare_with_cpp.py         # side-by-side C++ vs Python check
-└── README.md
-```
+The markout **curve** is deliberately retained. Removing the **markout state** must not be interpreted as removing markout economics from RFQ price optimization. Other features, including crossed RFQ/ECN flow sources, size distributions, fees and operational inventory constraints, are carried over from the original PricingProblem.
 
-It is outside the normal `python/` package tree, so installing/running the application does not import it.
+## Discrete customer RFQ sizes (pricing knots)
 
-To run its tests explicitly:
+For each tier, `sizes` is the **only** RFQ size support and the set of optimized
+pricing rungs. The former `rfqSizeStep` config and dashboard field are gone;
+quotes are not interpolated in the RFQ size dimension. We still interpolate
+**inventory** when evaluating a policy between inventory grid points.
 
-```bash
-PYTHONPATH=python_reference python -m pytest -q python_reference/tests
-```
+Each RFQ flow source maps a target size `z` to its own base-currency size
+`z_s` and provides one-sided exogenous arrivals
+`lambda_s(z) = A0_s * z_s ** (-theta_s-beta_s*z_s)`. The current Monte Carlo samples
+only `sizes` with probabilities `lambda_s(z) / sum(lambda_s(z))` and a
+pooled two-sided source rate `2 * sum(lambda_s(z))`. The active fixed-policy
+generator and HJB policy improvement both enumerate those same rungs. **Adding or removing a knot changes total modeled RFQ flow**
+by design; it is not a density quadrature. ECN trade size distribution and dark
+pool sizes are separate mechanisms and remain unchanged.
 
-After the main C++ extension is installed, compare the two implementations with:
+## Read-only volatility regimes from FX pair JSON
 
-```bash
-python python_reference/compare_with_cpp.py
-```
+The **only volatility-regime source** is `python/trinity/fx_pair_defaults.json`.
+The top-level `volatilityRegimes` contains a 2×2 or 3×3 model shared by all
+FX pairs. A pair may override this by adding its own `"volatilityRegimes"`
+object inside `"pairs": {"GBPSEK": { ... }}`. All entries must supply
+`"sigmaPips"` (increasing levels) and `"ratesPerMinute"` (nonnegative,
+zero diagonal, positive exit rate). Changing the JSON requires restarting
+Dash to reload the offline defaults. All shipped pair values inherit the
+existing three-regime 12/20/35 example until calibrated per pair.
 
-The reference implementation should not be used by the Dash application; C++ remains the canonical production numerical backend.
+The modal displays the selected pair's volatility levels and the **full
+continuous-time generator Q** in numerical read-only tables. Q's diagonal
+is −sum of the off-diagonal jump intensities. No Dash inputs, mutable stores,
+or callbacks can override the volatility model. Solve gets the pair directly
+from the target-pair selector; Monte Carlo and efficient frontier use this
+solved configuration. The Monte Carlo starting regime selector remains an
+initial-condition choice, not a different model.
+
+Every diagnostic expander **inside Configure flow sources** starts closed
+(exogenous RFQ flow, volatility and RFQ markout). This does not change the
+open/closed defaults of the main Policy/Monte Carlo/frontier tabs.
+
+## Dashboard flow-source and policy interface
+
+The **Configure flow sources** modal shows **Market Data** and **Pricing Rungs**
+inside the **same bordered target-pair flow card** as **RFQ flow intensities**,
+**Volatility**, and **Markouts**, in that order. All five expanders start closed.
+The header for the selected FX pair remains above them. Both target-only
+sections are hidden when editing a crossed flow source.
+
+The spot/spread inputs and both Tier pricing-knot fields remain mounted at a
+stable position in the modal; changes to the selected source or Tier do not
+remount or reset them. Each Tier shows only **its own** pricing-knot field,
+and both Tier size lists remain separate inputs to Solve. The redundant
+explanatory sentence above the knot inputs was removed.
+
+- The default pricing setup has **Tier 1 and Tier 2 only**; Tier 3 and its configuration controls are removed from the dashboard and default Python config. The C++ pricing engine remains generic over the number of supplied pricing tiers.
+- In **Configure flow sources**, each pair's exogenous RFQ flow inputs are grouped in an expander. Existing direct and crossed source size, intensity and win-probability mapping semantics are unchanged.
+- The **direct target pair** flow-source view displays the read-only volatility levels and generator matrix immediately after the RFQ flow expander, loaded from the target FX pair's JSON defaults. No matrix inputs remain in the dashboard. The process is shared by all tiers and crossed sources of that target risk.
+- The **RFQ markout** section in the same modal provides an enabled switch, an asymptote and a time constant with an immediate time-curve preview. The solver still supports **one markout curve per Tier shared across all its sources**; the crossed source card displays/edits that Tier's common curve. No source-specific markout economics are invented by the dashboard.
+- The **Policy** tab has **8 local volatility regime dropdowns**, placed inside each expander whose displayed result depends on the solved `(q, σ)` policy: continuation value; Tier implied hit ratios, quotes and volume premium; dark-pool policy; ECN implied fill intensity, quotes and optimal delta. A dropdown selects only its expander’s plotted/table policy slice; selectors are independent and default to Normal after each Solve. Exogenous arrival curves, fitted flow parameters, calibration win probabilities, direct markout curves and dark-pool size models have no redundant regime dropdown because they do not depend on the selected volatility regime.
+- The standalone **Stochastic volatility** tab is removed. Stochastic volatility itself is **retained in the C++ HJB**.
+- **Monte Carlo, closed-form PnL analytics and efficient frontier work for both two and three volatility regimes.** The Monte Carlo tab lets you choose the initial volatility regime; the simulated regime follows its own continuous-time Markov chain and determines the instantaneous spot volatility and RFQ/ECN/dark-pool policies. Retained time series display the regime-specific bid/ask quotes.
+- The expected inventory-to-zero diagnostic uses the joint (q,σ) fixed-policy generator, rather than an empirical internalization-time curve.
+
+### UI verification
+
+The Python and native tests validate the configuration and solver. Browser-level Dash testing requires Dash dependencies (`pip install -e .`) in your environment. This build environment did not have Dash available, so the UI was verified through a static/mocked component and callback-construction check rather than a running browser.
+
+## Policy diagnostic cleanup
+
+Removed the misleading **Frozen best-response residual** metric card and its empty convergence-history graph, plus the empty **Value-function change** graph. The compact header displays **Converged**, **Best-response iterations** and **Average reward**. Numerical evaluation residuals and the fixed-policy solver checks remain available internally in C++ and regression tests. This dashboard-only cleanup does not change the HJB equations, risk penalty, stochastic-volatility generator, or pricing decisions.
+
+The layout/callback tests verify that each regime-dependent expander owns a distinct selector and that Tier, dark-pool and ECN diagnostics route each selector to its matching figure/table. Browser-level Dash verification was not available in the development environment.
+
+## Dashboard control-text colours
+
+- The visible **Enabled** controls for Tier 1, Tier 2, Dark pool and ECN use
+  `channel-enable-checkbox` with an explicit white `html.Span` option label and white inline label styling, so Dash checklist defaults cannot leave the text dark.
+- The **Volatility regime** dropdown in every policy expander, and the
+  **Tier** selectors in Policy/Monte Carlo, use `policy-selector-dropdown`.
+  Their selected text, placeholder, and menu options are dark on a white
+  surface in both legacy React-Select and Dash 4 dropdowns. In Dash 4 the
+  `policy-selector-dropdown` class is applied to the dropdown button itself;
+  the `policy-selector-field` wrapper scopes the fix to its button, label and
+  popup, without changing unrelated dropdowns. Before Solve a legible
+  placeholder explains why no regime value is available.
+- These are CSS/layout-only changes. HJB, native C++, mathematical parameters,
+  callbacks and solution values are unchanged.
+
+## Joint-regime analytics (2 or 3 regimes)
+
+`Engine.statistics(horizon_minutes, initial_inventory, initial_regime)` calculates
+finite-horizon **mean and standard deviation of mark-to-market PnL** from the
+regime-aware Markov generator, including RFQ markout and its time decay, spot
+Brownian volatility per regime, RFQ win/loss events, ECN passive fills, dark-pool
+fills, and exogenous regime switches. It uses augmented moment equations, not a
+second HJB optimizer. `initial_regime=-1` selects the middle configured regime.
+
+`Engine.simulate(...)` uses the same solved policy, with regime switches as
+competing Poisson events. `samplePaths[*].regimes` records the regime at every
+retained timestamp. `finalRegime` contains one ending regime per Monte Carlo path.
+The dashboard shows regime-specific quotes along each retained path. The existing
+progress dialog and aggregate RFQ/ECN/fill diagnostics are retained.
+
+`Engine.frontier(gamma_values, ...)` re-runs the **single** joint C++ Solver for
+each risk parameter, then evaluates the corresponding regime-aware PnL moments.
+It does not use the old one-volatility `HowardSolver`.
+
+For any regime-aware analytic PnL statistic, base-currency (EUR) PnL uses the
+**reference spot** to convert from quote currency; Monte Carlo converts each path
+at its realized terminal spot. The analytic moment calculation also uses the
+solver's discretized inventory generator. Partial ECN fills create fractional
+inventories in Monte Carlo, so comparisons may exhibit grid approximation errors.
+These conventions should be considered when comparing EUR statistics from very
+long or volatile sessions.
+
+### Verification
+
+- Native tests and full Python regression suite include two- and three-regime
+  analytics, Monte Carlo regime switches, policy-dependent expected hitting
+  times, and efficient frontier consistency.
+- Dedicated regression tests compare the analytic PnL moments against many-path
+  event-driven Monte Carlo, including Tier markout, ECN and dark-pool channels.
+- The default 570-minute, three-regime production configuration was exercised
+  for Solve, PnL moments, 500 Monte Carlo paths, and a three-point frontier.
+- Dash was not installed in the offline test environment; static/mock component
+  and callback construction were checked, but live browser behaviour was not
+  verified.
+
+## ECN regime heatmap view (dashboard)
+
+Under Policy → Passive ECN, the regime-dependent **Fill intensity vs inventory**,
+**Quotes vs inventory**, and **Optimal quote delta** expanders each have their own
+**Heatmap · all volatility regimes** toggle. The default is the existing line
+plot and its local volatility-regime selector. When enabled, the selector is
+hidden and the graph shows two aligned panels (bid/ask): horizontal axis is
+inventory in EUR M, and vertical axis lists all configured volatility regimes.
+
+The **Optimal quote delta** line chart always uses a fixed vertical range of 0 to 0.5,
+regardless of the displayed volatility regime or active delta values.
+
+Inactive ECN quotes are masked (slate background), not shown as zero values.
+The bid/ask panels share a color scale: Viridis for deltas/intensities and a
+zero-centered red/blue scale for quotes relative to mid. The optimal-delta
+single-regime table is hidden in heatmap mode, returning when the toggle is
+turned off. This is a dashboard-only change; HJB, Monte Carlo and calibration
+are unchanged.
+
+## RFQ pricing-knot policy heatmaps
+
+The **Policy → Tier diagnostics** panel now has independent **Heatmap** toggles
+for *Implied hit ratios* and *Quotes vs inventory*.
+A toggle switches only its own chart between the original single-regime
+line view and a matrix view over **all configured volatility regimes** and
+**inventory q**. In heatmap mode, the local volatility-regime selector is hidden
+and replaced by an **RFQ size [EUR M]** dropdown containing only the selected
+Tier's actual pricing knots; no RFQ-size interpolation occurs. Switching off
+heatmap restores the original view and the previous single-regime selection.
+
+Bid and ask appear in separate heatmap panels, sharing a colour scale.
+Quote heatmaps show the price relative to mid in pips with a diverging red/blue
+colour map; implied win probabilities use Viridis. The redundant Bid/Ask quote
+surface sections have been removed from Tier diagnostics. Every plot reads existing
+`solution.regimes[*].tiers[*]` data and does **not** change the C++ HJB solver,
+pricing knots, policy or analytics.
 
 
-## Visualization parity with the Streamlit research app
+## UI fix: ladder inventory dropdown text (2026-10-14)
 
-The Dash application now carries the full diagnostic plot set from the previous Streamlit version:
+The `Inventory level for ladder` selector now uses the same white-background, dark-text dropdown styles as the policy regime and Tier selectors. The selected value and option menu use `#111821` for contrast. No changes to the HJB solver, pricing mathematics or analytics.
 
-- continuation value `h(q)`
-- Howard Bellman-residual and value-change convergence histories
-- internalization time vs inventory
-- tier flow curves and logistic hit-ratio curves
-- implied hit ratios under the solved policy
-- per-tier saturating markout curves (same curve for all RFQ sizes within each tier)
-- quotes vs inventory across all rungs
-- bid and ask 3D quote surfaces
-- volume-premium ladder at a selected inventory
-- flow parameters, selected tier markout at 60 seconds and ladder tables
-- dark-pool fill-size density, full-fill probability and solved posted-size policy
-- Monte Carlo PnL distribution and inventory confidence band
-- exact event-time retained inventory path
-- spot + tier quotes + executed fills for a selected ticket size
-- fill counts by tier and side, plus the fill tape
-- efficient frontier and risk-adjusted PnL vs phi
+## Tier diagnostics cleanup (2026-10-14)
 
-C++ remains the production numerical backend. The diagnostic plots are computed in Python from the solved C++ policy and the same model configuration; no pricing mathematics has been duplicated into Dash callbacks.
+Removed the **Expected whole-inventory MTM · 5M RFQ** expander from the Policy → Tier diagnostics dashboard, including its chart, regime selection, plotting helper and callback connections. The HJB's expected markout / MTM calculations and their native solver outputs are unchanged. The separate RFQ **Markouts** visualization remains available.
 
-## Dash configuration mapping
+## ECN intensity dashboard (October 2026)
 
-Dash control values are converted to the numerical model by component ID in
-`python/trinity/ui_config.py`. The model configuration no longer depends on the
-positional ordering of callback states, so adding or reordering UI controls does
-not silently shift tier parameters. The regression tests in
-`tests/test_ui_config.py` cover independent tier markout parameters, tier markout switches and tier-fee mapping.
+The **Passive ECN** policy tab shows **Trade intensity curves** with target-pair
+price improvement on the horizontal axis and one-sided trades/minute on the
+vertical axis. The aggregated grid markers and total curve are both called
+**Total** (a single legend entry is shown). The former **Relative intensity**
+expander and its callback have been removed.
 
-### Dark-pool diagnostics layout
+**Targeted trade intensity** shows bid and ask policy-implied trade rates against
+**Inventory EURm**. Its vertical axis is fixed from zero to the **maximum
+aggregated ECN flow rate over the configured delta range**, calculated from
+all ECN flow sources after their mappings to the target pair. The intensity
+heatmap uses that same maximum for its colour scale. This is a per-side rate,
+not the sum of bid-side and ask-side events. These changes affect only Dash
+visualization, not the HJB solver, policy, or Monte Carlo.
 
-The Policy → Dark pool tab mirrors the Streamlit-style diagnostic layout: plots are stacked vertically in independent collapsible sections for arrival-size density, full-fill probability, and the solved dark-pool policy (with its table).
+### Target-pair spot and spread in the flow-source editor
 
+The `EURSEK spot` (renamed for the currently selected target FX pair) and
+`Spread [pips]` inputs now live under **Configure flow sources → Target pair
+market data**, directly below the target FX pair selector. They no longer
+appear in the sidebar. Both retain their existing
+`spot` and `spread` input IDs, and are consumed by the same Solve/analytics
+config builder as before. The inputs stay mounted while the modal is closed
+and while users switch between direct and crossed flow sources.
 
-### UI diagnostics
+### Removed exogenous spot drift
 
-- **Passive ECN diagnostics** show every direct/crossed exponential-flow source, its FX mapping, source-specific and total fill curves, optimal trade intensity vs inventory, quotes vs inventory, and the discrete master-delta policy. The ECN action grid is configurable from `minDelta` to `maxDelta` in fixed 0.01 increments (one percentage point of spread), plus `NONE`.
-- **Inventory grid** is fixed to uniform 1M spacing; only the maximum absolute inventory is configurable.
+The model assumes **zero exogenous spot drift**. The `spotDrift` parameter and
+its dashboard input were removed from the HJB reward, native `PricingProblem`,
+Monte Carlo spot process, PnL moment equations, and Python configuration.
+Transient trade markout is unchanged. The volatility-regime Markov generator
+(and any volatility-process mean reversion used in offline research) is unrelated
+to spot drift and remains available. The sidebar `Global` expander now contains
+`Max |q| [M]` and `Gamma / φ`; the old `Risk & drift` expander is gone.
+Compiled native schema version 11 is required.
 
+### Regression check for zero-drift equivalence
 
-- Inventory grid is fixed to a uniform 1M spacing from `-maxAbs` to `+maxAbs`; the nonuniform/piecewise grid has been removed from the production and reference comparison paths.
-
-
-### Passive ECN exponential flow
-
-Each passive ECN source has its own parent trade intensity `A_s` and reach distribution `X_s ~ Exp(k_s)`. Direct sources use the master delta unchanged. Crossed sources use the same affine FX mapping as Tier flow sources, so their target-delta fill contribution is `A_s exp(-k_s alpha_s (0.5-d))`. The total ECN fill intensity is the sum across sources. The default direct EURSEK source remains A=4.0 trades/min per side, k=8.4, with a 0.00-to-0.50 master-delta grid in 0.01 increments.
-
-
-## Dark pool model
-
-The dark pool uses an exogenous incoming-order process on each side. Incoming sell orders
-arrive at `lambda` and can hit our posted bid; incoming buy orders arrive at
-`lambda` and can hit our posted ask. At each arrival, incoming size `X` is sampled
-from the zero-inflated model: size zero with probability `p0`, otherwise a
-zero-truncated Poisson with mean parameter `mu`. If our posted size is `u`, the
-realized fill is `min(X, u)`. Thus an incoming 3M order fills 3M of a 5M post, while
-an incoming 5M order fills all of a 1M post. Dark-pool executions occur at mid.
-The HJB/analytics use the equivalent transition rates implied by this same capped-size
-mechanism. The previous geometric fill-size model has been removed.
+The refactor was checked against the previous compiled solver at zero drift
+using the default three-regime config and a two-regime config with ECN and
+darkpool enabled. Across policy solutions, PnL moments, and seeded Monte Carlo
+results, all 49,913 numerical values matched exactly. C++: 3/3 tests; Python:
+119/119 tests. Browser-based Dash rendering was not exercised.
 
 
-## Customer RFQs in Monte Carlo
+### Target FX pair JSON defaults and pricing knots in Configure flow sources
 
-The **exogenous RFQ-arrival intensity curve itself defines the RFQ-size density**. For each
-customer flow source `s`, the calibrated one-sided curve is
+Changing **Global → Target FX pair** now loads
+both its spot and its reference spread from
+`python/trinity/fx_pair_defaults.json`. The same JSON provides the temporary
+mids used for crossed flow sources (including reciprocal cross rates). All
+29 supported target FX pairs have explicit entries. The *spread* values for
+pairs other than EURSEK are **illustrative offline placeholders, not real
+market measurements or validated trading costs**; replace them with your own
+pair-specific references before trusting the resulting quotes. Manually changing
+either field remains possible, and a normal Solve does not reset these values.
+Selecting another target pair reloads both values from the JSON.
 
-```text
-lambda_RFQ,s(z) = A0_s * z^(-theta_s - beta_s*z).
-```
+Under **Configure flow sources → Pricing Rungs**, the
+Tier 1 and Tier 2 pricing knots can now be edited side by side, separately per
+Tier (sizes are in millions of the selected target pair's base currency).
+The input IDs remain `t0-sizes` and `t1-sizes`; there are no duplicate hidden
+inputs in the sidebar. The normal HJB Solve, simulation and diagnostics use
+these edited discrete RFQ size supports without interpolation between sizes.
 
-Pricing sizes and customer RFQ sizes are deliberately separate.  A tier can, for example,
-optimize prices only at
+The JSON is included as package data in `setup.py`, so these defaults remain
+available when the project is installed rather than run from its checkout.
+This update changes only offline input defaults and dashboard placement; no
+HJB equation or C++ source file was modified.
 
-```text
-pricing knots = {1, 2, 3, 5, 10, 20} M
-```
+## Compact flow-source dialog labels
 
-while customer RFQs are sampled on the full grid
+The Tier flow-source dialog displays the globally selected target pair as read-only and retains the configuration inputs,
+but removes duplicate target-risk and direct-flow headings. Under **Market Data**,
+the spot input is labeled **Mid-rate**; under **Pricing Rungs**, the visible
+Tier-specific size field is labeled **Base M**. The RFQ and volatility explainer
+sentences have been removed. **Markouts → Enabled** uses the same white label
+style as the other channel toggles. These changes affect only the UI: spot,
+spread, pricing-rung values and all solver configuration remain unchanged.
 
-```text
-RFQ support = {1, 2, 3, 4, ..., 20} M
-```
+### Target FX pair selector in Configure flow sources
 
-when `rfqSizeStep = 1.0`.  The support runs from the smallest to the largest pricing knot;
-pricing knots are always included exactly.  `rfqSizeStep` is configurable per tier.
-
-For each source, evaluate the exogenous curve on that full RFQ support. The Monte Carlo
-size PMF is
-
-```text
-p_s,j = lambda_RFQ,s(z_j) / sum_k lambda_RFQ,s(z_k),
-```
-
-and the pooled two-sided source clock is
-
-```text
-Lambda_s = 2 * sum_j lambda_RFQ,s(z_j).
-```
-
-There is therefore **no independent RFQ-size probability calibration**. Each customer RFQ
-is generated as
-
-```text
-source RFQ clock:          Lambda_s
-customer side:             Bid / Ask with probability 1/2 each
-requested size:            z_j with probability p_s,j
-quoted price:              linear interpolation between neighboring pricing knots
-conditional trade win:     Bernoulli(p_win,s(interpolated_price, z_j))
-```
-
-For example, if 3M and 5M are pricing knots and a 4M RFQ arrives, the 4M bid or ask price is
-exactly halfway between the current 3M and 5M prices. In the code the equivalent `delta` is
-interpolated; because execution price is affine in `delta` for a fixed side and reference
-spot, this is mathematically identical to interpolating the price itself.
-
-The sampled **actual RFQ size** drives win probability, cash, inventory, retained
-RFQ events, and the population hit-ratio aggregates.  Hence the realized hit-ratio chart can
-show 4M, 6M, 7M, etc. even though those sizes are not explicit pricing knots.
-
-The HJB continues to store the control policy at the pricing knots. Its existing pricing-knot
-optimization is unchanged; Monte Carlo applies the resulting ladder to intermediate customer
-sizes via the same linear price interpolation used in production-style quoting.
-
-Crossed sources evaluate the exogenous curve and hit-ratio model at their mapped source-currency
-size before normalization / win sampling. For compatibility, configs produced by the short-lived
-`totalRfqRate` version are converted back to an equivalent `A0` using the full RFQ support.
-
-Once an RFQ arrives, only a won RFQ changes inventory and cash. The RFQ markout shock is
-applied on every RFQ, including lost RFQs; for a won RFQ, inventory/cash are updated before
-the markout is applied.
+The **global** target FX pair is displayed as a disabled dropdown in the
+Direct card. When editing a crossed source, the read-only Direct selector is
+hidden and only crossed pair selectors are editable. Target FX pair changes
+must be made in **Global**, and all flow channels share that target.
 
 
-### Temporary FX reference mids
+### Crossed RFQ source market data
 
-The Dash flow-source editor currently obtains crossed-source reference mids from
-`trinity.defaults.DEFAULT_FX_MIDS`. `default_fx_mid(pair)` also resolves inverse
-orientations (for example `USDEUR` from `EURUSD`). This is intentionally a
-temporary market-data boundary: a production deployment should replace the
-default lookup with the bank's/database market-data source while leaving the
-flow-source and HJB interfaces unchanged.
+In **Configure flow sources**, a crossed RFQ source shows its **Crossed pair**
+ and **Crossing pair** selectors directly, followed by a collapsed **Market Data**
+expander. **Crossing Mid-Rate** and **Crossing Spread** are edited inside this
+expander. The original `flow-edit-cross-mid` and `flow-edit-spread` controls
+retain their IDs and value wiring, so changing the selected source or invoking
+Solve does not change the underlying FX cross mapping logic. The direct target
+pair retains its separate **Market Data** expander with Mid-rate and Spread.
 
-## Policy-improvement stability fix (2026-10-13)
+### Flow source popup layout (Oct 2026)
 
-The constrained RFQ ladder is optimized by sweeping outward from zero inventory.
-`PolicyBuilder::improve()` now uses the **already updated** inner-neighbour ladder
-from the current iteration (`out`), rather than the lagged previous-iteration
-ladder (`old`), when constructing cross-inventory monotonicity/gap bounds.
-This is a two-line algorithmic fix; the per-state Howard safeguard still
-compares candidates to the previous policy at that same inventory state.
-
-Regression: `cpp/tests/test_policy_improvement_regression.cpp` reproduces the
-large q=0 curvature spike at an asymptotic markout of -50 EUR per EUR 1M,
-ECN disabled, gamma=1. The test fails before the fix and passes afterwards,
-and also checks both sides' cross-inventory ladder constraints.
-
-**Historical note:** At the time of this stability fix the HJB still used
-the old markout reward; the policy-dependent expected-MTM model was added
-subsequently. The original ladder neighbor update remains in place.
-
-## Per-tier markout configuration (2026-10-13)
-
-- Removed the obsolete top-level `config["markout"]` and the global markout sidebar panel.
-- Each tier now has `markout: {asymptoticEurPerMillion: ..., tauSeconds: ...}`.
-- Updated Dash callbacks, native C++ binding conversion, the selected-tier chart,
-  and configuration/regression tests. Expected MTM was added subsequently.
-- The earlier Gauss–Seidel-style policy-improvement stability fix remains intact.
-
-## Validation of the expected-MTM update (2026-10-13)
-
-- New `cpp/tests/test_expected_mtm.cpp` checks the resolvent against an exact
-  Markov-chain solution, both trade directions, gross-vs-incremental MTM, and
-  independence from the legacy `tau0/tau1/tau2` inputs.
-- Existing Howard/ladder/analytics/simulation tests still pass in debug mode.
-- Closed-form PnL and Monte Carlo use matching RFQ-impact conventions. In
-  the included simulation regression case, their expected PnL outputs are
-  approximately 6,821 EUR and 6,850 EUR, respectively.
-- 42 Python tests pass with the current native extension; Python/native schema
-  is bumped to 3 and `run_dash.sh` rebuilds incompatible binaries.
-- Dash syntax is checked, but a live Dash server was not run in the build
-  environment, where Dash was unavailable.
+In both RFQ Tier and ECN **Configure flow sources** popups, the red **Remove FX pair**
+button appears immediately to the right of **+ Add FX pair** in the footer,
+only when a valid crossed source is selected. The Direct source cannot be
+removed. The ECN popup's old descriptive paragraph has been removed.
+These are dashboard-only changes; native pricing and simulation are unchanged.

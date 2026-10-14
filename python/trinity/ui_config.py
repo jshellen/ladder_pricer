@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import math
+
 from typing import Any, Mapping
 
-from .defaults import default_config, ecn_delta_grid
+from .defaults import default_config, default_fx_pair_volatility, ecn_delta_grid
 
 
 def checked(value: Any) -> bool:
@@ -58,16 +60,15 @@ def build_config(values: Mapping[str, Any]) -> dict[str, Any]:
     }
     cfg["spot"] = _number(values, "spot")
     cfg["spreadPips"] = _number(values, "spread")
-    cfg["spotDrift"] = _number(values, "drift")
-    cfg["sigmaPips"] = _number(values, "sigma")
     cfg["gamma"] = _number(values, "gamma")
-    cfg["internalization"] = {
-        "tau0": _number(values, "tau0"),
-        "tau1": _number(values, "tau1"),
-        "tau2": _number(values, "tau2"),
-    }
+    # One read-only target-pair volatility model, loaded from JSON rather than
+    # from any editable dashboard state. The same config reaches the C++ solver
+    # and is subsequently reused by Monte Carlo and the efficient frontier.
+    cfg["targetPair"] = str(values.get("target-pair") or cfg["targetPair"]).upper()
+    cfg["volatilityRegimes"] = default_fx_pair_volatility(cfg["targetPair"])
+    cfg["sigmaPips"] = cfg["volatilityRegimes"]["sigmaPips"][len(cfg["volatilityRegimes"]["sigmaPips"]) // 2]
     tiers: list[dict[str, Any]] = []
-    for i in range(3):
+    for i in range(len(cfg["tiers"])):
         p = f"t{i}"
         sizes = parse_numbers(values.get(f"{p}-sizes", ""))
         flow = {
@@ -88,7 +89,6 @@ def build_config(values: Mapping[str, Any]) -> dict[str, Any]:
             "enabled": checked(values.get(f"{p}-enabled")),
             "name": str(values.get(f"{p}-name", f"Tier {i + 1}")),
             "sizes": sizes,
-            "rfqSizeStep": _number(values, f"{p}-rfq-size-step") if values.get(f"{p}-rfq-size-step") is not None else 1.0,
             "flow": flow,
             "useMarkout": checked(values.get(f"{p}-markout-enabled")),
             "markout": {"asymptoticEurPerMillion": m_inf, "tauSeconds": tau_s},
