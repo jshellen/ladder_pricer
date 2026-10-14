@@ -565,7 +565,8 @@ def test_target_market_data_is_first_flow_expander_and_uses_closed_default(dashb
     direct = dashboard._direct_flow_source(dashboard.DEFAULT["tiers"][0]["flow"], "EURSEK")
     editor_contents = dashboard.flow_source_settings_editor("direct", direct, "EURSEK")
     header, dynamic_sections = editor_contents.children
-    assert any(getattr(n, "className", "") == "flow-source-row-head" for n in walk(header))
+    assert not any(getattr(n, "className", "") in ("flow-source-row-head", "flow-source-title")
+                   for n in walk(header))
     dynamic_titles = [next(n for n in walk(expander)
                            if getattr(n, "type", "") == "Summary").children
                       for expander in walk(dynamic_sections) if getattr(expander, "type", "") == "Details"]
@@ -624,8 +625,8 @@ def test_unified_flow_card_renders_header_then_tier_inputs_then_source_expanders
         header, dynamic = dashboard.render_flow_source_settings(
             tier_index, "EURSEK", "direct", {"0": [], "1": []}, *direct_values,
         )
-        assert any(getattr(node, "className", None) == "flow-source-row-head"
-                   for node in walk(header))
+        assert not any(getattr(node, "className", None) in ("flow-source-row-head", "flow-source-title")
+                       for node in walk(header))
         headings = [node.children for node in walk(dynamic)
                     if getattr(node, "type", None) == "Summary"]
         assert headings == ["RFQ flow intensities", "Volatility", "Markouts"]
@@ -800,8 +801,8 @@ def test_crossed_source_editor_has_no_redundant_pair_heading(dashboard):
     """Only the editable source pair selector identifies a crossed RFQ flow."""
     direct = dashboard._direct_flow_source(dashboard.DEFAULT["tiers"][0]["flow"], "EURSEK")
     direct_header, _ = dashboard.flow_source_settings_editor("direct", direct, "EURSEK").children
-    assert any(getattr(node, "className", None) == "flow-source-title"
-               for node in walk(direct_header))
+    assert not any(getattr(node, "className", None) == "flow-source-title"
+                   for node in walk(direct_header))
 
     crossed = {
         "pair": "USDSEK", "crossPair": "EURUSD", "flow": direct["flow"],

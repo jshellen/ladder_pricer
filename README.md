@@ -1,3 +1,20 @@
+## Fixed-size flow-source dialogs (Dash card-level fix)
+
+The modal card itself now has explicit **inline height/min-height/max-height**
+settings in `app.py` for both RFQ Tiers and ECN. This prevents the dialog
+from shrinking when Dash swaps Direct and Crossed content even if the browser
+has an older stylesheet cached. The scrollable editor also has inline flex
+and overflow settings. The visibility callbacks keep the outer overlay aligned
+at the top. The CSS still supplies the visual styling and fade-in.
+
+
+Tier and ECN **Configure flow sources** dialogs use one fixed-height card
+(maximum 800 px, responsive to the viewport). Switching Direct/Crossed sources
+or adding/removing crossed pairs cannot change the card size. The header and
+Add/Remove/Close/Apply footer stay visible; only the editor area scrolls when
+there are many FX pairs or expanded settings. New settings may fade in gently,
+but there is no height animation or custom JavaScript controlling the layout.
+Reduced-motion preferences disable the fade-in. The solver is unchanged.
 
 ## One global target FX pair (Tier, dark pool and ECN)
 

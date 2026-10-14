@@ -567,13 +567,10 @@ def flow_source_settings_editor(source_key: str, source: dict[str, Any], target_
     direct = source_key == "direct"
     markout = markout or {"enabled": True, "asymptote": -50.8, "tau": 36.7}
 
-    # The target-pair heading remains for Direct; the crossed source is
-    # identified by its dropdowns. Removal now lives next to Add in the footer.
-    header = (
-        html.Div([html.Div(str(source.get("pair") or target_pair), className="flow-source-title")],
-                 className="flow-source-row-head")
-        if direct else html.Div()
-    )
+    # The Direct card already identifies the target pair, and the locked
+    # Target pair dropdown immediately below it does so again. Do not render
+    # a redundant title above the selector: the Direct and Crossed inputs
+    # must start at the same vertical position.
     if direct:
         source_fields = [html.Div([
             dcc.Dropdown(id="flow-edit-pair", value=target_pair, options=FX_PAIR_OPTIONS),
@@ -610,7 +607,7 @@ def flow_source_settings_editor(source_key: str, source: dict[str, Any], target_
     # *same* source card.  Splitting the groups avoids remounting the inputs
     # whenever a source, Tier or target pair changes.
     return html.Div([
-        html.Div([header, *source_fields], className="flow-source-header-fields"),
+        html.Div(source_fields, className="flow-source-header-fields"),
         html.Div([
             crossed_market_data,
             diagnostic_expander("RFQ flow intensities", [
@@ -659,11 +656,8 @@ def ecn_flow_source_settings_editor(source_key: str, source: dict[str, Any], tar
     mapping = source.get("mapping", {})
     direct = source_key == "direct"
 
-    header = (
-        html.Div([html.Div(str(source.get("pair") or target_pair), className="flow-source-title")],
-                 className="flow-source-row-head")
-        if direct else html.Div()
-    )
+    # The selected Direct/Crossed tile already displays the pair name.
+    # No second header here: align the form for both source types.
 
     if direct:
         # All callback IDs must remain mounted even when editing a direct
@@ -693,7 +687,6 @@ def ecn_flow_source_settings_editor(source_key: str, source: dict[str, Any], tar
         ]
 
     return html.Div([
-        header,
         *source_fields,
         html.Div([
             number_input("A at mid / side [trades/min]", "ecn-flow-edit-A", float(flow.get("A", 0.10)), "any"),
@@ -2150,7 +2143,9 @@ app.layout = html.Div([
                        style={"display": "none"}),
                     html.Div(id="flow-source-settings"),
                 ], id="flow-source-active-card", className="flow-source-settings"),
-            ], id="flow-source-editor", className="flow-source-editor"),
+            ], id="flow-source-editor", className="flow-source-editor",
+               style={"flex": "1 1 auto", "minHeight": 0,
+                      "overflowY": "auto", "overflowX": "hidden"}),
             html.Div([
                 html.Div([
                     html.Button("+ Add FX pair", id="flow-source-add", className="secondary-button", n_clicks=0),
@@ -2163,7 +2158,12 @@ app.layout = html.Div([
                     html.Button("Apply", id="flow-source-apply", className="modal-action-button modal-action-apply", n_clicks=0),
                 ], className="modal-actions-right"),
             ], className="modal-actions"),
-        ], className="flow-source-modal-card"),
+        ], className="flow-source-modal-card",
+           style={"height": "min(800px, calc(100vh - 56px))",
+                  "minHeight": "min(800px, calc(100vh - 56px))",
+                  "maxHeight": "min(800px, calc(100vh - 56px))",
+                  "display": "flex", "flexDirection": "column",
+                  "flexShrink": 0, "overflow": "hidden", "boxSizing": "border-box"}),
     ], id="flow-source-modal", className="flow-source-modal", style={"display": "none"}),
     html.Div([
         html.Div([
@@ -2201,7 +2201,9 @@ app.layout = html.Div([
                 ], id="ecn-target-picker-container",
                    className="flow-target-picker flow-pair-selectors"),
                 html.Div(id="ecn-flow-source-settings"),
-            ], className="flow-source-editor"),
+            ], id="ecn-flow-source-editor", className="flow-source-editor",
+               style={"flex": "1 1 auto", "minHeight": 0,
+                      "overflowY": "auto", "overflowX": "hidden"}),
             html.Div([
                 html.Div([
                     html.Button("+ Add FX pair", id="ecn-flow-source-add", className="secondary-button", n_clicks=0),
@@ -2214,7 +2216,12 @@ app.layout = html.Div([
                     html.Button("Apply", id="ecn-flow-source-apply", className="modal-action-button modal-action-apply", n_clicks=0),
                 ], className="modal-actions-right"),
             ], className="modal-actions"),
-        ], className="flow-source-modal-card"),
+        ], className="flow-source-modal-card",
+           style={"height": "min(800px, calc(100vh - 56px))",
+                  "minHeight": "min(800px, calc(100vh - 56px))",
+                  "maxHeight": "min(800px, calc(100vh - 56px))",
+                  "display": "flex", "flexDirection": "column",
+                  "flexShrink": 0, "overflow": "hidden", "boxSizing": "border-box"}),
     ], id="ecn-flow-source-modal", className="flow-source-modal", style={"display": "none"}),
     html.Div([
         html.Div([
@@ -2338,7 +2345,7 @@ def set_flow_source_modal_open(_open_clicks, _close, _cancel, _apply, is_open, s
     Input("flow-source-modal-open-store", "data"),
 )
 def render_flow_source_modal_visibility(is_open):
-    return {"display": "flex"} if is_open else {"display": "none"}
+    return {"display": "flex", "alignItems": "flex-start"} if is_open else {"display": "none"}
 
 
 @app.callback(
@@ -2692,7 +2699,7 @@ def set_ecn_flow_source_modal_open(_open, _close, _cancel, _apply, is_open):
     Input("ecn-flow-source-modal-open-store", "data"),
 )
 def render_ecn_flow_source_modal_visibility(is_open):
-    return {"display": "flex"} if is_open else {"display": "none"}
+    return {"display": "flex", "alignItems": "flex-start"} if is_open else {"display": "none"}
 
 
 @app.callback(

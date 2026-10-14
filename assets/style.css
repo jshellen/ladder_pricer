@@ -571,3 +571,109 @@ input[type="checkbox"] { accent-color: var(--accent); }
 .ecn-heatmap-toggle:hover { border-color: #58a6ff; background: #1d3046; }
 .ecn-heatmap-toggle input { accent-color: #58a6ff; width: 16px; height: 16px; margin: 0 12px 0 0 !important; }
 .ecn-heatmap-toggle-label { color: #f5f7fb; -webkit-text-fill-color: #f5f7fb; }
+
+/* Tier and ECN flow-source dialogs retain the SAME outer dimensions for
+   Direct, crossed, Add, Remove and expanded settings.  Only their middle
+   editor scrolls; the header and action buttons stay stationary.  Do not
+   animate the editor's height or measure it in JavaScript. */
+.flow-source-modal {
+  align-items: flex-start;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.flow-source-modal-card {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  box-sizing: border-box;
+  height: min(800px, calc(100vh - 56px));
+  height: min(800px, calc(100dvh - 56px));
+  max-height: none;
+  overflow: hidden;
+}
+.flow-source-modal-card > .modal-head,
+.flow-source-modal-card > .modal-actions {
+  flex: 0 0 auto;
+}
+.flow-source-modal-card > .flow-source-editor {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 8px 4px 4px 0;
+}
+.flow-source-modal .flow-source-header-fields,
+.flow-source-modal .flow-source-dynamic-expanders,
+.flow-source-modal #ecn-flow-source-settings > .flow-source-settings {
+  animation: flow-editor-content-enter 200ms cubic-bezier(.22,1,.36,1) both;
+}
+@keyframes flow-editor-content-enter {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .flow-source-modal .flow-source-header-fields,
+  .flow-source-modal .flow-source-dynamic-expanders,
+  .flow-source-modal #ecn-flow-source-settings > .flow-source-settings {
+    animation: none;
+  }
+}
+
+/* ---------------------------------------------------------------
+   Flow-source FX pair menus: stay in front of following expanders.
+
+   The header/expander fade-in wrappers are independent stacking contexts
+   (animation-fill-mode: both), so a high z-index on the menu alone is not
+   sufficient. Raise the complete pair-selector ancestor above every later
+   diagnostic section. Apply to both RFQ Tier and ECN editors. Do NOT remove
+   the editor's internal vertical scroll or the fixed modal size.
+   --------------------------------------------------------------- */
+.flow-source-modal .flow-target-picker,
+.flow-source-modal .flow-source-header-fields {
+  position: relative;
+  z-index: 20;
+  overflow: visible;
+}
+.flow-source-modal .flow-pair-selectors {
+  position: relative;
+  z-index: 25;
+  overflow: visible;
+}
+/* The first (Crossed) menu also needs to draw above the second (Crossing)
+   control when the options list overlaps that row. */
+.flow-source-modal .flow-pair-selectors > .field {
+  position: relative;
+  z-index: 1;
+}
+.flow-source-modal .flow-pair-selectors > .field:focus-within {
+  z-index: 40;
+}
+.flow-source-modal .flow-pair-selectors > .field:has([aria-expanded="true"]) {
+  z-index: 40;
+}
+.flow-source-modal .flow-source-dynamic-expanders,
+.flow-source-modal .flow-target-direct-settings {
+  position: relative;
+  z-index: 0;
+}
+/* Both current Dash dropdown popovers and older React-Select menus. Keep
+   native positioning managed by the component; only fix paint order. */
+.flow-source-modal .flow-pair-selectors .dash-dropdown-content,
+.flow-source-modal .flow-pair-selectors .dash-dropdown-options,
+.flow-source-modal .flow-pair-selectors .Select-menu-outer,
+.flow-source-modal .flow-pair-selectors [class*="-menu"] {
+  z-index: 100 !important;
+}
+
+/* In the ECN dialog the Direct picker is outside the source settings card,
+   whereas crossed selectors sit inside its 16px padded card. Give the Direct
+   picker the same top/left inset, so the two input rows do not jump when a
+   user chooses Add FX pair. */
+.flow-source-modal #ecn-target-picker-container {
+  width: min(100%, 514px); /* 480px dropdown + 2 × 17px inset */
+  padding: 16px 16px 0;
+  border: 1px solid transparent;
+  border-bottom: 0;
+}
