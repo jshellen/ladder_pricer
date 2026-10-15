@@ -35,5 +35,5 @@ setup(
     cmdclass={"build_ext": build_ext},
     python_requires=">=3.10",
     install_requires=["dash>=3.1", "plotly>=6.0", "numpy>=1.24", "scipy>=1.10", "pandas>=2.0"],
-    extras_require={"test": ["pytest>=8"]},
+    extras_require={"test": ["pytest>=8"], "calibration": ["yfinance>=0.2.40", "matplotlib>=3.7", "ipykernel>=6", "nbformat>=5"]},
 )

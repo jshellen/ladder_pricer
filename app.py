@@ -21,7 +21,7 @@ from trinity.defaults import (
     default_config,
     default_ecn_trade_size_probabilities,
     default_fx_mid,
-    default_fx_pair_market_data, default_fx_pair_volatility,
+    default_fx_pair_market_data, default_fx_pair_volatility, volatility_calibration_source,
 )
 from trinity.markout import markout_eur_per_million
 from trinity.service import ENGINES
@@ -514,12 +514,21 @@ def _dropdown_field(label: str, component_id: str, value: str | None, options: l
     ], className="field")
 
 
+def volatility_regime_names(n: int) -> tuple[str, ...]:
+    """Human-readable names for any volatility state count supported by HJB."""
+    if n == 2:
+        return ("Low", "High")
+    if n == 3:
+        return ("Low", "Normal", "High")
+    return tuple(f"Regime {i + 1}" for i in range(n))
+
+
 def volatility_generator_matrix(sigma, rates):
     """Full Markov-chain generator: off-diagonal arrival rates, diagonal = -row sum."""
     matrix = np.asarray(rates, dtype=float).copy()
     n=len(sigma)
-    if n not in (2, 3) or matrix.shape != (n, n):
-        raise ValueError("Expected two or three volatility regimes")
+    if not 2 <= n <= 12 or matrix.shape != (n, n):
+        raise ValueError("Expected a square matrix with 2–12 volatility regimes")
     for i in range(n):
         matrix[i, i] = -sum(matrix[i, j] for j in range(n) if i != j)
     return matrix
@@ -530,7 +539,7 @@ def readonly_volatility_matrix(volatility: dict[str, Any]):
     sigma = volatility["sigmaPips"]
     rates = volatility["ratesPerMinute"]
     matrix = volatility_generator_matrix(sigma, rates)
-    names = ("Low", "High") if len(sigma) == 2 else ("Low", "Normal", "High")
+    names = volatility_regime_names(len(sigma))
     sigma_table = html.Table([
         html.Thead(html.Tr([html.Th("Regime"), html.Th("σ [pips/√min]")])),
         html.Tbody([html.Tr([html.Td(name), html.Td(f"{value:g}")])
@@ -542,6 +551,7 @@ def readonly_volatility_matrix(volatility: dict[str, Any]):
                     for label, row in zip(names, matrix)]),
     ], className="data-table volatility-readonly-table")
     return html.Div([
+        html.Div(f"{len(sigma)} volatility states", className="muted-note"),
         html.Div("Volatility levels", className="subhead"),
         sigma_table,
         html.Div("Generator Q [1/min] · rows: from regime, columns: to regime", className="subhead"),
@@ -599,6 +609,7 @@ def flow_source_settings_editor(source_key: str, source: dict[str, Any], target_
     ]) if not direct else None
 
     volatility_panel = diagnostic_expander("Volatility", [
+        html.Div(f"Model: {volatility_calibration_source(target_pair)}", className="muted-note"),
         readonly_volatility_matrix(default_fx_pair_volatility(target_pair)),
     ]) if direct else None
 
@@ -1186,10 +1197,7 @@ def rfq_regime_heatmap_figure(
         j = int(matching[0])
     z = float(sizes[j])
     q = np.asarray(solution["qGrid"], dtype=float)
-    sigma_names = ("Low", "High") if len(regimes) == 2 else (
-        ("Low", "Normal", "High") if len(regimes) == 3 else
-        tuple(f"Regime {i + 1}" for i in range(len(regimes)))
-    )
+    sigma_names = volatility_regime_names(len(regimes))
     y_labels = [f"{name} · σ={float(reg['sigmaPips']):g}" for name, reg in zip(sigma_names, regimes)]
     tier_cfg = _tier_cfg(cfg, ti)
     spread = float(cfg["spreadPips"])
@@ -1750,10 +1758,7 @@ def passive_ecn_regime_heatmap_figure(
         return fig
 
     q = np.asarray(regimes[0]["passiveEcn"]["qGrid"], dtype=float)
-    names = ("Low", "High") if len(regimes) == 2 else (
-        ("Low", "Normal", "High") if len(regimes) == 3 else
-        tuple(f"Regime {i+1}" for i in range(len(regimes)))
-    )
+    names = volatility_regime_names(len(regimes))
     y_labels = [f"{name} · σ={float(r['sigmaPips']):g}" for name, r in zip(names, regimes)]
     spread_pips = float(cfg.get("spreadPips", 0.0))
     matrices = {}
@@ -3031,7 +3036,8 @@ def solve_model(_clicks, *values):
             cfg["targetPair"] = str(target_pair)
         solution = ENGINES.get(cfg).solve()
         method = "Production C++ (q, σ)"
-        return cfg, solution, f"Solved · {method} · {solution['iterations']} iterations", "status ready"
+        n_vol = len(cfg["volatilityRegimes"]["sigmaPips"])
+        return cfg, solution, f"Solved · {method} · {n_vol} volatility states · {solution['iterations']} iterations", "status ready"
     except Exception as exc:
         return no_update, no_update, f"Solve failed · {exc}", "status error"
 
@@ -3369,7 +3375,7 @@ def mc_volatility_regime_options(solution):
     if not solution or not solution.get("regimes"):
         return [], None
     sigmas=solution.get("sigmaPips", [])
-    names=("Low", "High") if len(sigmas)==2 else ("Low", "Normal", "High")
+    names=volatility_regime_names(len(sigmas))
     options=[{"label": f"{name} · σ={float(sigma):g} pips/√min", "value": i}
              for i,(name,sigma) in enumerate(zip(names,sigmas))]
     return options, len(options)//2
@@ -4002,7 +4008,7 @@ def regime_dropdown_options(solution):
     if not solution or not solution.get("regimes"):
         return (*([[]] * count), *([None] * count))
     sigmas = [regime["sigmaPips"] for regime in solution["regimes"]]
-    names=("Low", "High") if len(sigmas)==2 else ("Low", "Normal", "High")
+    names=volatility_regime_names(len(sigmas))
     opts = [{"label": f"{name} · σ={float(sigma):g} pips/√min", "value": i}
             for i, (name, sigma) in enumerate(zip(names, sigmas))]
     normal = len(opts) // 2

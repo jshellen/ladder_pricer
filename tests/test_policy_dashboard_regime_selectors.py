@@ -1331,3 +1331,34 @@ def test_ecn_missing_size_inputs_skip_save_during_partial_mount(dashboard):
         assert result == (dashboard.no_update,) * 5
     finally:
         dashboard.ctx.triggered_id = old_trigger
+
+
+def test_five_volatility_states_have_matrix_and_selector_labels(dashboard):
+    from trinity.defaults import _validated_volatility_regimes
+
+    n = 5
+    sigma = [7.0, 11.0, 18.0, 25.0, 37.0]
+    rates = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        if i > 0:
+            rates[i][i-1] = 0.04
+        if i < n-1:
+            rates[i][i+1] = 0.05
+    model = _validated_volatility_regimes({"sigmaPips": sigma, "ratesPerMinute": rates}, "EURSEK")
+    assert dashboard.volatility_regime_names(n) == tuple(f"Regime {i+1}" for i in range(n))
+    q = dashboard.volatility_generator_matrix(sigma, rates)
+    assert q.shape == (n, n)
+    assert abs(q.sum(axis=1)).max() < 1e-12
+    rendered = dashboard.readonly_volatility_matrix(model)
+    assert len(list(walk(rendered))) > 0
+
+    solution = {"sigmaPips": sigma, "regimes": [{"sigmaPips": v} for v in sigma]}
+    choices, selected = dashboard.mc_volatility_regime_options(solution)
+    assert len(choices) == 5
+    assert selected == 2
+    assert choices[4]["label"].startswith("Regime 5")
+
+    outputs = dashboard.regime_dropdown_options(solution)
+    n_selectors = len(dashboard.POLICY_REGIME_SELECTOR_IDS)
+    assert all(len(options) == 5 for options in outputs[:n_selectors])
+    assert list(outputs[n_selectors:]) == [2] * n_selectors

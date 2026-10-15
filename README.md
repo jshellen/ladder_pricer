@@ -115,15 +115,15 @@ generator and HJB policy improvement both enumerate those same rungs. **Adding o
 by design; it is not a density quadrature. ECN trade size distribution and dark
 pool sizes are separate mechanisms and remain unchanged.
 
-## Read-only volatility regimes from FX pair JSON
+## Read-only volatility regimes from calibration or FX pair JSON
 
-The **only volatility-regime source** is `python/trinity/fx_pair_defaults.json`.
-The top-level `volatilityRegimes` contains a 2×2 or 3×3 model shared by all
+The dashboard first looks for a validated pair-specific calibration in `notebooks/output/<PAIR>_volatility_regimes.json`. If none exists, it uses `python/trinity/fx_pair_defaults.json`.
+The top-level `volatilityRegimes` contains a square 2–12-state model shared by all
 FX pairs. A pair may override this by adding its own `"volatilityRegimes"`
 object inside `"pairs": {"GBPSEK": { ... }}`. All entries must supply
 `"sigmaPips"` (increasing levels) and `"ratesPerMinute"` (nonnegative,
-zero diagonal, positive exit rate). Changing the JSON requires restarting
-Dash to reload the offline defaults. All shipped pair values inherit the
+zero diagonal, positive exit rate). Editing packaged default JSON requires restarting Dash; notebook calibration
+exports are read on every new Solve and need no restart. All shipped pair values inherit the
 existing three-regime 12/20/35 example until calibrated per pair.
 
 The modal displays the selected pair's volatility levels and the **full
@@ -409,3 +409,121 @@ fail because an editor field has not been mounted yet. ECN trade-size editing
 also skips incomplete transient input values while the editor is mounting.
 The direct/crossed FX mapping, Apply validation, and native pricing models are
 otherwise unchanged.
+
+## yfinance volatility-regime calibration notebook (October 2026)
+
+`notebooks/calibrate_volatility_yfinance.ipynb` estimates the existing
+user-selectable 2–12-state Markov volatility inputs from indicative Yahoo Finance intraday
+FX candles (default: `EURSEK=X`). Install its optional dependencies with:
+
+```bash
+python3 -m pip install -e ".[calibration]"
+python3 -m pip install jupyterlab  # optional if Jupyter is not installed
+jupyter lab
+```
+
+The notebook uses 5-minute closes during the 07:45–17:15 Copenhagen session,
+calculates complete trailing 60-minute realized-volatility windows in
+**pips/√minute**, identifies `N_REGIMES` equal-frequency states from volatility quantiles
+and calibrates a continuous-time Markov generator by maximizing the likelihood
+of the *sampled* 5-minute transitions, using `expm(5 * Q)`.
+
+Output is a pair-specific JSON containing `generatorQPerMinute` (the full
+CTMC generator, **negative diagonal**) and the matching increasing `sigmaPips`.
+With `SAVE_FOR_DASHBOARD=True` (default), this is saved atomically under
+`notebooks/output/`, and on the next Solve the dashboard validates the file,
+infers the regime count, and converts Q to the solver's zero-diagonal
+`ratesPerMinute` input. It does **not** modify `fx_pair_defaults.json`; no
+restart or C++ rebuild is required. The JSON fallback remains in effect for
+uncalibrated pairs.
+
+**Caveats:** Yahoo normally restricts intraday history to the last 60 days;
+indicative FX closes may not reflect executable bank mids; the rolling window
+artificially increases state persistence; and 5-minute observations cannot
+resolve rapid variance switching perfectly. Treat rates as provisional until
+checked using longer internal market-data history. The current C++ solver
+converts `sigmaPips` using 0.0001 quote-price units, which differs from
+conventional 0.01 market pips for JPY FX pairs.
+
+## Configure volatility-state count in the yfinance notebook
+
+Open `notebooks/calibrate_volatility_yfinance.ipynb` and set `N_REGIMES` in
+cell 1 (the settings cell), for example `N_REGIMES = 5`. Accepted values are
+**2 through 12**, matching the existing C++ joint inventory/volatility HJB.
+The rolling-volatility quantile buckets, state-dependent sigmas, transition
+count matrices, fitted generator, plots, JSON output and dashboard selectors
+all adjust to the chosen count automatically. The calibration becomes active
+automatically on the next Solve when `SAVE_FOR_DASHBOARD=True`.
+
+With `CTMC_TOPOLOGY = "auto"`, for 2–3 states the calibration keeps the
+historical unrestricted direct transition rates; for 4–12 states it fits only
+adjacent-state rates in the *continuous-time* generator Q. That is a compact
+birth–death approximation for a smoothly moving variance process: transitions
+across multiple states over one observation interval are still accounted for
+by the full `expm(ΔQ)` matrix in the discrete-data likelihood. The optional
+`CTMC_TOPOLOGY = "full"` estimates every off-diagonal rate (much more costly,
+and easy to overfit using Yahoo's short intraday history).
+
+**Performance/identification warning:** N volatility states multiply the
+number of joint HJB states and increase the linear-system solve cost. Large N
+is not necessarily more accurate: especially with short intraday history,
+more granular regime transitions may be poorly identified.
+
+
+### Live notebook → dashboard stochastic-volatility calibration
+
+Run `notebooks/calibrate_volatility_yfinance.ipynb`, choose `N_REGIMES` (2–12),
+then run the save cell (`SAVE_FOR_DASHBOARD=True`, the default). It atomically
+writes `notebooks/output/<PAIR>_volatility_regimes.json`, storing both
+`generatorQPerMinute` (**full** CTMC generator, with negative diagonal) and
+`sigmaPips` (the corresponding calibrated volatilities), as well as threshold
+and sample metadata. A Q matrix alone does not determine volatility levels.
+
+For each target pair, the dashboard and HJB config builder read that file on
+demand and derive the number of states from the dimensions of Q. The loader
+checks shape, units, ordering, generator row sums, and exit rates, and transforms
+Q into the zero-diagonal `ratesPerMinute` expected by the native solver. A new
+calibration takes effect at the **next Solve** without restarting the dashboard.
+The Flow Sources → Volatility panel displays the current model and state count
+when it is rendered. Existing solved policies/Monte Carlo remain snapshots until
+re-solved; changing the calibration file does not mutate an existing solution.
+
+If there is no per-pair export, `python/trinity/fx_pair_defaults.json` is used as
+the fallback. If an export exists but is invalid, solving fails with a clear
+error rather than silently using old settings. Deleting/renaming a calibration
+file restores the default on the next Solve.
+
+## Tail-weighted volatility-state calibration (October 2026)
+
+In `notebooks/calibrate_volatility_yfinance.ipynb`, set:
+
+```python
+N_REGIMES = 6
+REGIME_METHOD = "tail_weighted"  # or "equal_frequency" (legacy)
+EXTREME_QUANTILE = 0.95
+SAVE_FOR_DASHBOARD = True
+```
+
+`tail_weighted` fixes the *last state's population definition* to the upper
+5% of trailing intraday realized-volatility observations. This remains the
+same for 3, 6, or 12 volatility states when calibrated on the **same data**.
+For 6 states the population fractions are 30/20/20/15/10/5%; for 3 states
+they are 60/35/5%. The actual cutoff in pips/√minute is the dataset's
+95th percentile and can change when the dataset or estimation window changes.
+Set `REGIME_METHOD = "equal_frequency"` to restore the legacy equal-frequency
+quantiles (approximately 1/N of the observations in every state).
+
+The notebook compares both methods for three and six states and displays a
+sigma-level comparison for the selected N. Only the selected method is used
+to calibrate the CTMC Q; reference comparison tables do **not** fit Q twice.
+The exported `notebooks/output/{PAIR}_volatility_regimes.json` includes the
+full CTMC generator Q with negative diagonal, conditional RMS sigma levels,
+volatility thresholds, and metadata: `regimeMethod`, `regimeQuantiles`,
+and `extremeQuantile`. The current Dash loader consumes the existing Q and
+sigma keys unchanged and infers N from Q's dimension on each Solve. No native
+solver, Dash, or schema changes are required.
+
+The highest-volatility regime is a rare-state estimate: review its observed
+exits and fitted-versus-empirical transition probabilities before treating Q
+as stable. A 60-minute overlapping realized-volatility estimator creates
+persistence even if price increments have no true Markov volatility states.

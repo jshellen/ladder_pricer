@@ -36,15 +36,15 @@ def _load_pair_market_defaults() -> dict[str, dict[str, float]]:
 
 
 def _validated_volatility_regimes(model: dict, pair: str) -> dict:
-    """Parse 2/3-state Markov volatility parameters from JSON; return a fresh copy."""
+    """Parse 2–12-state Markov volatility parameters from JSON; return a fresh copy."""
     try:
         sigma = [float(v) for v in model["sigmaPips"]]
         rates = [[float(v) for v in row] for row in model["ratesPerMinute"]]
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"Invalid volatility regimes for {pair}: expected sigmaPips and ratesPerMinute") from exc
     n = len(sigma)
-    if n not in (2, 3) or len(rates) != n or any(len(row) != n for row in rates):
-        raise ValueError(f"Volatility matrix for {pair} must be 2x2 or 3x3")
+    if not 2 <= n <= 12 or len(rates) != n or any(len(row) != n for row in rates):
+        raise ValueError(f"Volatility matrix for {pair} must be square with 2–12 states")
     if any(not math.isfinite(v) or v <= 0 for v in sigma) or any(a >= b for a,b in zip(sigma,sigma[1:])):
         raise ValueError(f"Volatility sigmas for {pair} must increase strictly and be positive")
     if any(not math.isfinite(v) or v < 0 for row in rates for v in row):
@@ -70,12 +70,77 @@ def _load_pair_volatility_defaults(json_path: Path | None = None) -> dict[str, d
 
 DEFAULT_FX_PAIR_VOLATILITY = _load_pair_volatility_defaults()
 
+# The calibration notebook writes pair-specific snapshots here.  These are
+# intentionally not cached: a new calibration becomes effective on the next
+# Solve without a dashboard restart.  The packaged JSON remains the fallback.
+CALIBRATION_OUTPUT_DIR = Path(__file__).resolve().parents[2] / "notebooks" / "output"
+
+
+def calibration_artifact_path(pair: str) -> Path:
+    key = str(pair or "").upper().strip()
+    if key not in DEFAULT_FX_PAIR_VOLATILITY:
+        raise ValueError(f"Unknown volatility target pair {key!r}")
+    return CALIBRATION_OUTPUT_DIR / f"{key}_volatility_regimes.json"
+
+
+def _volatility_from_calibration_artifact(document: dict, pair: str) -> dict:
+    """Translate an offline calibration's full Q into native zero-diagonal rates.
+
+    No attempt is made to infer sigma levels from Q: they must be calibrated
+    alongside Q and supplied in the same artifact.  Reject inconsistent or
+    truncated models instead of using plausible-looking fallback parameters.
+    """
+    if not isinstance(document, dict):
+        raise ValueError(f"Calibration for {pair} must be a JSON object")
+    if "pair" in document and document["pair"] != pair:
+        raise ValueError(f"Calibration for {pair} contains pair {document['pair']!r}")
+    if "generatorQPerMinute" not in document:
+        # Read old standalone exports as well as the canonical Q format.
+        return _validated_volatility_regimes(document, pair)
+    try:
+        sigma = [float(x) for x in document["sigmaPips"]]
+        q = [[float(x) for x in row] for row in document["generatorQPerMinute"]]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Calibration for {pair} requires sigmaPips and generatorQPerMinute") from exc
+    n = len(q)
+    if not 2 <= n <= 12 or len(sigma) != n or any(len(row) != n for row in q):
+        raise ValueError(f"Calibration Q for {pair} must be NxN (2-12) matching {n} sigma levels")
+    rates = [[0.0 if i == j else q[i][j] for j in range(n)] for i in range(n)]
+    model = _validated_volatility_regimes({"sigmaPips": sigma, "ratesPerMinute": rates}, pair)
+    for i, row in enumerate(q):
+        if not math.isfinite(row[i]) or row[i] >= 0:
+            raise ValueError(f"Calibration Q for {pair} has an invalid diagonal in row {i}")
+        if abs(sum(row)) > max(1e-9, 1e-8 * abs(row[i])):
+            raise ValueError(f"Calibration Q for {pair} must have zero row sums (row {i})")
+        if not math.isclose(row[i], -sum(rates[i]), rel_tol=1e-8, abs_tol=1e-9):
+            raise ValueError(f"Calibration Q for {pair} has inconsistent diagonal in row {i}")
+    if "ratesPerMinute" in document:
+        canonical = _validated_volatility_regimes(document, pair)
+        for left, right in zip(canonical["ratesPerMinute"], rates):
+            if any(not math.isclose(a, b, rel_tol=1e-8, abs_tol=1e-10) for a, b in zip(left, right)):
+                raise ValueError(f"Calibration Q and ratesPerMinute disagree for {pair}")
+    return model
+
+
+def volatility_calibration_source(pair: str | None) -> str:
+    """Readable source indicator for the dashboard."""
+    path = calibration_artifact_path(str(pair or ""))
+    return str(path) if path.is_file() else "fx_pair_defaults.json (fallback)"
+
 
 def default_fx_pair_volatility(pair: str | None) -> dict:
     """Return exactly the configured volatility model for a target FX pair."""
     key = str(pair or "").upper().strip()
     if key not in DEFAULT_FX_PAIR_VOLATILITY:
         raise ValueError(f"Missing JSON volatility model for target FX pair {key!r}")
+    path = calibration_artifact_path(key)
+    if path.is_file():
+        try:
+            with path.open(encoding="utf-8") as stream:
+                artifact = json.load(stream)
+            return _volatility_from_calibration_artifact(artifact, key)
+        except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid volatility calibration file {path}: {exc}") from exc
     return deepcopy(DEFAULT_FX_PAIR_VOLATILITY[key])
 
 
@@ -252,4 +317,9 @@ _DEFAULT_CONFIG = {
 
 
 def default_config() -> dict:
-    return deepcopy(_DEFAULT_CONFIG)
+    cfg = deepcopy(_DEFAULT_CONFIG)
+    # Do not retain the import-time 3-state default if notebook was rerun.
+    model = default_fx_pair_volatility(cfg["targetPair"])
+    cfg["volatilityRegimes"] = model
+    cfg["sigmaPips"] = model["sigmaPips"][len(model["sigmaPips"]) // 2]
+    return cfg
